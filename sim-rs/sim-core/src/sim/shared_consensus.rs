@@ -2056,6 +2056,10 @@ impl SharedConsensus {
                         NoVoteReason::LateEB => SimNoVoteReason::LateEB,
                         NoVoteReason::LateRBHeader => SimNoVoteReason::LateRBHeader,
                         NoVoteReason::WrongEB => SimNoVoteReason::WrongEB,
+                        // Sim has no dedicated "no adopted tip" telemetry;
+                        // fold into `WrongEB` (its former home before the
+                        // shared enum split the empty-context case out).
+                        NoVoteReason::NoChainTip => SimNoVoteReason::WrongEB,
                         // TODO: sim no vote reason doesn't have extended MissingTX info. Should we add it?
                         NoVoteReason::MissingTX { .. } => SimNoVoteReason::MissingTX,
                         // Sim has no dedicated "validating" telemetry;
