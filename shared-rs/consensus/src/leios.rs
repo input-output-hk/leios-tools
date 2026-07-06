@@ -128,7 +128,14 @@ pub enum NoVoteReason {
     /// At least one transaction the EB references is unknown locally.
     /// Only meaningful in TX-by-references mode; the wrapper supplies
     /// the `tx_known` callback that drives this check.
-    MissingTX,
+    MissingTX {
+        /// Total number of required TX for EB
+        required: usize,
+        /// Number of pinned TX, available in the mempool
+        present_pinned: usize,
+        /// Number of unpinned TX, available in the mempool
+        present_unpinned: usize,
+    },
     /// The EB body has not been validated locally yet — either the
     /// body hasn't been received (vote-placeholder election) or the
     /// body is present but the validator hasn't ratified it
@@ -381,6 +388,13 @@ pub struct LeiosState {
     pub control: ControlSignal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAvailability {
+    Absent,
+    PresentPinned,
+    PresentUnpinned,
+}
+
 impl LeiosState {
     /// Construct a new state with the default fetch policy
     /// ([`LowestRttFirst`] for both fetch-bearing traffic classes) and a
@@ -504,7 +518,7 @@ impl LeiosState {
     /// locally?" — used by the CIP-0164 `MissingTX` voting check in
     /// TX-by-references mode.  Wrappers without a mempool surface yet
     /// can pass `&|_| true`; in that case the predicate is a no-op.
-    pub fn on_slot(&mut self, slot: u64, tx_known: &dyn Fn(&TxId) -> bool) -> Vec<LeiosEffect> {
+    pub fn on_slot(&mut self, slot: u64, tx_known: &dyn Fn(&TxId) -> TxAvailability) -> Vec<LeiosEffect> {
         let mut fx: Vec<LeiosEffect> = Vec::new();
         for eff in self.elections.on_slot(slot) {
             match eff {
@@ -654,7 +668,7 @@ impl LeiosState {
         eb_hash: &[u8; 32],
         eb_slot: u64,
         eb_seen_slot: u64,
-        tx_known: &dyn Fn(&TxId) -> bool,
+        tx_known: &dyn Fn(&TxId) -> TxAvailability,
     ) -> VoteDecision {
         // Predicate 1: LateEB.  The EB must have arrived before its
         // voting window closes.  The phase machine already filters out
@@ -696,10 +710,22 @@ impl LeiosState {
         // check; the validator will reject the EB body if it references
         // unknown TXs.
         if let Some((_, tx_hashes)) = self.eb_tx_hashes.get(eb_hash) {
+            let mut present_pinned = 0;
+            let mut present_unpinned = 0;
+            let mut decline = false;
             for h in tx_hashes {
-                if !tx_known(h) {
-                    return Err(NoVoteReason::MissingTX);
+                match tx_known(h) {
+                    TxAvailability::Absent => decline = true,
+                    TxAvailability::PresentPinned => present_pinned += 1,
+                    TxAvailability::PresentUnpinned => present_unpinned += 1,
                 }
+            }
+            if decline {
+                return Err(NoVoteReason::MissingTX {
+                    required: tx_hashes.len(),
+                    present_pinned,
+                    present_unpinned,
+                });
             }
         }
 
@@ -1308,6 +1334,7 @@ fn indices_to_bitmap(indices: &[u32]) -> BTreeMap<u16, u64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::leios::TxAvailability::PresentPinned;
     use super::*;
     use crate::mempool::{TxBody, TxId};
 
@@ -1377,8 +1404,8 @@ mod tests {
 
     /// Default "all txs known" callback: predicates ignore MissingTX
     /// unless the test populates `eb_tx_hashes` and supplies its own.
-    fn tx_all(_: &TxId) -> bool {
-        true
+    fn tx_all(_: &TxId) -> TxAvailability {
+        PresentPinned
     }
 
     /// Set chain-tip context that satisfies the LateRBHeader / WrongEB
