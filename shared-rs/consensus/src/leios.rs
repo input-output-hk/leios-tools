@@ -388,10 +388,15 @@ pub struct LeiosState {
     pub control: ControlSignal,
 }
 
+/// Auxiliary enum for the `tx_known` callback passed into `LeiosState::on_slot`.
+/// Gives extended info about tx status in mempool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxAvailability {
     Absent,
+    /// Tx is present in mempool and pinned (i.e., specified in eb_pinned struct).
     PresentPinned,
+    /// Tx is present in mempool but not pinned (i.e., can be evicted at any moment
+    /// if mempool is full).
     PresentUnpinned,
 }
 
@@ -516,8 +521,13 @@ impl LeiosState {
     ///
     /// `tx_known` is the wrapper's predicate for "do we have this TX
     /// locally?" — used by the CIP-0164 `MissingTX` voting check in
-    /// TX-by-references mode.  Wrappers without a mempool surface yet
-    /// can pass `&|_| true`; in that case the predicate is a no-op.
+    /// TX-by-references mode. It should return `TxAvailability::PresentPinned`
+    /// for any TX that is in the mempool, and `TxAvailability::PresentUnpinned`
+    /// for any TX that is in the mempool, but not pinned (yet?).
+    ///
+    /// Wrappers without a mempool surface yet can pass
+    /// `&|_| TxAvaialability::PresentPinned` (or Unpinned); in that case
+    /// the predicate is a no-op.
     pub fn on_slot(&mut self, slot: u64, tx_known: &dyn Fn(&TxId) -> TxAvailability) -> Vec<LeiosEffect> {
         let mut fx: Vec<LeiosEffect> = Vec::new();
         for eff in self.elections.on_slot(slot) {

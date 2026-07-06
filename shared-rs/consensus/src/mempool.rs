@@ -707,7 +707,7 @@ impl MempoolState {
                     continue;
                 };
 
-            self.eb_pinned.entry(to_pin.clone()).or_insert(body.clone());
+            self.eb_pinned.entry(to_pin.clone()).or_insert_with(|| body.clone());
         }
     }
 
