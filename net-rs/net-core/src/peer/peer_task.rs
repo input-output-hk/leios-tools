@@ -799,6 +799,24 @@ pub(crate) async fn run_peer_task(mut config: PeerTaskConfig) {
         None
     };
 
+    // Cancellation-safe teardown: register every sub-task's AbortHandle in
+    // a guard so they are reaped no matter how this task exits.  The
+    // explicit cleanup below runs on the normal path; if this task is
+    // instead cancelled mid-`select!` (the coordinator aborts our
+    // JoinHandle), that cleanup is skipped and dropped JoinHandles only
+    // detach — the guard's Drop is what actually stops the sub-tasks then.
+    // See `super::AbortGuard`.
+    let mut guard = super::AbortGuard::new();
+    guard.push(cs_handle.abort_handle());
+    guard.push(ka_handle.abort_handle());
+    guard.push(bf_handle.abort_handle());
+    guard.push(ps_handle.abort_handle());
+    guard.push(ts_handle.abort_handle());
+    if let Some((ln_handle, lf_handle, _)) = &leios_handles {
+        guard.push(ln_handle.abort_handle());
+        guard.push(lf_handle.abort_handle());
+    }
+
     // Build shared command senders for dispatch.
     let senders = ClientProtocolSenders {
         fetch: fetch_sender,

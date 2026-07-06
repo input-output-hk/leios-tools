@@ -340,6 +340,31 @@ impl RunningMux {
     }
 }
 
+impl Drop for RunningMux {
+    /// Abort the mux tasks when the handle is dropped — this is what makes
+    /// per-connection teardown cancellation-safe.
+    ///
+    /// The per-peer task explicitly `abort()`s the mux when its protocol
+    /// loop exits normally. But if that task is itself cancelled while
+    /// suspended (the coordinator `abort()`s its `JoinHandle` on a racing
+    /// `Failed` event or a full command channel — the dominant paths under
+    /// connection churn), the explicit cleanup never runs. Without this
+    /// `Drop`, the muxer/demuxer/supervisor would keep running: the socket
+    /// stays open (the orphaned keepalive keeps the peer from dropping it),
+    /// the per-protocol ingress buffers and in-flight decoded message
+    /// bodies are pinned forever, and the orphan population grows one per
+    /// churned connection — an unbounded, churn-driven memory leak.
+    ///
+    /// Dropping the handle now closes the socket, which unblocks and exits
+    /// the connection's protocol sub-tasks (they observe `MuxError`), so
+    /// the whole per-peer task tree is reaped. `AbortHandle::abort` /
+    /// `JoinHandle::abort` are idempotent, so double-abort (explicit
+    /// cleanup then drop) is harmless.
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

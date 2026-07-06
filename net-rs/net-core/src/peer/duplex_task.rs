@@ -368,6 +368,33 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
         None
     };
 
+    // Cancellation-safe teardown: register every sub-task's AbortHandle in
+    // a guard so they are reaped no matter how this task exits.  The
+    // explicit cleanup at the end of the loop runs on the normal path; if
+    // this task is instead cancelled mid-`select!` (the coordinator aborts
+    // our JoinHandle), that cleanup is skipped and dropped JoinHandles only
+    // detach — the guard's Drop is what actually stops the sub-tasks then.
+    // See `super::AbortGuard`.
+    let mut guard = super::AbortGuard::new();
+    guard.push(cs_client.abort_handle());
+    guard.push(ka_client.abort_handle());
+    guard.push(bf_client.abort_handle());
+    guard.push(ps_client.abort_handle());
+    guard.push(ts_client.abort_handle());
+    if let Some((ln_handle, lf_handle, _)) = &leios_client_handles {
+        guard.push(ln_handle.abort_handle());
+        guard.push(lf_handle.abort_handle());
+    }
+    guard.push(cs_server.abort_handle());
+    guard.push(bf_server.abort_handle());
+    guard.push(ts_server.abort_handle());
+    guard.push(ps_server.abort_handle());
+    guard.push(ka_server.abort_handle());
+    if let Some((ln_server, lf_server)) = &leios_server_handles {
+        guard.push(ln_server.abort_handle());
+        guard.push(lf_server.abort_handle());
+    }
+
     // Build shared command senders for dispatch.
     let senders = ClientProtocolSenders {
         fetch: fetch_sender,

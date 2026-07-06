@@ -442,6 +442,56 @@ impl Coordinator {
         self.add_peer_with_backoff(address, Duration::from_secs(1))
     }
 
+    /// Queue for removal every peer whose task has already exited, and
+    /// return the count of peers that are still live.
+    ///
+    /// Under connection churn the coordinator's `PeerEvent::Failed`
+    /// processing lags behind the peer tasks that emit it, so dead
+    /// `PeerState`s linger in `self.peers` until their (backlogged)
+    /// removal is finally processed. Those zombies still count against
+    /// `max_peers` — enough of them and the cap is pinned, forcing us to
+    /// reject *live* inbound reconnects while the map is full of corpses
+    /// (the fork-storm's connectivity collapse: nodes stuck at cap while
+    /// others starve). A finished `task_handle` is an authoritative,
+    /// synchronous "this peer is gone" signal — the per-peer task only
+    /// returns after its own teardown — so we can reclaim the slot
+    /// immediately instead of waiting for the event. Removal is routed
+    /// through the normal `pending_removals` path so the full cleanup
+    /// (ip_guard release, fragment sizes, `PeerDisconnected`, and outbound
+    /// reconnect scheduling) still runs exactly once.
+    fn reap_finished_peers(&mut self) -> usize {
+        let mut live = 0usize;
+        let mut dead = Vec::new();
+        for (id, peer) in &self.peers {
+            if peer.task_handle.is_finished() {
+                dead.push(*id);
+            } else {
+                live += 1;
+            }
+        }
+        for id in dead {
+            if !self.pending_removals.iter().any(|(pid, _)| *pid == id) {
+                self.pending_removals
+                    .push((id, "peer task already exited (reaped at cap)".to_string()));
+            }
+        }
+        live
+    }
+
+    /// Whether a still-live peer already holds this outbound address.
+    ///
+    /// Outbound addresses are stable node listen ports (unlike inbound
+    /// connections, which arrive on ephemeral source ports and can't be
+    /// mapped back to a logical node), so we can dedup on them: never
+    /// spawn a second outbound task for an address we're already connected
+    /// to. Finished (zombie) peers don't count — they're about to be
+    /// reaped, so a reconnect to their address should proceed.
+    fn has_live_peer_for_address(&self, address: &str) -> bool {
+        self.peers
+            .values()
+            .any(|p| p.address == address && !p.task_handle.is_finished())
+    }
+
     /// Handle an event from a peer task.
     async fn handle_peer_event(&mut self, peer_id: PeerId, event: PeerEvent) {
         match event {
@@ -749,7 +799,9 @@ impl Coordinator {
                     // catches addresses surfaced by peer discovery, not just
                     // statically configured peers.
                     tracing::debug!(%address, "AddPeer refused: address is blocklisted");
-                } else if self.peers.len() >= self.config.max_peers {
+                } else if self.has_live_peer_for_address(&address) {
+                    tracing::debug!(%address, "ignoring AddPeer — address already connected");
+                } else if self.reap_finished_peers() >= self.config.max_peers {
                     tracing::warn!(
                         "max peers ({}) reached, ignoring AddPeer",
                         self.config.max_peers
@@ -1117,14 +1169,26 @@ impl Coordinator {
         self.reconnect_queue = still_pending;
 
         for (address, next_backoff) in ready {
-            if self.blocklist.contains(&address) || (self.peers.len() >= self.config.max_peers) {
-                // Active partition: park the reconnection instead of dropping
-                // it. Re-queued at the same (un-escalated) backoff so it
-                // keeps the link cut while blocklisted and reconnects on its
-                // own once the blocklist is cleared (heal) — no separate
-                // bookkeeping needed.
-                // OR
-                // Re-queued at the same un-escalated backoff either way.
+            // Active partition: park the reconnection instead of dropping it.
+            // Re-queued at the same (un-escalated) backoff so it keeps the
+            // link cut while blocklisted and reconnects on its own once the
+            // blocklist is cleared (heal) — no separate bookkeeping needed.
+            if self.blocklist.contains(&address) {
+                self.reconnect_queue
+                    .push((address, Instant::now() + next_backoff, next_backoff));
+                continue;
+            }
+            // Outbound dedup: if a live peer already holds this address, the
+            // reconnect is redundant (a duplicate queue entry, or the peer
+            // came back another way) — dropping it prevents two outbound
+            // tasks to one node, which would otherwise waste a cap slot.
+            if self.has_live_peer_for_address(&address) {
+                tracing::debug!(%address, "skipping reconnect — address already connected");
+                continue;
+            }
+            // Reap zombies so the cap reflects live peers only.
+            if self.reap_finished_peers() >= self.config.max_peers {
+                // Re-queue — we're genuinely at capacity with live peers.
                 self.reconnect_queue
                     .push((address, Instant::now() + next_backoff, next_backoff));
             } else {
@@ -1424,11 +1488,19 @@ impl Coordinator {
                     }
                 } => {
                     if let Some((conn, peer_addr, ip_guard)) = result {
-                        if self.peers.len() < self.config.max_peers {
+                        // Reap zombies first so the cap reflects live peers
+                        // only — otherwise dead PeerStates awaiting removal
+                        // pin the cap and we reject live reconnects.
+                        let live = self.reap_finished_peers();
+                        if live < self.config.max_peers {
                             let peer_id = self.add_accepted_peer(conn, peer_addr, ip_guard);
                             tracing::info!("accepted inbound peer as {peer_id}");
                         } else {
-                            tracing::warn!("max peers reached, dropping inbound connection");
+                            tracing::warn!(
+                                live,
+                                max = self.config.max_peers,
+                                "max peers reached (all live), dropping inbound connection"
+                            );
                             conn.running.abort();
                             // ip_guard dropped here → slot released.
                             drop(ip_guard);
@@ -3161,5 +3233,137 @@ mod tests {
             saw_disconnect,
             "PeerDisconnected should be emitted when peer is force-removed"
         );
+    }
+
+    /// Build a bare coordinator with default config for the eviction/dedup
+    /// unit tests below.
+    fn bare_coordinator() -> Coordinator {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, _net_event_receiver) = mpsc::channel(NETWORK_EVENTS_CAPACITY);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        )
+    }
+
+    /// A JoinHandle guaranteed to be `is_finished()` — the runtime has
+    /// polled the (trivial) task to completion.
+    async fn finished_handle() -> JoinHandle<()> {
+        let h = tokio::spawn(async {});
+        while !h.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        h
+    }
+
+    fn insert_peer_with_task(
+        coord: &mut Coordinator,
+        id: PeerId,
+        address: &str,
+        task_handle: JoinHandle<()>,
+    ) {
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(2);
+        coord.peers.insert(
+            id,
+            PeerState {
+                address: address.to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle,
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: Duration::from_secs(1),
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+            },
+        );
+    }
+
+    /// `reap_finished_peers` queues the dead for removal and returns only
+    /// the live count — the signal the cap checks rely on.
+    #[tokio::test]
+    async fn reap_finished_peers_queues_dead_and_counts_live() {
+        let mut coord = bare_coordinator();
+        // One dead peer (task already exited) and one live peer.
+        insert_peer_with_task(&mut coord, PeerId(1), "dead:3001", finished_handle().await);
+        let live_task = tokio::spawn(std::future::pending::<()>());
+        let live_abort = live_task.abort_handle();
+        insert_peer_with_task(&mut coord, PeerId(2), "live:3001", live_task);
+
+        let live = coord.reap_finished_peers();
+        assert_eq!(live, 1, "only the live peer should be counted");
+        assert!(
+            coord.pending_removals.iter().any(|(id, _)| *id == PeerId(1)),
+            "dead peer should be queued for removal"
+        );
+        assert!(
+            !coord.pending_removals.iter().any(|(id, _)| *id == PeerId(2)),
+            "live peer must not be queued"
+        );
+
+        // Idempotent: a second reap must not double-queue the same corpse.
+        let before = coord.pending_removals.len();
+        coord.reap_finished_peers();
+        assert_eq!(coord.pending_removals.len(), before, "no double-queue");
+
+        live_abort.abort();
+    }
+
+    /// `has_live_peer_for_address` matches only live peers — a zombie
+    /// holding an address must not block a reconnect to it.
+    #[tokio::test]
+    async fn has_live_peer_for_address_ignores_finished() {
+        let mut coord = bare_coordinator();
+        insert_peer_with_task(&mut coord, PeerId(1), "zombie:3001", finished_handle().await);
+        let live_task = tokio::spawn(std::future::pending::<()>());
+        let live_abort = live_task.abort_handle();
+        insert_peer_with_task(&mut coord, PeerId(2), "alive:3001", live_task);
+
+        assert!(
+            !coord.has_live_peer_for_address("zombie:3001"),
+            "a finished peer must not count as a live holder of its address"
+        );
+        assert!(coord.has_live_peer_for_address("alive:3001"));
+        assert!(!coord.has_live_peer_for_address("never:3001"));
+
+        live_abort.abort();
+    }
+
+    /// A due reconnect to an address already held by a live peer is
+    /// dropped (outbound dedup) — no second outbound task is spawned.
+    #[tokio::test]
+    async fn reconnect_skips_when_address_already_live() {
+        let mut coord = bare_coordinator();
+        let live_task = tokio::spawn(std::future::pending::<()>());
+        let live_abort = live_task.abort_handle();
+        insert_peer_with_task(&mut coord, PeerId(1), "dup:3001", live_task);
+
+        // Queue a due reconnect for the same address.
+        coord.reconnect_queue.push((
+            "dup:3001".to_string(),
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_secs(2),
+        ));
+
+        coord.process_reconnections();
+
+        assert_eq!(coord.peers.len(), 1, "no duplicate outbound peer spawned");
+        assert!(
+            coord.reconnect_queue.is_empty(),
+            "the redundant reconnect should be dropped, not re-queued"
+        );
+
+        live_abort.abort();
     }
 }
