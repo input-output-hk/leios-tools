@@ -1115,6 +1115,15 @@ impl Coordinator {
                     Instant::now() + backoff,
                     next_backoff,
                 ));
+            } else {
+                // Inbound (accepted) peers key `reintersect_throttle` on
+                // their ephemeral remote socket address, which never recurs.
+                // The entry is dead once the connection ends, so drop it —
+                // otherwise it accumulates one per inbound connection ever
+                // accepted (unbounded under churn). Outbound addresses are
+                // stable listen ports and intentionally keep their backoff
+                // across reconnects, so they are left alone.
+                self.reintersect_throttle.remove(&peer.address);
             }
 
             // Surface BlockFetchFailed for every pending fetch that was
