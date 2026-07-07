@@ -1262,12 +1262,15 @@ impl PraosState {
                     self.authentic_headers.retain(|_, (bn, _)| *bn >= min);
                 }
                 // Bodies: pruned at the tighter tip-hot window when set,
-                // otherwise at `k` (archive / full-history default).
-                let body_min = match self.block_body_retention_blocks {
-                    Some(w) if bn > w => Some(bn - w),
-                    None if bn > self.security_param_k => Some(bn - self.security_param_k),
-                    _ => None,
-                };
+                // otherwise at `k` (archive / full-history default). The window
+                // is clamped to `k` so a `Some(w)` with `w >= k` is inert —
+                // bodies never outlive the k-pruned chain structure, which
+                // would otherwise strand `validated` / `header_first_seen`
+                // entries for blocks whose `chain_tree` node is already gone.
+                let body_window = self
+                    .block_body_retention_blocks
+                    .map_or(self.security_param_k, |w| w.min(self.security_param_k));
+                let body_min = (bn > body_window).then(|| bn - body_window);
                 if let Some(body_min) = body_min {
                     self.block_cache.retain(|_, cb| cb.block_no >= body_min);
                     self.validated.retain(|h| self.block_cache.contains_key(h));

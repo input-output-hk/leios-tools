@@ -1612,8 +1612,13 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
     // window gets NoBlocks and refetches from an archive node). `None` keeps
     // the full configured capacity. Only the chain store is capped here —
     // `leios_store` keeps its own slot-window retention.
+    // `w.max(1)` guards against `Some(0)` collapsing the store to capacity 0,
+    // which would evict every block on insert and serve nothing. The `as
+    // usize` cast is lossless on our 64-bit targets, and `.min` bounds the
+    // result to the configured capacity regardless, so a truncated large `w`
+    // could only shrink the cap, never inflate it.
     let chain_store_cap = match config.block_body_retention_blocks {
-        Some(w) => (w as usize).min(config.chain_store_capacity),
+        Some(w) => (w.max(1) as usize).min(config.chain_store_capacity),
         None => config.chain_store_capacity,
     };
     let (chain_store, _chain_rx) = ChainStore::new(chain_store_cap);
