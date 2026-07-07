@@ -1238,6 +1238,22 @@ impl PraosState {
                 }
             }
         }
+        // Bound the slot-keyed equivocation-tracking maps. They are keyed by
+        // slot and only meaningfully consulted for recent slots: RB-header
+        // equivocation is detected at header arrival (near-real-time), and
+        // `equivocating_rb_slots` is read by CIP-0164 voting only within the
+        // pipeline window. Without a prune they grow one entry per
+        // (slot, issuer) ever observed. Retain the last `k` slots — orders of
+        // magnitude beyond any voting / header-arrival horizon, so detection
+        // and voting are unaffected — measured against the applied tip's slot.
+        if let Point::Specific { slot, .. } = &point {
+            let slot_cutoff = slot.saturating_sub(self.security_param_k);
+            if slot_cutoff > 0 {
+                self.header_hashes_by_slot_issuer
+                    .retain(|(s, _), _| *s >= slot_cutoff);
+                self.equivocating_rb_slots.retain(|s| *s >= slot_cutoff);
+            }
+        }
         // Try switching to chain_tree's best tip, then evaluate peers.
         if let Some(best) = self.chain_tree.best_tip_hash() {
             self.try_switch_and_execute_internal(best, &mut fx);
@@ -2926,6 +2942,27 @@ mod tests {
         assert!(s.block_cache.contains_key(&h(2)));
         assert!(s.block_cache.contains_key(&h(3)));
         assert!(s.block_cache.contains_key(&h(4)));
+    }
+
+    #[test]
+    fn equivocation_maps_pruned_at_k_slots() {
+        let mut s = PraosState::new("test".to_string(), 2); // k = 2 slots
+        // Equivocation at old slot 1, plus a recent slot 100 observation.
+        s.note_header_for_equivocation(1, b"issuerA", h(1));
+        s.note_header_for_equivocation(1, b"issuerA", h(2));
+        s.note_header_for_equivocation(100, b"issuerB", h(3));
+        assert!(s.equivocating_rb_slots.contains(&1));
+        assert!(s.header_hashes_by_slot_issuer.keys().any(|(sl, _)| *sl == 1));
+
+        // Apply a block at slot 100 ⇒ cutoff = 100 - k(2) = 98; slots < 98 drop.
+        install_validated_block(&mut s, 100, 5, 1, None);
+        s.adopted_tip_hash = Some(h(5));
+        let _ = s.on_block_applied(pt(100, 5), Instant::now());
+
+        // Old slot 1 gone from both maps; recent slot 100 retained.
+        assert!(!s.equivocating_rb_slots.contains(&1));
+        assert!(!s.header_hashes_by_slot_issuer.keys().any(|(sl, _)| *sl == 1));
+        assert!(s.header_hashes_by_slot_issuer.keys().any(|(sl, _)| *sl == 100));
     }
 
     #[test]
