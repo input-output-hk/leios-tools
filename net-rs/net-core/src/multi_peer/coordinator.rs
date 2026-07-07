@@ -1606,7 +1606,17 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
     let (net_event_sender, net_event_receiver) = mpsc::channel(NETWORK_EVENTS_CAPACITY);
     let (net_cmd_sender, net_cmd_receiver) = mpsc::channel(NETWORK_COMMANDS_CAPACITY);
     let (peer_event_sender, peer_event_receiver) = mpsc::channel(PEER_EVENTS_CAPACITY);
-    let (chain_store, _chain_rx) = ChainStore::new(config.chain_store_capacity);
+    // The chain store holds block *bodies* for serving BlockFetch to
+    // responder peers. Under a tip-hot window it carries the same bound as
+    // `PraosState.block_cache`: keep only recent bodies (a peer behind the
+    // window gets NoBlocks and refetches from an archive node). `None` keeps
+    // the full configured capacity. Only the chain store is capped here —
+    // `leios_store` keeps its own slot-window retention.
+    let chain_store_cap = match config.block_body_retention_blocks {
+        Some(w) => (w as usize).min(config.chain_store_capacity),
+        None => config.chain_store_capacity,
+    };
+    let (chain_store, _chain_rx) = ChainStore::new(chain_store_cap);
 
     let leios_store = if config.leios_enabled {
         let (store, _leios_rx) = LeiosStore::new_with_retention(
