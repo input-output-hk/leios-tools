@@ -123,8 +123,20 @@ pub enum NoVoteReason {
     /// The chain-tip RB header arrived later than `eb_slot + Δhdr`,
     /// past the equivocation-resistant cutoff.
     LateRBHeader,
-    /// The chain-tip RB does not announce this EB.
+    /// The adopted chain-tip RB announces a *different* EB than this one.
+    /// A phase mismatch: the voter has a tip, but the tip has advanced to
+    /// an RB that endorses a later EB, so the EB under vote is no longer
+    /// the one the tip references. Distinct from [`NoVoteReason::NoChainTip`]
+    /// (no adopted tip at all), which was previously folded in here.
     WrongEB,
+    /// No adopted chain tip is available yet (`rb_header_arrival_slot`
+    /// is unset), so the announcement predicate cannot be evaluated —
+    /// e.g. a follower that hasn't populated its `ChainTipContext`, or a
+    /// node still catching up. Split out from [`NoVoteReason::WrongEB`]
+    /// so that `WrongEB` means specifically the announcement *mismatch*,
+    /// making a drifting tip/EB phase mismatch directly identifiable in
+    /// telemetry rather than shadowed by the empty-context case.
+    NoChainTip,
     /// At least one transaction the EB references is unknown locally.
     /// Only meaningful in TX-by-references mode; the wrapper supplies
     /// the `tx_known` callback that drives this check.
@@ -693,7 +705,7 @@ impl LeiosState {
         // and its header must have arrived within the equivocation
         // cutoff (`eb_slot + Δhdr`).
         let Some(rb_arrival) = self.chain_tip_ctx.rb_header_arrival_slot else {
-            return Err(NoVoteReason::WrongEB);
+            return Err(NoVoteReason::NoChainTip);
         };
         if self.chain_tip_ctx.eb_announcement.as_ref() != Some(eb_hash) {
             return Err(NoVoteReason::WrongEB);
@@ -2045,15 +2057,16 @@ mod tests {
     }
 
     #[test]
-    fn no_vote_wrong_eb_when_chain_tip_not_set() {
+    fn no_vote_no_chain_tip_when_chain_tip_not_set() {
         // Default ChainTipContext has no rb_header_arrival_slot — predicate
-        // returns WrongEB before any other check.
+        // returns NoChainTip before any other check (distinct from the
+        // WrongEB announcement-mismatch case).
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
         state.on_slot(10, &tx_all);
         state.elections.announce(10, h(1));
         let fx = state.on_slot(13, &tx_all);
-        assert_no_vote(&fx, h(1), NoVoteReason::WrongEB);
-        // WrongEB is transient: do NOT mark_voted, so subsequent slots can
+        assert_no_vote(&fx, h(1), NoVoteReason::NoChainTip);
+        // NoChainTip is transient: do NOT mark_voted, so subsequent slots can
         // re-evaluate as the chain tip catches up.
         assert!(!state.elections.voted(&h(1)));
     }
@@ -2221,13 +2234,13 @@ mod tests {
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
         state.on_slot(10, &tx_all);
         state.elections.announce(10, h(1));
-        // No chain tip → WrongEB.
+        // No chain tip → NoChainTip.
         let fx_first = state.on_slot(13, &tx_all);
-        assert_no_vote(&fx_first, h(1), NoVoteReason::WrongEB);
+        assert_no_vote(&fx_first, h(1), NoVoteReason::NoChainTip);
         assert!(!state.elections.voted(&h(1)));
-        // Next slot: still no chain tip → WrongEB again, not suppressed.
+        // Next slot: still no chain tip → NoChainTip again, not suppressed.
         let fx_second = state.on_slot(14, &tx_all);
-        assert_no_vote(&fx_second, h(1), NoVoteReason::WrongEB);
+        assert_no_vote(&fx_second, h(1), NoVoteReason::NoChainTip);
     }
 
     // -- missing_eb_tx_bitmap ---------------------------------------------
