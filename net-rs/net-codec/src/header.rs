@@ -128,6 +128,11 @@ impl HeaderInfo {
         //   array(2)      → announced_eb tuple     (consumes 1 element)
         //   bytes(32)     → announced_eb flat hash; the next element is
         //                   the u32 size            (consumes 2 elements)
+        //   null          → announced_eb absent    (consumes 1 element)
+        //
+        // The `null` case is the finalized Dijkstra layout (cardano-ledger
+        // #5889): a fixed array(12) ending in `certified_eb : bool,
+        // announced_eb : [hash32, uint] / nil`.
         //
         // Any other shape falls through as an error rather than being
         // silently misread.
@@ -192,6 +197,22 @@ impl HeaderInfo {
                     let eb_size = d.u32()?;
                     announced_eb = Some((eb_hash, eb_size));
                     remaining -= 2;
+                }
+                minicbor::data::Type::Null => {
+                    // The finalized Dijkstra-era layout (cardano-ledger
+                    // #5889, deployed on the 2026w27 leios-prototype
+                    // testnet) makes the body a fixed array(12) whose last
+                    // field is `leios_announcement : leios_announcement /
+                    // nil` — an explicit `null` when the block announces no
+                    // EB.  Earlier draft encodings simply omitted the
+                    // field.  Treat `null` as "no announced_eb".
+                    if announced_eb.is_some() {
+                        return Err(DecodeError::message(
+                            "duplicate announced_eb extension in header_body",
+                        ));
+                    }
+                    d.skip()?;
+                    remaining -= 1;
                 }
                 other => {
                     return Err(DecodeError::message(format!(
@@ -851,5 +872,151 @@ mod tests {
         let encoded = minicbor::to_vec(&header).unwrap();
         let decoded: WrappedHeader = minicbor::decode(&encoded).unwrap();
         assert_eq!(decoded.parsed, header.parsed);
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Build a header in the finalized Dijkstra layout (cardano-ledger
+    /// #5889): a fixed `array(12)` header_body whose two trailing fields
+    /// are `certified_eb : bool` FIRST, then `announced_eb :
+    /// [hash32, uint] / nil` LAST.  This is the wire shape sent by the
+    /// 2026w27 leios-prototype testnet.
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_header_dijkstra(
+        era: u8,
+        block_number: u64,
+        slot: u64,
+        prev_hash: Option<[u8; 32]>,
+        issuer_vkey: [u8; 32],
+        body_size: u32,
+        block_body_hash: [u8; 32],
+        certified_eb: bool,
+        announced_eb: Option<([u8; 32], u32)>,
+    ) -> Vec<u8> {
+        use minicbor::encode::Error as EncodeError;
+        use std::io::Write as _;
+
+        let mut body_buf = Vec::new();
+        let mut be = Encoder::new(&mut body_buf);
+        be.array(HEADER_BODY_BASE_FIELDS + 2).unwrap(); // always 12
+        be.u64(block_number).unwrap();
+        be.u64(slot).unwrap();
+        match prev_hash {
+            Some(h) => {
+                be.bytes(&h).unwrap();
+            }
+            None => {
+                be.null().unwrap();
+            }
+        }
+        be.bytes(&issuer_vkey).unwrap();
+        be.bytes(&[0u8; 32]).unwrap();
+        be.array(2).unwrap();
+        be.bytes(&[0u8; 32]).unwrap();
+        be.bytes(&[0u8; 32]).unwrap();
+        be.u32(body_size).unwrap();
+        be.bytes(&block_body_hash).unwrap();
+        be.array(4).unwrap();
+        be.bytes(&[0u8; 32]).unwrap();
+        be.u64(0).unwrap();
+        be.u64(0).unwrap();
+        be.bytes(&[0u8; 64]).unwrap();
+        be.array(2).unwrap();
+        be.u32(12).unwrap(); // protocol major version 12 (Dijkstra)
+        be.u32(0).unwrap();
+
+        // Trailing Leios fields, Dijkstra order: certified_eb THEN announced_eb.
+        be.bool(certified_eb).unwrap();
+        match announced_eb {
+            Some((eb_hash, eb_size)) => {
+                be.array(2).unwrap();
+                be.bytes(&eb_hash).unwrap();
+                be.u32(eb_size).unwrap();
+            }
+            None => {
+                be.null().unwrap();
+            }
+        }
+
+        let mut inner_buf = Vec::new();
+        let mut ie = Encoder::new(&mut inner_buf);
+        ie.array(2).unwrap();
+        ie.writer_mut()
+            .write_all(&body_buf)
+            .map_err(EncodeError::write)
+            .unwrap();
+        ie.bytes(&[0u8; 64]).unwrap();
+
+        let mut outer_buf = Vec::new();
+        let mut oe = Encoder::new(&mut outer_buf);
+        oe.array(2).unwrap();
+        oe.u32(era as u32).unwrap();
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner_buf).unwrap();
+        outer_buf
+    }
+
+    #[test]
+    fn parse_dijkstra_header_no_eb() {
+        // certified_eb=false, announced_eb=nil → the fixed-12 layout with a
+        // trailing CBOR null that older parsers rejected outright.
+        let raw = build_test_header_dijkstra(
+            6,
+            100,
+            200,
+            Some([0xAA; 32]),
+            [0xBB; 32],
+            2048,
+            [0xCC; 32],
+            false,
+            None,
+        );
+        let info = HeaderInfo::parse(&raw).expect("Dijkstra no-EB header must parse");
+        assert_eq!(info.certified_eb, Some(false));
+        assert_eq!(info.announced_eb, None);
+    }
+
+    #[test]
+    fn parse_dijkstra_header_with_eb() {
+        // certified_eb=true, announced_eb=[hash32, size] as array(2), LAST.
+        let eb_hash = [0x77; 32];
+        let raw = build_test_header_dijkstra(
+            6,
+            6202,
+            126_440,
+            Some([0xAA; 32]),
+            [0xBB; 32],
+            4,
+            [0xCC; 32],
+            true,
+            Some((eb_hash, 65536)),
+        );
+        let info = HeaderInfo::parse(&raw).expect("Dijkstra EB header must parse");
+        assert_eq!(info.certified_eb, Some(true));
+        assert_eq!(info.announced_eb, Some((eb_hash, 65536)));
+    }
+
+    /// Real header captured from the 2026w27 leios-prototype dev relay
+    /// (leios-node.play.dev.cardano.org), block 0 of the 2026-07-01 respin.
+    /// Era 6, fixed array(12) header_body, trailing `f4 f6` =
+    /// `certified_eb=false, announced_eb=nil`.  Wire-locks the Dijkstra
+    /// layout (cardano-ledger #5889) against a live-network sample.
+    #[test]
+    fn parse_real_dijkstra_relay_header() {
+        const RELAY_HEADER: &str = "8206d818590330828c0017f65820e9716933be318d9d700786213ed6aea5c68ea000f06aa753fd4f24c43dfd3e55582056bc41b070f03712217873d6993b1c42f38030ee2ec5a2b1f37da70f8d81a1d38258407cc17f9894b8730ffb0c8639d036bde764d531d41afbe50a6a1d310821ba7bbeb6877359d99a3d909e6e4475aedd2885b89ef82ea485b7b61ffadf0586b06f335850375477fdb4a2a972979beaec169bd5e6702acdc704b42fa401ef0af52aed1d9628f6a5d17d3c4db096ed490987d95be09fb9b0789559de2cc00b013821487396d92f6b658773294a3f342688bc72bd0704582029571d16f081709b3c48651860077bebf9340abb3fc7133443c54f1f5a5edcf1845820be96953dc057cf17fc360f8927ffc4606ffb7f95e4d32c71c9d1e01b04622081000058403431b1476c0af7b52878c4d43e59f92471b74b02b54aeca0af637b604fc3e5a750bc8ed627550bbe2f9baeacfa072ef6c2f56408ab5a0a84c91f8e886bdf3c0f820c00f4f65901c03895fb429176938da031ba1b7232580b5d50ef324ecfcb51f2889a09f775f15dee08940e925aba982e1fea3582f1b88f2ac8e4cf39fe8ee85352b0479cc8a8010db898100a2023805598a6dbbca20cfb751d044f7e70dc15f43948af5b17dacfc2c720c37232ec22128d25050e8aa9c329c999c70747c2a8247a0245a8380d70daab2b5b5e782155da5fdfe3fe7310ccf7e9c3abce721edbf273b8a773d3fc8f72811bf37519d78c991ca5440918fe4355ff1a64c262b2241d04970327d156d21f2d41fb42ab0cd3a1b20210fa75da2f337d3ac2844c1b5c538a3dfd0d3367d465ae2a8f5727e352e6414823128494bd9cfeca2dfed64e60c807be91dbe871696ec5cb0e12d7eefc30534d312b91fded38cad2daeca90689ddb826109443d4e66bfcad27cb4f4e18f7d0dcfd1882228e4db1dc56da72c0380530707658e8e4bbcb14df4ca7494f36adc1439125bf229fd345cdf400448589ba08bc20bf6e7c7a487e08d8ff05ca0584368127fcc58debeae0fcb29e270607f9fdf6499b4cb47a6a9440b411adb7aa6311210068bbbf6a5bbe456e80fd22efc82ff1574af1e8fcfe42a12d76dee5c7e6114e79aefbd40c819a62a566288039d4030316186ae881";
+        let raw = hex(RELAY_HEADER);
+        let info = HeaderInfo::parse(&raw).expect("real Dijkstra relay header must parse");
+        assert_eq!(info.era, 6);
+        assert_eq!(info.block_number, 0);
+        assert_eq!(info.slot, 23);
+        assert_eq!(info.prev_hash, None); // genesis successor
+        assert_eq!(info.body_size, 4);
+        assert_eq!(info.certified_eb, Some(false));
+        assert_eq!(info.announced_eb, None);
     }
 }
