@@ -358,14 +358,12 @@ mod tests {
                 .send(&Message::MsgLeiosVotes {
                     votes: vec![
                         Vote {
-                            slot: 100,
-                            eb_hash: [0x11; 32],
+                            announcing_rb_hash: [0x11; 32],
                             voter_id: 1,
                             vote_signature: vec![0xAB; 48],
                         },
                         Vote {
-                            slot: 101,
-                            eb_hash: [0x22; 32],
+                            announcing_rb_hash: [0x22; 32],
                             voter_id: 2,
                             vote_signature: vec![0xCD; 48],
                         },
@@ -430,8 +428,7 @@ mod tests {
                     assert_eq!(
                         votes[0],
                         Vote {
-                            slot: 100,
-                            eb_hash: [0x11; 32],
+                            announcing_rb_hash: [0x11; 32],
                             voter_id: 1,
                             vote_signature: vec![0xAB; 48],
                         }
@@ -439,8 +436,7 @@ mod tests {
                     assert_eq!(
                         votes[1],
                         Vote {
-                            slot: 101,
-                            eb_hash: [0x22; 32],
+                            announcing_rb_hash: [0x22; 32],
                             voter_id: 2,
                             vote_signature: vec![0xCD; 48],
                         }

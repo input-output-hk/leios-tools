@@ -823,7 +823,7 @@ fn notification_to_ln_msg(n: &crate::store::leios_store::LeiosNotification) -> L
         LeiosNotification::BlockTxsOffer { point } => LnMsg::MsgLeiosBlockTxsOffer {
             point: point.clone(),
         },
-        LeiosNotification::Votes { votes } => LnMsg::MsgLeiosVotes {
+        LeiosNotification::Votes { votes, .. } => LnMsg::MsgLeiosVotes {
             votes: votes.clone(),
         },
     }

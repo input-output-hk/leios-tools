@@ -21,15 +21,21 @@ pub enum PipelinePhase {
 
 /// Per-EB election state.
 ///
-/// The struct is sans-IO and carries no transport identifier for the EB —
-/// callers key elections by EB hash externally and pass `eb_hash` to
-/// `record_vote` for any logging that needs it.
+/// The struct is sans-IO. Callers key elections by the **announcing RB
+/// hash** (the RB whose header announced the EB), not by the EB hash:
+/// under RB-header equivocation the same EB can be announced by two
+/// distinct RBs, and each announcement is a separate election, so votes
+/// for one can't be replayed against the other. The EB hash is carried
+/// as an attribute (`eb_hash`) for body correlation and cert targeting.
 ///
 /// `voter_weights` is a `BTreeMap` so iteration order is deterministic.
 /// Election-side aggregations (`Σ weight`, `len()`) are commutative, so
 /// determinism isn't strictly needed here, but the simulator's contract
 /// is uniform: no `HashMap` traversal anywhere in shared-consensus.
 pub struct EbElection {
+    /// Hash of the endorser block this election is about (the EB the
+    /// announcing RB committed to). Attribute, not the map key.
+    pub eb_hash: [u8; 32],
     pub announced_slot: u64,
     pub phase: PipelinePhase,
     /// Slot at which this node first learned of the EB. Used by the

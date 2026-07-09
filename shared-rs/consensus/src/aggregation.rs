@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use tracing::info;
 
-use super::pipeline::{EbElection, PipelineConfig};
+use super::pipeline::EbElection;
 
 /// Returned from `record_vote` when a vote causes quorum to fire for the
 /// first time. The caller uses this to emit `LeiosQuorumReached` telemetry.
@@ -28,45 +28,31 @@ pub struct QuorumFormed {
 /// - `StakeCentile`: the voter's stake (`expected_total_weight` is
 ///   then `total_active_stake`, matching CIP-164 PR #1196).
 ///
-/// If no election exists for `eb_hash`, a vote-placeholder is created
-/// at `(eb_slot, current_slot)` with `body_validated_locally = false`.
-/// CIP-0164 certs are independently verifiable from vote signatures,
-/// so a node can aggregate votes for an EB whose body it hasn't
-/// validated locally (or even fetched yet); the producer-side
-/// EB-safety gate then ensures any cert built from such an aggregate
-/// rides on an empty RB body until the closure validates.
+/// The election is keyed by the announcing RB hash (`rb_hash`) and must
+/// already exist — created by [`crate::elections::Elections::announce_from_rb`]
+/// when the RB header announcing the EB was observed. A vote for an
+/// unknown announcing RB is dropped (returns `None`): the announcement
+/// arrives via ChainSync at Praos priority, ahead of votes. CIP-0164
+/// certs are independently verifiable from vote signatures, so quorum
+/// can form before the EB *body* is validated locally
+/// (`body_validated_locally` may still be false); the producer-side
+/// EB-safety gate ensures any cert built from such an aggregate rides on
+/// an empty RB body until the closure validates.
 ///
 /// Quorum: `Σ weight ≥ quorum_weight_fraction × expected_total_weight`.
 /// Returns `Some(QuorumFormed)` exactly once per election.
-#[allow(clippy::too_many_arguments)]
 pub fn record_vote(
     elections: &mut BTreeMap<[u8; 32], EbElection>,
-    eb_hash: &[u8; 32],
-    eb_slot: u64,
+    rb_hash: &[u8; 32],
     voter_id: Vec<u8>,
     weight: u64,
     quorum_weight_fraction: f64,
     expected_total_weight: u64,
-    current_slot: u64,
-    pipeline: PipelineConfig,
     node_id: &str,
 ) -> Option<QuorumFormed> {
-    let election = match elections.get_mut(eb_hash) {
-        Some(e) => e,
-        None => {
-            let elapsed = current_slot.saturating_sub(eb_slot);
-            let phase = pipeline.phase_for_elapsed(elapsed);
-            elections.entry(*eb_hash).or_insert(EbElection {
-                announced_slot: eb_slot,
-                phase,
-                seen_slot: current_slot,
-                voted: false,
-                voter_weights: BTreeMap::new(),
-                quorum_reached: false,
-                body_validated_locally: false,
-            })
-        }
-    };
+    // No election for this announcing RB — its header hasn't been seen
+    // (or has been pruned). Nothing to aggregate against.
+    let election = elections.get_mut(rb_hash)?;
 
     use std::collections::btree_map::Entry;
     if let Entry::Vacant(e) = election.voter_weights.entry(voter_id) {
@@ -93,7 +79,8 @@ pub fn record_vote(
     info!(
         node_id = %node_id,
         eb_slot = election.announced_slot,
-        eb_hash = %hex_prefix(eb_hash),
+        rb_hash = %hex_prefix(rb_hash),
+        eb_hash = %hex_prefix(&election.eb_hash),
         voted_weight,
         threshold,
         voters,
@@ -144,6 +131,7 @@ mod tests {
         (
             hash,
             EbElection {
+                eb_hash: [0xEB; 32],
                 announced_slot: slot,
                 phase: PipelinePhase::Voting,
                 seen_slot: slot,
@@ -164,13 +152,10 @@ mod tests {
         record_vote(
             elections,
             hash,
-            EB_SLOT,
             voter_id,
             weight,
             QUORUM_FRACTION,
             EXPECTED_TOTAL_WEIGHT,
-            CURRENT_SLOT,
-            test_pipeline(),
             "test",
         );
     }
@@ -244,19 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn vote_for_unknown_eb_creates_placeholder() {
-        // CIP-0164 cert assembly does not require local body validation
-        // — a node aggregates votes for any `eb_hash` it sees signed
-        // votes for.  Verify the placeholder is created with
-        // `body_validated_locally = false` so the producer-side
-        // EB-safety gate can fire on certs built from such aggregates.
+    fn vote_for_unknown_rb_is_dropped() {
+        // Elections are keyed by announcing RB and created when that RB's
+        // header is observed (ChainSync, ahead of votes).  A vote whose
+        // announcing RB has no election — the header hasn't been seen, or
+        // it was pruned — has nothing to aggregate against and is dropped
+        // (no placeholder).
         let mut elections = BTreeMap::new();
-        let unknown_hash = [0xFF; 32];
-        vote(&mut elections, &unknown_hash, vec![1], 500);
-        let e = &elections[&unknown_hash];
-        assert_eq!(e.announced_slot, EB_SLOT);
-        assert!(!e.body_validated_locally);
-        assert_eq!(e.voter_weights.len(), 1);
+        let unknown_rb = [0xFF; 32];
+        vote(&mut elections, &unknown_rb, vec![1], 500);
+        assert!(
+            elections.is_empty(),
+            "vote for an unknown announcing RB must not create an election"
+        );
     }
 
     #[test]

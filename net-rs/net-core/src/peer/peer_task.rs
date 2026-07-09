@@ -537,8 +537,7 @@ pub(crate) fn spawn_leios_notify(
                     for v in &votes {
                         tracing::debug!(
                             %peer_id,
-                            slot = v.slot,
-                            eb_hash = %hex32(&v.eb_hash),
+                            announcing_rb_hash = %hex32(&v.announcing_rb_hash),
                             voter_id = v.voter_id,
                             sig_len = v.vote_signature.len(),
                             "leios_notify: vote"
@@ -1219,8 +1218,7 @@ mod tests {
             runner
                 .send(&LnMsg::MsgLeiosVotes {
                     votes: vec![crate::types::Vote {
-                        slot: 100,
-                        eb_hash: [0xAB; 32],
+                        announcing_rb_hash: [0xAB; 32],
                         voter_id: 1,
                         vote_signature: vec![0xAB; 48],
                     }],
@@ -1257,7 +1255,7 @@ mod tests {
             match event2 {
                 PeerEvent::LeiosVotesReceived { votes } => {
                     assert_eq!(votes.len(), 1);
-                    assert_eq!(votes[0].slot, 100);
+                    assert_eq!(votes[0].announcing_rb_hash, [0xAB; 32]);
                     assert_eq!(votes[0].voter_id, 1);
                 }
                 other => panic!("expected LeiosVotesReceived, got {other:?}"),

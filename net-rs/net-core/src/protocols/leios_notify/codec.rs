@@ -57,9 +57,9 @@ impl minicbor::Encode<()> for Message {
                 e.u32(4)?;
                 e.array(votes.len() as u64)?;
                 for vote in votes {
-                    e.array(4)?;
-                    e.u64(vote.slot)?;
-                    e.bytes(&vote.eb_hash)?;
+                    // vote = [announcing_rb_hash, voter_id, vote_signature]
+                    e.array(3)?;
+                    e.bytes(&vote.announcing_rb_hash)?;
                     e.u16(vote.voter_id)?;
                     e.bytes(&vote.vote_signature)?;
                 }
@@ -178,23 +178,23 @@ fn decode_votes(d: &mut Decoder<'_>) -> Result<Vec<Vote>, DecodeError> {
 
 /// Decode a single `vote = [slot, eb_hash, voter_id, vote_signature]`.
 fn decode_vote(d: &mut Decoder<'_>) -> Result<Vote, DecodeError> {
+    // vote = [announcing_rb_hash: hash32, voter_id: word16,
+    //         vote_signature: bytes .size 48]
     let len = d.array()?;
-    let slot = d.u64()?;
     let hash_bytes = d.bytes()?;
     if hash_bytes.len() != 32 {
         return Err(DecodeError::message(format!(
-            "vote eb_hash must be 32 bytes, got {}",
+            "vote announcing_rb_hash must be 32 bytes, got {}",
             hash_bytes.len()
         )));
     }
-    let mut eb_hash = [0u8; 32];
-    eb_hash.copy_from_slice(hash_bytes);
+    let mut announcing_rb_hash = [0u8; 32];
+    announcing_rb_hash.copy_from_slice(hash_bytes);
     let voter_id = d.u16()?;
     let vote_signature = d.bytes()?.to_vec();
-    skip_trailing(d, len, 4)?;
+    skip_trailing(d, len, 3)?;
     Ok(Vote {
-        slot,
-        eb_hash,
+        announcing_rb_hash,
         voter_id,
         vote_signature,
     })
@@ -300,14 +300,12 @@ mod tests {
         let msg = Message::MsgLeiosVotes {
             votes: vec![
                 Vote {
-                    slot: 100,
-                    eb_hash: [0x11; 32],
+                    announcing_rb_hash: [0x11; 32],
                     voter_id: 130,
                     vote_signature: sig_a.clone(),
                 },
                 Vote {
-                    slot: 200,
-                    eb_hash: [0x22; 32],
+                    announcing_rb_hash: [0x22; 32],
                     voter_id: 65535,
                     vote_signature: sig_b.clone(),
                 },
@@ -317,10 +315,10 @@ mod tests {
         match decoded {
             Message::MsgLeiosVotes { votes } => {
                 assert_eq!(votes.len(), 2);
-                assert_eq!(votes[0].slot, 100);
+                assert_eq!(votes[0].announcing_rb_hash, [0x11; 32]);
                 assert_eq!(votes[0].voter_id, 130);
                 assert_eq!(votes[0].vote_signature, sig_a);
-                assert_eq!(votes[1].eb_hash, [0x22; 32]);
+                assert_eq!(votes[1].announcing_rb_hash, [0x22; 32]);
                 assert_eq!(votes[1].voter_id, 65535);
                 assert_eq!(votes[1].vote_signature, sig_b);
             }
@@ -375,26 +373,32 @@ mod tests {
     /// length the deployment is using).
     #[test]
     fn decode_synthetic_bls_votes() {
+        // Real MsgLeiosVotes captured off the 2026w27 leios-prototype dev
+        // relay. vote = [announcing_rb_hash: hash32, voter_id: word16,
+        // vote_signature: bytes .size 48] (blueprint pr-67 CDDL).
         let bytes = hex(concat!(
-            "82",                                                               // array(2)
-            "04",                                                               // tag = 4
-            "81",                                                               // votes array(1)
-            "84",                                                               // vote array(4)
-            "1a0005dfc7",                                                       // slot = 0x0005dfc7
-            "5820",                                                             // bytes(32) header
-            "630ee36ae6a20e024a30cb582b3fcd1fd3a1aa0df16c1c7be53fea9ac3f1f70b", // eb_hash
-            "1882",                                                             // voter_id = 130
-            "5830",                                                             // bytes(48) header
-            "abababababababababababababababababababababababababababababababab", // sig (32 bytes)
-            "abababababababababababababababab", // sig (16 bytes) → 48 total
+            "82",   // array(2)
+            "04",   // tag = 4 (MsgLeiosVotes)
+            "81",   // votes array(1)
+            "83",   // vote array(3)
+            "5820", // bytes(32) header
+            "13e6edd7f422f62a8b0b0b0d2707174f1538dbeaa9c059e7f3b2f53736fbef31", // announcing_rb_hash
+            "04",   // voter_id = 4
+            "5830", // bytes(48) header
+            "a4864c44beff9e18eca7d182c85ddedb609d97031b956b99ab674fba239d67e0", // sig (32 bytes)
+            "24d571486ebe98c49a61011f04c8845f",                                 // sig (16 bytes) → 48 total
         ));
         let decoded: Message = minicbor::decode(&bytes).unwrap();
         match &decoded {
             Message::MsgLeiosVotes { votes } => {
                 assert_eq!(votes.len(), 1);
-                assert_eq!(votes[0].slot, 0x0005_dfc7);
-                assert_eq!(votes[0].voter_id, 0x82); // 130
-                assert_eq!(votes[0].vote_signature, vec![0xAB; 48]);
+                assert_eq!(
+                    votes[0].announcing_rb_hash.as_slice(),
+                    hex("13e6edd7f422f62a8b0b0b0d2707174f1538dbeaa9c059e7f3b2f53736fbef31")
+                        .as_slice()
+                );
+                assert_eq!(votes[0].voter_id, 4);
+                assert_eq!(votes[0].vote_signature.len(), 48);
             }
             other => panic!("expected MsgLeiosVotes, got {other:?}"),
         }
@@ -411,17 +415,16 @@ mod tests {
         e.array(2).unwrap();
         e.u32(4).unwrap();
         e.array(1).unwrap();
-        e.array(5).unwrap(); // 5-element vote: 4 known + 1 future field
-        e.u64(7).unwrap();
-        e.bytes(&[0xAB; 32]).unwrap();
-        e.u16(3).unwrap();
-        e.bytes(&[0xCD; 48]).unwrap();
+        e.array(4).unwrap(); // 4-element vote: 3 known + 1 future field
+        e.bytes(&[0xAB; 32]).unwrap(); // announcing_rb_hash
+        e.u16(3).unwrap(); // voter_id
+        e.bytes(&[0xCD; 48]).unwrap(); // vote_signature
         e.u64(999).unwrap(); // trailing field
         let decoded: Message = minicbor::decode(&buf).unwrap();
         match decoded {
             Message::MsgLeiosVotes { votes } => {
                 assert_eq!(votes.len(), 1);
-                assert_eq!(votes[0].slot, 7);
+                assert_eq!(votes[0].announcing_rb_hash, [0xAB; 32]);
                 assert_eq!(votes[0].voter_id, 3);
             }
             other => panic!("expected MsgLeiosVotes, got {other:?}"),

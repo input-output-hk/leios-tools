@@ -547,6 +547,14 @@ impl PraosState {
         })
     }
 
+    /// Hash of the adopted RB tip, if any.  Feeds
+    /// [`crate::leios::ChainTipContext::tip_rb_hash`]: the announcing-RB
+    /// key of the election for the tip's announced EB, and the
+    /// `announcing_rb_hash` carried by votes the local node emits.
+    pub fn adopted_tip_rb_hash(&self) -> Option<[u8; 32]> {
+        self.adopted_tip_hash
+    }
+
     /// Slot at which the adopted tip RB's header was first observed
     /// locally.  Falls back to the RB's own slot if the I/O wrapper
     /// never called [`PraosState::note_header_first_seen`] for this hash — that's a
