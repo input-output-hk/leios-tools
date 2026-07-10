@@ -176,6 +176,27 @@ pub enum NoVoteReason {
     Declined,
 }
 
+impl NoVoteReason {
+    /// Stable, field-free tag for telemetry and aggregation (kebab-case, matching
+    /// the serde `rename_all`). Use this for the wire/telemetry string instead of
+    /// `format!("{self:?}")`: the Debug form of the struct variant `MissingTX`
+    /// includes its fields (e.g. `"MissingTX { required: 1, .. }"`), which breaks
+    /// exact-match aggregation downstream. `tag()` always returns just the variant
+    /// name, so consumers can match it exactly.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            NoVoteReason::LateEB => "late-eb",
+            NoVoteReason::LateRBHeader => "late-rb-header",
+            NoVoteReason::WrongEB => "wrong-eb",
+            NoVoteReason::NoChainTip => "no-chain-tip",
+            NoVoteReason::MissingTX { .. } => "missing-tx",
+            NoVoteReason::EBValidating => "eb-validating",
+            NoVoteReason::EquivocatingRB => "equivocating-rb",
+            NoVoteReason::Declined => "declined",
+        }
+    }
+}
+
 /// Result of evaluating the CIP-0164 voting predicates for one EB.
 ///
 /// `Ok((emit_pv, npv_signature))` means the voter cast at least one
