@@ -15,6 +15,10 @@ pub struct QuorumFormed {
     pub eb_slot: u64,
     pub voted_weight: u64,
     pub voters: usize,
+    /// Expected total committee weight (the quorum denominator): quorum needs
+    /// `voted_weight ≥ ceil(τ · expected_weight)`. Surfaced so downstream
+    /// telemetry can compute the quorum margin `voted_weight / expected_weight`.
+    pub expected_weight: u64,
 }
 
 /// Record a vote for an EB. Deduplicates by `(voter_id, tag)`. The
@@ -90,6 +94,7 @@ pub fn record_vote(
         eb_slot: election.announced_slot,
         voted_weight,
         voters,
+        expected_weight: expected_total_weight,
     })
 }
 

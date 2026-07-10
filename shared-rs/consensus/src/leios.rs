@@ -317,6 +317,9 @@ pub enum LeiosTelemetryEvent {
         eb_slot: u64,
         voted_weight: u64,
         voters: usize,
+        /// Expected total committee weight (quorum denominator) — lets the
+        /// coordinator compute the quorum margin `voted_weight / expected_weight`.
+        expected_weight: u64,
     },
     ElectionExpired {
         eb_slot: u64,
@@ -1177,12 +1180,14 @@ impl LeiosState {
                     eb_slot,
                     voted_weight,
                     voters,
+                    expected_weight,
                 } = formed;
                 fx.push(LeiosEffect::EmitTelemetry(
                     LeiosTelemetryEvent::QuorumReached {
                         eb_slot,
                         voted_weight,
                         voters,
+                        expected_weight,
                     },
                 ));
             }
