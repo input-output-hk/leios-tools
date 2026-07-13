@@ -239,6 +239,18 @@ pub struct PraosState {
     pub node_id: String,
     pub security_param_k: u64,
 
+    /// Optional tip-hot window (in blocks) for block *bodies* only.
+    ///
+    /// `None` (default) keeps bodies for the full `k` window — archive /
+    /// full-history behaviour. `Some(w)` prunes `block_cache` to the last
+    /// `w` blocks while chain structure and headers stay pruned at `k`.
+    /// Bodies dropped below the window are re-fetched on demand via the
+    /// `WaitingForBlocks` → `BlockFetch` path if a fork switch ever needs
+    /// them, so `w` only has to cover practical reorg depth plus how far a
+    /// slightly-behind peer may be served from the hot cache — far below
+    /// `k`. Values `>= k` are inert.
+    pub block_body_retention_blocks: Option<u64>,
+
     pub chain_tree: ChainTree,
     pub adopted_tip_hash: Option<[u8; 32]>,
 
@@ -372,6 +384,7 @@ impl PraosState {
         Self {
             node_id,
             security_param_k,
+            block_body_retention_blocks: None,
             chain_tree: ChainTree::new(),
             adopted_tip_hash: None,
             self_produced: BTreeSet::new(),
@@ -410,6 +423,13 @@ impl PraosState {
     /// Replace the block-fetch policy.
     pub fn set_fetch_policy(&mut self, policy: Box<dyn BlockFetchPolicy + Send + Sync>) {
         self.block_policy = policy;
+    }
+
+    /// Set the tip-hot retention window (in blocks) for block bodies.
+    /// `None` keeps bodies for the full `k` window. See
+    /// [`PraosState::block_body_retention_blocks`].
+    pub fn set_block_body_retention_blocks(&mut self, blocks: Option<u64>) {
+        self.block_body_retention_blocks = blocks;
     }
 
     /// Replace the per-peer RTT oracle.
@@ -1221,20 +1241,45 @@ impl PraosState {
             "block validated, publishing to chain store"
         );
         fx.push(inject);
-        // Prune old blocks beyond k.
+        // Prune old state. Chain structure (`chain_tree`) and pending
+        // announced headers (`authentic_headers`) are kept for the full `k`
+        // window — needed to evaluate and anchor a reorg up to security depth.
+        // Block *bodies* are the expensive part and are only needed to serve
+        // slightly-behind peers or to replay a fork switch — so they get a
+        // (configurable) tighter tip-hot window, well below `k`. The bodies'
+        // bookkeeping maps (`validated`, `header_first_seen`) track the body
+        // window, not `k`: they're only useful while the body is held.
+        // Anything dropped from `block_cache` is re-fetched on demand: it
+        // also leaves `validated`, so the "held" check in `leading_missing_run`
+        // reports it missing (→ `WaitingForBlocks` → `BlockFetch`) and the
+        // dedup in `on_block_received` accepts the re-fetched copy.
         if let Some(adopted) = self.adopted_tip_hash {
             if let Some(bn) = self.chain_tree.block_number(&adopted) {
+                // Chain structure + pending announced headers: pruned at `k`.
                 if bn > self.security_param_k {
                     let min = bn - self.security_param_k;
                     self.chain_tree.prune_below(min);
-                    self.block_cache.retain(|_, cb| cb.block_no >= min);
-                    self.validated.retain(|h| self.block_cache.contains_key(h));
-                    self.header_first_seen
-                        .retain(|h, _| self.block_cache.contains_key(h));
                     // Pending headers (announced, not yet fetched) live here
                     // until consumed on cache; drop any whose block fell
                     // below the k window so they can't accumulate.
                     self.authentic_headers.retain(|_, (bn, _)| *bn >= min);
+                }
+                // Bodies (and their `validated` / `header_first_seen`
+                // bookkeeping): pruned at the tighter tip-hot window when set,
+                // otherwise at `k` (archive / full-history default). The window
+                // is clamped to `k` so a `Some(w)` with `w >= k` is inert —
+                // bodies never outlive the k-pruned chain structure, which
+                // would otherwise strand `validated` / `header_first_seen`
+                // entries for blocks whose `chain_tree` node is already gone.
+                let body_window = self
+                    .block_body_retention_blocks
+                    .map_or(self.security_param_k, |w| w.min(self.security_param_k));
+                let body_min = (bn > body_window).then(|| bn - body_window);
+                if let Some(body_min) = body_min {
+                    self.block_cache.retain(|_, cb| cb.block_no >= body_min);
+                    self.validated.retain(|h| self.block_cache.contains_key(h));
+                    self.header_first_seen
+                        .retain(|h, _| self.block_cache.contains_key(h));
                 }
             }
         }
@@ -2926,6 +2971,67 @@ mod tests {
         assert!(s.block_cache.contains_key(&h(2)));
         assert!(s.block_cache.contains_key(&h(3)));
         assert!(s.block_cache.contains_key(&h(4)));
+    }
+
+    #[test]
+    fn tip_hot_retention_prunes_bodies_but_keeps_structure() {
+        // k large so the k-prune never fires; body window = 2 blocks.
+        let mut s = PraosState::new("test".to_string(), 1000);
+        s.set_block_body_retention_blocks(Some(2));
+        install_validated_block(&mut s, 100, 1, 1, None);
+        install_validated_block(&mut s, 101, 2, 2, Some(1));
+        install_validated_block(&mut s, 102, 3, 3, Some(2));
+        install_validated_block(&mut s, 103, 4, 4, Some(3));
+        install_validated_block(&mut s, 104, 5, 5, Some(4));
+        s.adopted_tip_hash = Some(h(5));
+
+        let _ = s.on_block_applied(pt(104, 5), Instant::now());
+
+        // Body window = bn(5) - 2 = 3 ⇒ bodies for blocks 1,2 dropped, 3–5 kept.
+        assert!(!s.block_cache.contains_key(&h(1)));
+        assert!(!s.block_cache.contains_key(&h(2)));
+        assert!(s.block_cache.contains_key(&h(3)));
+        assert!(s.block_cache.contains_key(&h(5)));
+        // `validated` follows the body cache (the invariant that keeps the
+        // "held" check and the re-fetch dedup correct).
+        assert!(!s.validated.contains(&h(1)));
+        assert!(!s.validated.contains(&h(2)));
+        assert!(s.validated.contains(&h(3)));
+        // Chain structure is retained at k — headers / block numbers survive
+        // even though the bodies were dropped.
+        assert_eq!(s.chain_tree.block_number(&h(1)), Some(1));
+        assert_eq!(s.chain_tree.block_number(&h(2)), Some(2));
+    }
+
+    #[test]
+    fn pruned_body_is_flagged_missing_so_a_switch_refetches() {
+        // A block we validated then pruned (body dropped, structure kept)
+        // must register as "missing" for replay so a fork switch that needs
+        // it issues a BlockFetch instead of silently wedging.
+        let mut s = PraosState::new("test".to_string(), 1000);
+        s.set_block_body_retention_blocks(Some(2));
+        install_validated_block(&mut s, 100, 1, 1, None);
+        install_validated_block(&mut s, 101, 2, 2, Some(1));
+        install_validated_block(&mut s, 102, 3, 3, Some(2));
+        install_validated_block(&mut s, 103, 4, 4, Some(3));
+        install_validated_block(&mut s, 104, 5, 5, Some(4));
+        s.adopted_tip_hash = Some(h(5));
+        let _ = s.on_block_applied(pt(104, 5), Instant::now());
+
+        // Block 2's body is pruned, but it is still in the chain tree.
+        assert!(!s.block_cache.contains_key(&h(2)));
+        assert_eq!(s.chain_tree.block_number(&h(2)), Some(2));
+
+        // A replay that needs block 2 flags it missing (→ fetch), not held.
+        let missing = s.leading_missing_run(&[(pt(101, 2), h(2))]);
+        assert_eq!(missing, vec![pt(101, 2)]);
+
+        // `on_block_received`'s dedup keys on exactly these three sets; the
+        // pruned block is absent from all, so a re-fetched copy is accepted
+        // (not dropped) and can re-populate the cache — no wedge.
+        assert!(!s.block_cache.contains_key(&h(2)));
+        assert!(!s.validated.contains(&h(2)));
+        assert!(!s.in_flight_validation.contains(&h(2)));
     }
 
     #[test]

@@ -57,6 +57,12 @@ pub struct CoordinatorConfig {
     pub listen_address: Option<String>,
     /// Maximum blocks to retain in the chain store (for serving to responder peers).
     pub chain_store_capacity: usize,
+    /// Tip-hot window (in blocks) for retained block *bodies*. `Some(w)` caps
+    /// the chain store at `min(w, chain_store_capacity)` so an edge node keeps
+    /// only recent bodies (peers behind the window refetch from an archive
+    /// node); `None` keeps the full `chain_store_capacity` (archive default).
+    /// Mirrors the same window applied to `PraosState.block_cache`.
+    pub block_body_retention_blocks: Option<u64>,
     /// If true, outbound connections use duplex mode (both client and server protocols).
     pub duplex: bool,
     /// Enable Leios protocols (LeiosNotify, LeiosFetch). Default: false.
@@ -108,6 +114,7 @@ impl Default for CoordinatorConfig {
             sdu_timeout: Duration::from_secs(900),
             listen_address: None,
             chain_store_capacity: 2160,
+            block_body_retention_blocks: None,
             duplex: false,
             leios_enabled: false,
             leios_dedup_window: 1000,
