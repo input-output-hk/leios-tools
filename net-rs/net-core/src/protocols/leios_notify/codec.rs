@@ -176,7 +176,7 @@ fn decode_votes(d: &mut Decoder<'_>) -> Result<Vec<Vote>, DecodeError> {
     }
 }
 
-/// Decode a single `vote = [slot, eb_hash, voter_id, vote_signature]`.
+/// Decode a single `vote = [announcing_rb_hash, voter_id, vote_signature]`.
 fn decode_vote(d: &mut Decoder<'_>) -> Result<Vote, DecodeError> {
     // vote = [announcing_rb_hash: hash32, voter_id: word16,
     //         vote_signature: bytes .size 48]
