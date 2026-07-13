@@ -324,8 +324,12 @@ pub enum LeiosTelemetryEvent {
     ElectionExpired {
         eb_slot: u64,
         had_quorum: bool,
+        /// Final accumulated voted weight at end-of-round (incl. failed
+        /// elections) — the true quorum-margin numerator.
         voted_weight: u64,
         voters: usize,
+        /// Quorum denominator (`expected_total_weight`).
+        expected_weight: u64,
     },
     LeiosElectionInfo {
         eb_slot: u64,
@@ -707,6 +711,7 @@ impl LeiosState {
                     had_quorum,
                     voted_weight,
                     voters,
+                    expected_weight,
                     ..
                 } => {
                     fx.push(LeiosEffect::EmitTelemetry(
@@ -715,6 +720,7 @@ impl LeiosState {
                             had_quorum,
                             voted_weight,
                             voters,
+                            expected_weight,
                         },
                     ));
                 }
@@ -737,7 +743,30 @@ impl LeiosState {
                 .retain(|_, (s, _)| *s >= min_keep);
             self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
             self.validated_eb_bodies.retain(|_, s| *s >= min_keep);
-            self.elections.prune_below_slot(min_keep);
+            // Pruned elections emit their final voting tally so the quorum-
+            // margin sensor sees end-of-round weight (incl. elections that
+            // never reached quorum), not the always-~τ formation-time reading.
+            for eff in self.elections.prune_below_slot(min_keep) {
+                if let crate::elections::SlotEffect::Expired {
+                    eb_slot,
+                    had_quorum,
+                    voted_weight,
+                    voters,
+                    expected_weight,
+                    ..
+                } = eff
+                {
+                    fx.push(LeiosEffect::EmitTelemetry(
+                        LeiosTelemetryEvent::ElectionExpired {
+                            eb_slot,
+                            had_quorum,
+                            voted_weight,
+                            voters,
+                            expected_weight,
+                        },
+                    ));
+                }
+            }
             self.candidates.prune_below_slot(min_keep);
         }
         fx
