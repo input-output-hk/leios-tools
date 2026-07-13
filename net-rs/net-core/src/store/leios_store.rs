@@ -38,7 +38,13 @@ pub enum LeiosNotification {
     /// An EB's transactions are available for download.
     BlockTxsOffer { point: Point },
     /// Votes delivered inline (no offer/fetch round-trip).
-    Votes { votes: Vec<Vote> },
+    /// `retention_slot` is the tip slot when the votes were injected;
+    /// wire votes carry no slot, so this is what ages the notification
+    /// out of the slot-window prune alongside everything else.
+    Votes {
+        retention_slot: u64,
+        votes: Vec<Vote>,
+    },
 }
 
 /// A queued notification with every peer that has advertised this data
@@ -79,8 +85,12 @@ struct LeiosStoreInner {
     /// a fetched EB manifest. Pairs with `tx_body_resolver` to serve the
     /// bodies indirectly without keeping a duplicate copy.
     eb_tx_hashes: HashMap<BlockKey, Vec<TxId>>,
-    /// Votes keyed by (slot, eb_hash, voter_id), for dedup and re-serving.
-    votes: HashMap<(u64, [u8; 32], u16), Vote>,
+    /// Votes keyed by `(announcing_rb_hash, voter_id)` for dedup and
+    /// re-serving. The `u64` in the value is the tip slot observed when
+    /// the vote was injected — used as the retention key so votes age
+    /// out on the same slot window as the RBs they reference (the wire
+    /// vote carries no slot of its own).
+    votes: HashMap<([u8; 32], u16), (u64, Vote)>,
     /// Notification queue for the LeiosNotify server.  Front-pruned
     /// alongside the slot-window eviction of the other maps so
     /// long-running connections don't accumulate notifications for
@@ -314,24 +324,29 @@ impl LeiosStore {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        let max_in_batch = votes.iter().map(|v| v.slot).max().unwrap_or(0);
+        // Tag each vote with the current tip slot for retention (the wire
+        // vote has no slot; votes trail their announcing RB by a few
+        // slots, so the tip slot is a faithful window key).
+        let seen_slot = inner.max_slot;
         // Filter to genuinely-new votes — anything already in `inner.votes`
         // has been advertised previously and would generate a duplicate
         // wire notification if we re-pushed the full batch.
         let mut new_votes = Vec::with_capacity(votes.len());
         for vote in votes {
-            let key = (vote.slot, vote.eb_hash, vote.voter_id);
+            let key = (vote.announcing_rb_hash, vote.voter_id);
             if !inner.votes.contains_key(&key) {
                 new_votes.push(vote.clone());
             }
-            inner.votes.insert(key, vote);
+            inner.votes.insert(key, (seen_slot, vote));
         }
-        inner.max_slot = inner.max_slot.max(max_in_batch);
         if !new_votes.is_empty() {
             Self::push_notification(
                 &mut inner,
                 source,
-                LeiosNotification::Votes { votes: new_votes },
+                LeiosNotification::Votes {
+                    retention_slot: seen_slot,
+                    votes: new_votes,
+                },
                 true,
             );
         }
@@ -580,7 +595,7 @@ impl LeiosStore {
             inner.blocks.retain(|key, _| key.slot >= cutoff);
             inner.block_txs.retain(|key, _| key.slot >= cutoff);
             inner.eb_tx_hashes.retain(|key, _| key.slot >= cutoff);
-            inner.votes.retain(|(slot, _, _), _| *slot >= cutoff);
+            inner.votes.retain(|_, (slot, _)| *slot >= cutoff);
             // Front-prune `notifications` for entries that reference
             // only data older than the cutoff.  `push_notification`
             // refuses anything already below cutoff, so any below-cutoff
@@ -685,7 +700,7 @@ fn notification_evictable(n: &LeiosNotification, cutoff: u64) -> bool {
             Point::Specific { slot, .. } => *slot < cutoff,
             Point::Origin => true,
         },
-        LeiosNotification::Votes { votes } => votes.iter().all(|v| v.slot < cutoff),
+        LeiosNotification::Votes { retention_slot, .. } => *retention_slot < cutoff,
     }
 }
 
@@ -698,7 +713,7 @@ fn notification_evictable(n: &LeiosNotification, cutoff: u64) -> bool {
 fn notification_heap_bytes(n: &LeiosNotification) -> usize {
     match n {
         LeiosNotification::BlockOffer { .. } | LeiosNotification::BlockTxsOffer { .. } => 0,
-        LeiosNotification::Votes { votes } => votes.len() * std::mem::size_of::<Vote>(),
+        LeiosNotification::Votes { votes, .. } => votes.len() * std::mem::size_of::<Vote>(),
     }
 }
 
@@ -1038,11 +1053,15 @@ mod tests {
         assert_eq!(store.get_eb_manifest(99, &eb_hash), None);
     }
 
-    /// Test helper: a vote at `slot` from voter index `voter_id`.
-    fn vote(slot: u64, voter_id: u16) -> Vote {
+    /// Test helper: a vote from voter index `voter_id`, with an
+    /// announcing-RB hash derived from `rb` so distinct RBs get distinct
+    /// dedup keys. (The wire vote carries no slot; the store tags
+    /// retention from the tip at inject time.)
+    fn vote(rb: u64, voter_id: u16) -> Vote {
+        let mut announcing_rb_hash = [0u8; 32];
+        announcing_rb_hash[..8].copy_from_slice(&rb.to_le_bytes());
         Vote {
-            slot,
-            eb_hash: [voter_id as u8; 32],
+            announcing_rb_hash,
             voter_id,
             vote_signature: vec![0xAB; 48],
         }
@@ -1243,7 +1262,7 @@ mod tests {
         let entries = store.notifications_after(&mut 0);
         assert_eq!(entries.len(), 2);
         match &entries[1].notification {
-            LeiosNotification::Votes { votes } => {
+            LeiosNotification::Votes { votes, .. } => {
                 assert_eq!(votes.len(), 1, "second batch must filter out v2");
                 assert_eq!(votes[0].voter_id, v3.voter_id);
             }

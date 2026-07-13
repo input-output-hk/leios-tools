@@ -140,24 +140,30 @@ impl<'a> minicbor::Decode<'a, ()> for Tip {
 
 /// A Leios vote, delivered inline (no offer/fetch round-trip).
 ///
-/// Mirrors the CIP-0164 prototype wire shape
-/// (`vote = [slot, eb_hash, voter_id: word16, vote_signature: bytes]`):
+/// Mirrors the current LeiosNotify wire shape
+/// (`vote = [announcing_rb_hash: hash32, voter_id: word16,
+/// vote_signature: bytes .size 48]`):
 ///
-/// - `slot` — the slot at which the endorser block was announced (its
-///   election id); votes can arrive before the local node has seen the
-///   EB body, so the slot is needed to place the vote in its pipeline.
-/// - `eb_hash` — the endorser block being voted on.
+/// - `announcing_rb_hash` — hash of the ranking block (RB) that
+///   announced the endorser block being voted on. Identifying the vote
+///   target by the *announcing RB* rather than the EB hash binds the
+///   vote to a single chain position + issuer: an equivocated
+///   announcement (same EB offered under two RB headers) yields two
+///   distinct vote targets, so a vote can't be replayed across the fork.
 /// - `voter_id` — compact voter index; resolves to a registered pool
 ///   via the deterministic voter registry (see `committee.rs`).
-/// - `vote_signature` — BLS signature bytes (length determined by the
-///   live deployment; not yet validated by this prototype).
+/// - `vote_signature` — BLS signature bytes (48 bytes in the live
+///   deployment; length not validated by this prototype).
+///
+/// The vote no longer carries an explicit slot: retention/pruning is
+/// derived from the announcing RB (see the network store), and the
+/// election id is resolved from the RB, not carried on the wire.
 ///
 /// The CBOR codec lives in the network I/O layer (this crate stays
 /// format-agnostic); this is the logical value every consumer agrees on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Vote {
-    pub slot: u64,
-    pub eb_hash: [u8; 32],
+    pub announcing_rb_hash: [u8; 32],
     pub voter_id: u16,
     pub vote_signature: Vec<u8>,
 }

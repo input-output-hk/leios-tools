@@ -115,8 +115,8 @@ async fn leios_generator(commands: mpsc::Sender<NetworkCommand>, rate: f64) {
         let num_votes = rng.gen_range(1..=3u8);
         let votes: Vec<net_core::types::Vote> = (0..num_votes)
             .map(|v| net_core::types::Vote {
-                slot,
-                eb_hash: hash,
+                // Fake server: stub the announcing RB as the EB hash.
+                announcing_rb_hash: hash,
                 voter_id: v as u16,
                 vote_signature: Vec::new(),
             })

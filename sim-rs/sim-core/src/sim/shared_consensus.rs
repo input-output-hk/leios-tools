@@ -1395,9 +1395,11 @@ impl SharedConsensus {
         if weight == 0 {
             return;
         }
+        // The simulator does not model RB-header equivocation, so the
+        // announcing-RB election key maps 1:1 to the EB hash.
         self.leios
             .elections
-            .record_vote(&eb_hash, vote.id.eb.slot, voter_key, weight);
+            .record_vote(&eb_hash, voter_key, weight);
         self.votes_by_eb
             .entry(vote.id.eb)
             .or_default()
@@ -1749,6 +1751,9 @@ impl SharedConsensus {
         let ctx = ChainTipContext {
             rb_header_arrival_slot: self.praos.adopted_tip_header_arrival_slot(),
             eb_announcement: self.praos.adopted_tip_announced_eb(),
+            // No RB-header equivocation in the simulator: the announcing-RB
+            // election key is the announced EB hash itself.
+            tip_rb_hash: self.praos.adopted_tip_announced_eb(),
             tip_rb_slot: self.praos.adopted_tip_rb_slot(),
             // CIP-0164 RB-header equivocation set, fed from PraosState
             // on every chain-tip refresh.  Clone is cheap here — the
@@ -2042,6 +2047,8 @@ impl SharedConsensus {
                 LeiosEffect::EmitVote {
                     eb_slot,
                     eb_hash,
+                    // rb == eb in the simulator; the vote's target is the EB.
+                    announcing_rb_hash: _,
                     emit_pv,
                     npv_signature,
                 } => {

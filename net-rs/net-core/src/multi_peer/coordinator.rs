@@ -31,10 +31,12 @@ struct OfferDedup {
     seen_eb: BTreeSet<(PeerId, u64, [u8; 32])>,
     /// `(peer, slot, eb_hash)` already forwarded as `LeiosBlockTxsOffered`.
     seen_eb_txs: BTreeSet<(PeerId, u64, [u8; 32])>,
-    /// `(peer, slot, eb_hash, voter_id)` already forwarded as part of an
-    /// inline `LeiosVotesReceived`.  Per-vote because a single notify
-    /// carries a batch; dedup keeps gossiped duplicates from re-firing.
-    seen_votes: BTreeSet<(PeerId, u64, [u8; 32], u16)>,
+    /// `(peer, announcing_rb_hash, voter_id)` already forwarded as part
+    /// of an inline `LeiosVotesReceived`.  Per-vote because a single
+    /// notify carries a batch; dedup keeps gossiped duplicates from
+    /// re-firing.  The `u64` value is the tip slot when first seen — the
+    /// retention key (wire votes carry no slot of their own).
+    seen_votes: BTreeMap<(PeerId, [u8; 32], u16), u64>,
     max_slot: u64,
     window: u64,
 }
@@ -53,7 +55,7 @@ impl OfferDedup {
             let cutoff = slot.saturating_sub(self.window);
             self.seen_eb.retain(|(_, s, _)| *s >= cutoff);
             self.seen_eb_txs.retain(|(_, s, _)| *s >= cutoff);
-            self.seen_votes.retain(|(_, s, _, _)| *s >= cutoff);
+            self.seen_votes.retain(|_, s| *s >= cutoff);
         }
     }
 
@@ -72,13 +74,13 @@ impl OfferDedup {
     /// Filter an inline vote batch to fresh-for-this-peer entries.
     /// Updates internal state to record forwarding.
     fn fresh_votes(&mut self, peer: PeerId, votes: Vec<Vote>) -> Vec<Vote> {
+        // Wire votes carry no slot; tag dedup entries with the current
+        // tip (advanced by EB/EB-txs offers) for retention.
+        let seen_slot = self.max_slot;
         let mut out = Vec::with_capacity(votes.len());
         for vote in votes {
-            self.update_slot(vote.slot);
-            if self
-                .seen_votes
-                .insert((peer, vote.slot, vote.eb_hash, vote.voter_id))
-            {
+            let key = (peer, vote.announcing_rb_hash, vote.voter_id);
+            if self.seen_votes.insert(key, seen_slot).is_none() {
                 out.push(vote);
             }
         }

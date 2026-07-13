@@ -25,13 +25,17 @@ use crate::pipeline::{EbElection, PipelineConfig, PipelinePhase};
 /// first (sorted by `eb_hash`), then all `Expired` (also sorted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotEffect {
-    /// The local node is in the Voting window for this EB and has not
-    /// yet voted. Caller should compute its vote, send it to the network,
-    /// then call `mark_voted(eb_hash)` to suppress further re-emission.
-    /// `eb_seen_slot` is the slot at which this node first learned of the
-    /// EB, carried so the caller can apply the CIP-0164 `LateEB` predicate
-    /// without an extra accessor.
+    /// The local node is in the Voting window for this election and has
+    /// not yet voted. Caller should compute its vote, send it to the
+    /// network, then call `mark_voted(rb_hash)` to suppress further
+    /// re-emission. `rb_hash` is the announcing RB (the election key and
+    /// the emitted vote's `announcing_rb_hash`); `eb_hash` is the EB it
+    /// announced (needed for the `MissingTX` predicate and the NPV
+    /// eligibility signature). `eb_seen_slot` is the slot at which this
+    /// node first learned of the EB, carried so the caller can apply the
+    /// CIP-0164 `LateEB` predicate without an extra accessor.
     EligibleToVote {
+        rb_hash: [u8; 32],
         eb_hash: [u8; 32],
         eb_slot: u64,
         eb_seen_slot: u64,
@@ -159,41 +163,57 @@ impl Elections {
         self.elections.len()
     }
 
-    /// Mark an election as locally-body-validated.  If an election
-    /// already exists for `eb_hash` (e.g., as a vote-placeholder
-    /// created by `record_vote`), flips `body_validated_locally` to
-    /// true and preserves accumulated votes.  Otherwise creates a
-    /// fresh election with the flag set.  Returns `true` iff a new
-    /// election was inserted; `false` if a placeholder was upgraded or
-    /// the EB is already past its pipeline lifetime relative to
-    /// `current_slot`.
-    pub fn announce(&mut self, eb_slot: u64, eb_hash: [u8; 32]) -> bool {
-        if let Some(existing) = self.elections.get_mut(&eb_hash) {
-            existing.body_validated_locally = true;
+    /// Create an election for the EB announced by an RB.  Keyed by the
+    /// announcing RB hash (`rb_hash`), so two RBs that announce the same
+    /// EB (equivocation) produce two independent elections.  `rb_slot`
+    /// is the announcing RB's slot — the pipeline time-anchor (the EB
+    /// carries no separate slot; it is produced in its announcing RB's
+    /// slot).  Called when the RB header announcing the EB is observed
+    /// (via the chain-tip refresh), i.e. before the EB body is fetched;
+    /// `body_validated_locally` starts false and is flipped by
+    /// [`Self::mark_body_validated`].  No-op if the election already
+    /// exists.  Returns `true` iff a new election was inserted.
+    pub fn announce_from_rb(&mut self, rb_hash: [u8; 32], rb_slot: u64, eb_hash: [u8; 32]) -> bool {
+        if self.elections.contains_key(&rb_hash) {
             return false;
         }
-        let elapsed = self.current_slot.saturating_sub(eb_slot);
+        let elapsed = self.current_slot.saturating_sub(rb_slot);
         let phase = self.cfg.pipeline.phase_for_elapsed(elapsed);
         info!(
             node_id = %self.cfg.node_id,
-            eb_slot,
+            rb_hash = %hex_prefix(&rb_hash),
             eb_hash = %hex_prefix(&eb_hash),
+            eb_slot = rb_slot,
             ?phase,
             "eb election created"
         );
         self.elections.insert(
-            eb_hash,
+            rb_hash,
             EbElection {
-                announced_slot: eb_slot,
+                eb_hash,
+                announced_slot: rb_slot,
                 phase,
                 seen_slot: self.current_slot,
                 voted: false,
                 voter_weights: BTreeMap::new(),
                 quorum_reached: false,
-                body_validated_locally: true,
+                body_validated_locally: false,
             },
         );
         true
+    }
+
+    /// Flip `body_validated_locally` on every election whose announced
+    /// EB is `eb_hash` — the body just validated locally, and it is
+    /// valid regardless of which RB announced it (so all equivocated
+    /// announcements of it become "body in hand").  Scans the live
+    /// election set (bounded by the chain-progress prune window).
+    pub fn mark_body_validated(&mut self, eb_hash: &[u8; 32]) {
+        for e in self.elections.values_mut() {
+            if &e.eb_hash == eb_hash {
+                e.body_validated_locally = true;
+            }
+        }
     }
 
     /// Advance the slot counter, update phases, and emit effects.
@@ -206,12 +226,13 @@ impl Elections {
         let pipeline = self.cfg.pipeline;
         let mut effects: Vec<SlotEffect> = Vec::new();
 
-        // Pass 1: collect EligibleToVote in BTreeMap order.
-        for (hash, election) in &self.elections {
+        // Pass 1: collect EligibleToVote in BTreeMap order (by rb_hash).
+        for (rb_hash, election) in &self.elections {
             let elapsed = slot.saturating_sub(election.announced_slot);
             if pipeline.phase_for_elapsed(elapsed) == PipelinePhase::Voting && !election.voted {
                 effects.push(SlotEffect::EligibleToVote {
-                    eb_hash: *hash,
+                    rb_hash: *rb_hash,
+                    eb_hash: election.eb_hash,
                     eb_slot: election.announced_slot,
                     eb_seen_slot: election.seen_slot,
                 });
@@ -231,38 +252,36 @@ impl Elections {
         effects
     }
 
-    /// Caller invokes after a vote message for `eb_hash` was successfully
-    /// emitted to the network, to suppress further `EligibleToVote`
-    /// effects for this election.
-    pub fn mark_voted(&mut self, eb_hash: &[u8; 32]) {
-        if let Some(e) = self.elections.get_mut(eb_hash) {
+    /// Caller invokes after a vote message for the election keyed by
+    /// `rb_hash` was successfully emitted to the network, to suppress
+    /// further `EligibleToVote` effects for this election.
+    pub fn mark_voted(&mut self, rb_hash: &[u8; 32]) {
+        if let Some(e) = self.elections.get_mut(rb_hash) {
             e.voted = true;
         }
     }
 
-    /// Record a vote received for an EB. The caller decoded the vote
-    /// body and computed the weight (typically via `weight_for`).
-    /// Returns `Some(QuorumFormed)` exactly once per election.  If
-    /// the election doesn't exist yet, a vote-placeholder is created
-    /// at `eb_slot` (see [`aggregation::record_vote`] for the
-    /// CIP-0164 rationale).
+    /// Record a received vote against the election keyed by its
+    /// `announcing_rb_hash`. The caller decoded the vote body and
+    /// computed the weight (typically via `weight_for`). Returns
+    /// `Some(QuorumFormed)` exactly once per election. Votes whose
+    /// announcing RB has no election (the RB header announcing it has
+    /// not been observed) are dropped — the announcement, delivered via
+    /// ChainSync at Praos priority, precedes votes, so this is the
+    /// unusual case.
     pub fn record_vote(
         &mut self,
-        eb_hash: &[u8; 32],
-        eb_slot: u64,
+        rb_hash: &[u8; 32],
         voter_key: Vec<u8>,
         weight: u64,
     ) -> Option<QuorumFormed> {
         aggregation::record_vote(
             &mut self.elections,
-            eb_hash,
-            eb_slot,
+            rb_hash,
             voter_key,
             weight,
             self.cfg.quorum_weight_fraction,
             self.cfg.expected_total_weight,
-            self.current_slot,
-            self.cfg.pipeline,
             &self.cfg.node_id,
         )
     }
@@ -354,29 +373,38 @@ impl Elections {
             .unwrap_or(false)
     }
 
-    /// True iff the EB body has been locally validated (the
-    /// producer-side EB-safety gate's "I have the closure" predicate).
-    /// A vote-placeholder election exists when only votes have been
-    /// observed; this query returns false for that case so the gate
-    /// fires when the producer holds a cert for an EB whose body has
-    /// not been validated locally.
-    pub fn is_announced(&self, eb_hash: &[u8; 32]) -> bool {
+    /// True iff the election keyed by `rb_hash` has its EB body locally
+    /// validated (the producer-side EB-safety gate's "I have the
+    /// closure" predicate). False for an election whose body hasn't
+    /// validated yet, so the gate fires when the producer holds a cert
+    /// for an EB whose body has not been validated locally.
+    pub fn is_announced(&self, rb_hash: &[u8; 32]) -> bool {
         self.elections
-            .get(eb_hash)
+            .get(rb_hash)
             .map(|e| e.body_validated_locally)
             .unwrap_or(false)
     }
 
-    pub fn quorum(&self, eb_hash: &[u8; 32]) -> bool {
+    /// True iff *any* election that announced `eb_hash` has its body
+    /// validated locally. Used where only the EB hash is known (the
+    /// cert-safety gate keyed off a chain-committed cert), independent
+    /// of which RB announced it.
+    pub fn eb_body_validated(&self, eb_hash: &[u8; 32]) -> bool {
         self.elections
-            .get(eb_hash)
+            .values()
+            .any(|e| &e.eb_hash == eb_hash && e.body_validated_locally)
+    }
+
+    pub fn quorum(&self, rb_hash: &[u8; 32]) -> bool {
+        self.elections
+            .get(rb_hash)
             .map(|e| e.quorum_reached)
             .unwrap_or(false)
     }
 
-    pub fn voter_count(&self, eb_hash: &[u8; 32]) -> usize {
+    pub fn voter_count(&self, rb_hash: &[u8; 32]) -> usize {
         self.elections
-            .get(eb_hash)
+            .get(rb_hash)
             .map(|e| e.voter_weights.len())
             .unwrap_or(0)
     }
@@ -390,15 +418,14 @@ impl Elections {
         self.elections.retain(|_, e| e.announced_slot >= min_slot);
     }
 
-    /// Slot of the EB at `eb_hash` if it is both at quorum and
-    /// CertEligible — the only state in which a producer can attach a
-    /// cert for it.  Linear Leios requires the cert to target the EB
-    /// announced by the parent RB specifically (see
-    /// [`crate::chain_tree::ChainTree::announced_eb_hash_by`]); the
-    /// producer threads the parent RB's announced EB hash through this
-    /// method to decide whether to set the `certified_eb` header bit.
-    pub fn eb_certifiable_slot(&self, eb_hash: &[u8; 32]) -> Option<u64> {
-        let e = self.elections.get(eb_hash)?;
+    /// Slot of the election keyed by `rb_hash` if it is both at quorum
+    /// and CertEligible — the only state in which a producer can attach
+    /// a cert for it.  Linear Leios requires the cert to target the EB
+    /// announced by the parent RB specifically, so the producer threads
+    /// the parent RB's hash through this method to decide whether to set
+    /// the `certified_eb` header bit.
+    pub fn eb_certifiable_slot(&self, rb_hash: &[u8; 32]) -> Option<u64> {
+        let e = self.elections.get(rb_hash)?;
         if e.quorum_reached && e.phase == PipelinePhase::CertEligible {
             Some(e.announced_slot)
         } else {
@@ -469,7 +496,7 @@ mod tests {
     fn announce_creates_election() {
         let mut e = test_elections();
         e.on_slot(10);
-        assert!(e.announce(10, h(1)));
+        assert!(e.announce_from_rb(h(1), 10, h(1)));
         assert_eq!(e.count(), 1);
         assert_eq!(e.phase(&h(1)), Some(PipelinePhase::EquivocationCheck));
     }
@@ -478,8 +505,8 @@ mod tests {
     fn duplicate_announce_returns_false() {
         let mut e = test_elections();
         e.on_slot(10);
-        assert!(e.announce(10, h(1)));
-        assert!(!e.announce(10, h(1)));
+        assert!(e.announce_from_rb(h(1), 10, h(1)));
+        assert!(!e.announce_from_rb(h(1), 10, h(1)));
         assert_eq!(e.count(), 1);
     }
 
@@ -487,7 +514,7 @@ mod tests {
     fn on_slot_emits_eligible_to_vote_in_voting_phase() {
         let mut e = test_elections();
         e.on_slot(10);
-        e.announce(10, h(1));
+        e.announce_from_rb(h(1), 10, h(1));
         // EquivocationCheck is [0, 3): nothing.
         let fx = e.on_slot(11);
         assert!(fx.is_empty());
@@ -496,6 +523,7 @@ mod tests {
         assert_eq!(
             fx,
             vec![SlotEffect::EligibleToVote {
+                rb_hash: h(1),
                 eb_hash: h(1),
                 eb_slot: 10,
                 eb_seen_slot: 10,
@@ -507,7 +535,7 @@ mod tests {
     fn mark_voted_suppresses_repeat_eligible_to_vote() {
         let mut e = test_elections();
         e.on_slot(10);
-        e.announce(10, h(1));
+        e.announce_from_rb(h(1), 10, h(1));
         let fx = e.on_slot(13);
         assert_eq!(fx.len(), 1);
         e.mark_voted(&h(1));
@@ -520,9 +548,9 @@ mod tests {
         // Chain-progress prune: drop elections at slot < min_keep.
         let mut e = test_elections();
         e.on_slot(10);
-        e.announce(10, h(1));
-        e.announce(15, h(2));
-        e.announce(20, h(3));
+        e.announce_from_rb(h(1), 10, h(1));
+        e.announce_from_rb(h(2), 15, h(2));
+        e.announce_from_rb(h(3), 20, h(3));
         assert_eq!(e.count(), 3);
         e.prune_below_slot(15);
         assert_eq!(e.count(), 2);
@@ -536,9 +564,9 @@ mod tests {
         let mut e = test_elections();
         e.on_slot(10);
         // Announce out of order; effects should still come out sorted.
-        e.announce(10, h(3));
-        e.announce(10, h(1));
-        e.announce(10, h(2));
+        e.announce_from_rb(h(3), 10, h(3));
+        e.announce_from_rb(h(1), 10, h(1));
+        e.announce_from_rb(h(2), 10, h(2));
         let fx = e.on_slot(13);
         assert_eq!(fx.len(), 3);
         let hashes: Vec<[u8; 32]> = fx
@@ -555,10 +583,10 @@ mod tests {
     fn record_vote_fires_quorum_then_advances_to_certifiable() {
         let mut e = test_elections();
         e.on_slot(10);
-        e.announce(10, h(1));
+        e.announce_from_rb(h(1), 10, h(1));
         // 75% × 100 = 75. Two voters of weight 40 each cross 75.
-        assert!(e.record_vote(&h(1), 10, b"a".to_vec(), 40).is_none());
-        assert!(e.record_vote(&h(1), 10, b"b".to_vec(), 40).is_some());
+        assert!(e.record_vote(&h(1), b"a".to_vec(), 40).is_none());
+        assert!(e.record_vote(&h(1), b"b".to_vec(), 40).is_some());
         assert!(e.quorum(&h(1)));
         // After Voting+Diffusing windows, phase should be CertEligible.
         e.on_slot(23);
