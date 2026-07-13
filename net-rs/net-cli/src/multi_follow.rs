@@ -31,6 +31,7 @@ pub async fn run(
         sdu_timeout: Duration::from_secs(900),
         listen_address: listen.clone(),
         chain_store_capacity: 2160,
+        block_body_retention_blocks: None,
         duplex,
         leios_enabled: leios,
         leios_dedup_window: 1000,

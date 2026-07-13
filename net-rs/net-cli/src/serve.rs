@@ -148,6 +148,7 @@ pub async fn run(
         sdu_timeout: Duration::from_secs(900),
         listen_address: Some(format!("0.0.0.0:{port}")),
         chain_store_capacity: 10_000,
+        block_body_retention_blocks: None,
         duplex: false,
         leios_enabled: leios,
         leios_dedup_window: 1000,
