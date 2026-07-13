@@ -99,6 +99,7 @@ use shared_consensus::{
     production::BodyPath,
     types::Point,
 };
+use shared_consensus::leios::TxAvailability;
 
 /// Stake registry derived from the sim config. Every node builds an
 /// identical copy at startup so the persistent-committee allocation
@@ -606,7 +607,17 @@ impl NodeImpl for SharedConsensus {
         // self.leios is borrowed mutably.
         let mempool = &self.mempool;
         let tx_arcs = &self.tx_arcs;
-        let tx_known = |key: &TxId| mempool.has_tx(key) || tx_arcs.contains_key(key);
+        let tx_known = |key: &TxId| {
+            if mempool.eb_pinned.contains_key(key) {
+                TxAvailability::PresentPinned
+            }
+            else if mempool.has_tx(key) || tx_arcs.contains_key(key) {
+                TxAvailability::PresentUnpinned
+            }
+            else {
+                TxAvailability::Absent
+            }
+        };
         let leios_fx = self.leios.on_slot(slot, &tx_known);
         self.apply_leios_effects(&mut out, leios_fx);
         // Praos RB lottery — shared formula with net-rs.  Threshold lives
@@ -2045,7 +2056,12 @@ impl SharedConsensus {
                         NoVoteReason::LateEB => SimNoVoteReason::LateEB,
                         NoVoteReason::LateRBHeader => SimNoVoteReason::LateRBHeader,
                         NoVoteReason::WrongEB => SimNoVoteReason::WrongEB,
-                        NoVoteReason::MissingTX => SimNoVoteReason::MissingTX,
+                        // Sim has no dedicated "no adopted tip" telemetry;
+                        // fold into `WrongEB` (its former home before the
+                        // shared enum split the empty-context case out).
+                        NoVoteReason::NoChainTip => SimNoVoteReason::WrongEB,
+                        // TODO: sim no vote reason doesn't have extended MissingTX info. Should we add it?
+                        NoVoteReason::MissingTX { .. } => SimNoVoteReason::MissingTX,
                         // Sim has no dedicated "validating" telemetry;
                         // fold into `MissingEB` (semantic neighbour:
                         // we don't have the validated body yet).

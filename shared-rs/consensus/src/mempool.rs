@@ -698,6 +698,19 @@ impl MempoolState {
         self.bump_eb_slot(eb_key.slot)
     }
 
+    pub fn pin_eb_transactions(&mut self, _eb_key: &EbKey, manifest: &[TxId]) {
+        for to_pin in manifest {
+            let Some(body) = self
+                .txs
+                .iter()
+                .find(|tx| &tx.tx_id == to_pin) else {
+                    continue;
+                };
+
+            self.eb_pinned.entry(to_pin.clone()).or_insert_with(|| body.clone());
+        }
+    }
+
     /// Receiver-side: insert a body fetched via LeiosFetch.  `tx_id`
     /// must be the integrity-verified Blake2b-256 of `body` — the
     /// wrapper hashes incoming bodies and matches against the manifest

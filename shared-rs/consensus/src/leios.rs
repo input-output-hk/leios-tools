@@ -123,12 +123,31 @@ pub enum NoVoteReason {
     /// The chain-tip RB header arrived later than `eb_slot + Δhdr`,
     /// past the equivocation-resistant cutoff.
     LateRBHeader,
-    /// The chain-tip RB does not announce this EB.
+    /// The adopted chain-tip RB announces a *different* EB than this one.
+    /// A phase mismatch: the voter has a tip, but the tip has advanced to
+    /// an RB that endorses a later EB, so the EB under vote is no longer
+    /// the one the tip references. Distinct from [`NoVoteReason::NoChainTip`]
+    /// (no adopted tip at all), which was previously folded in here.
     WrongEB,
+    /// No adopted chain tip is available yet (`rb_header_arrival_slot`
+    /// is unset), so the announcement predicate cannot be evaluated —
+    /// e.g. a follower that hasn't populated its `ChainTipContext`, or a
+    /// node still catching up. Split out from [`NoVoteReason::WrongEB`]
+    /// so that `WrongEB` means specifically the announcement *mismatch*,
+    /// making a drifting tip/EB phase mismatch directly identifiable in
+    /// telemetry rather than shadowed by the empty-context case.
+    NoChainTip,
     /// At least one transaction the EB references is unknown locally.
     /// Only meaningful in TX-by-references mode; the wrapper supplies
     /// the `tx_known` callback that drives this check.
-    MissingTX,
+    MissingTX {
+        /// Total number of required TX for EB
+        required: usize,
+        /// Number of pinned TX, available in the mempool
+        present_pinned: usize,
+        /// Number of unpinned TX, available in the mempool
+        present_unpinned: usize,
+    },
     /// The EB body has not been validated locally yet — either the
     /// body hasn't been received (vote-placeholder election) or the
     /// body is present but the validator hasn't ratified it
@@ -381,6 +400,18 @@ pub struct LeiosState {
     pub control: ControlSignal,
 }
 
+/// Auxiliary enum for the `tx_known` callback passed into `LeiosState::on_slot`.
+/// Gives extended info about tx status in mempool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAvailability {
+    Absent,
+    /// Tx is present in mempool and pinned (i.e., specified in eb_pinned struct).
+    PresentPinned,
+    /// Tx is present in mempool but not pinned (i.e., can be evicted at any moment
+    /// if mempool is full).
+    PresentUnpinned,
+}
+
 impl LeiosState {
     /// Construct a new state with the default fetch policy
     /// ([`LowestRttFirst`] for both fetch-bearing traffic classes) and a
@@ -502,9 +533,14 @@ impl LeiosState {
     ///
     /// `tx_known` is the wrapper's predicate for "do we have this TX
     /// locally?" — used by the CIP-0164 `MissingTX` voting check in
-    /// TX-by-references mode.  Wrappers without a mempool surface yet
-    /// can pass `&|_| true`; in that case the predicate is a no-op.
-    pub fn on_slot(&mut self, slot: u64, tx_known: &dyn Fn(&TxId) -> bool) -> Vec<LeiosEffect> {
+    /// TX-by-references mode. It should return `TxAvailability::PresentPinned`
+    /// for any TX that is in the mempool, and `TxAvailability::PresentUnpinned`
+    /// for any TX that is in the mempool, but not pinned (yet?).
+    ///
+    /// Wrappers without a mempool surface yet can pass
+    /// `&|_| TxAvaialability::PresentPinned` (or Unpinned); in that case
+    /// the predicate is a no-op.
+    pub fn on_slot(&mut self, slot: u64, tx_known: &dyn Fn(&TxId) -> TxAvailability) -> Vec<LeiosEffect> {
         let mut fx: Vec<LeiosEffect> = Vec::new();
         for eff in self.elections.on_slot(slot) {
             match eff {
@@ -654,7 +690,7 @@ impl LeiosState {
         eb_hash: &[u8; 32],
         eb_slot: u64,
         eb_seen_slot: u64,
-        tx_known: &dyn Fn(&TxId) -> bool,
+        tx_known: &dyn Fn(&TxId) -> TxAvailability,
     ) -> VoteDecision {
         // Predicate 1: LateEB.  The EB must have arrived before its
         // voting window closes.  The phase machine already filters out
@@ -669,7 +705,7 @@ impl LeiosState {
         // and its header must have arrived within the equivocation
         // cutoff (`eb_slot + Δhdr`).
         let Some(rb_arrival) = self.chain_tip_ctx.rb_header_arrival_slot else {
-            return Err(NoVoteReason::WrongEB);
+            return Err(NoVoteReason::NoChainTip);
         };
         if self.chain_tip_ctx.eb_announcement.as_ref() != Some(eb_hash) {
             return Err(NoVoteReason::WrongEB);
@@ -696,10 +732,22 @@ impl LeiosState {
         // check; the validator will reject the EB body if it references
         // unknown TXs.
         if let Some((_, tx_hashes)) = self.eb_tx_hashes.get(eb_hash) {
+            let mut present_pinned = 0;
+            let mut present_unpinned = 0;
+            let mut decline = false;
             for h in tx_hashes {
-                if !tx_known(h) {
-                    return Err(NoVoteReason::MissingTX);
+                match tx_known(h) {
+                    TxAvailability::Absent => decline = true,
+                    TxAvailability::PresentPinned => present_pinned += 1,
+                    TxAvailability::PresentUnpinned => present_unpinned += 1,
                 }
+            }
+            if decline {
+                return Err(NoVoteReason::MissingTX {
+                    required: tx_hashes.len(),
+                    present_pinned,
+                    present_unpinned,
+                });
             }
         }
 
@@ -1308,6 +1356,7 @@ fn indices_to_bitmap(indices: &[u32]) -> BTreeMap<u16, u64> {
 
 #[cfg(test)]
 mod tests {
+    use crate::leios::TxAvailability::PresentPinned;
     use super::*;
     use crate::mempool::{TxBody, TxId};
 
@@ -1377,8 +1426,8 @@ mod tests {
 
     /// Default "all txs known" callback: predicates ignore MissingTX
     /// unless the test populates `eb_tx_hashes` and supplies its own.
-    fn tx_all(_: &TxId) -> bool {
-        true
+    fn tx_all(_: &TxId) -> TxAvailability {
+        PresentPinned
     }
 
     /// Set chain-tip context that satisfies the LateRBHeader / WrongEB
@@ -2008,15 +2057,16 @@ mod tests {
     }
 
     #[test]
-    fn no_vote_wrong_eb_when_chain_tip_not_set() {
+    fn no_vote_no_chain_tip_when_chain_tip_not_set() {
         // Default ChainTipContext has no rb_header_arrival_slot — predicate
-        // returns WrongEB before any other check.
+        // returns NoChainTip before any other check (distinct from the
+        // WrongEB announcement-mismatch case).
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
         state.on_slot(10, &tx_all);
         state.elections.announce(10, h(1));
         let fx = state.on_slot(13, &tx_all);
-        assert_no_vote(&fx, h(1), NoVoteReason::WrongEB);
-        // WrongEB is transient: do NOT mark_voted, so subsequent slots can
+        assert_no_vote(&fx, h(1), NoVoteReason::NoChainTip);
+        // NoChainTip is transient: do NOT mark_voted, so subsequent slots can
         // re-evaluate as the chain tip catches up.
         assert!(!state.elections.voted(&h(1)));
     }
@@ -2184,13 +2234,13 @@ mod tests {
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
         state.on_slot(10, &tx_all);
         state.elections.announce(10, h(1));
-        // No chain tip → WrongEB.
+        // No chain tip → NoChainTip.
         let fx_first = state.on_slot(13, &tx_all);
-        assert_no_vote(&fx_first, h(1), NoVoteReason::WrongEB);
+        assert_no_vote(&fx_first, h(1), NoVoteReason::NoChainTip);
         assert!(!state.elections.voted(&h(1)));
-        // Next slot: still no chain tip → WrongEB again, not suppressed.
+        // Next slot: still no chain tip → NoChainTip again, not suppressed.
         let fx_second = state.on_slot(14, &tx_all);
-        assert_no_vote(&fx_second, h(1), NoVoteReason::WrongEB);
+        assert_no_vote(&fx_second, h(1), NoVoteReason::NoChainTip);
     }
 
     // -- missing_eb_tx_bitmap ---------------------------------------------
