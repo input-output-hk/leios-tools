@@ -103,10 +103,10 @@ use crate::peer::connect::{self, DuplexConnection};
 use crate::peer::duplex_task::{
     run_accepted_duplex_task, run_duplex_task, AcceptedDuplexTaskConfig, DuplexTaskConfig,
 };
-use crate::peer::server_handlers::TxDedup;
 use crate::peer::peer_task::{
     client_protocol_configs, run_peer_task, server_protocol_configs, PeerTaskConfig,
 };
+use crate::peer::server_handlers::TxDedup;
 use crate::peer::types::{PeerCommand, PeerEvent};
 use crate::peer::{ConnectionMode, PeerId};
 use crate::store::chain_store::ChainStore;
@@ -668,8 +668,8 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeersDiscovered { peers });
             }
 
-            PeerEvent::TransactionReceived { body } => {
-                self.emit_event(NetworkEvent::TransactionReceived { peer_id, body });
+            PeerEvent::TransactionReceived { body, era } => {
+                self.emit_event(NetworkEvent::TransactionReceived { peer_id, body, era });
             }
 
             // Leios events — deduplicated with offer tracking for smart routing.
@@ -3330,11 +3330,17 @@ mod tests {
         let live = coord.reap_finished_peers();
         assert_eq!(live, 1, "only the live peer should be counted");
         assert!(
-            coord.pending_removals.iter().any(|(id, _)| *id == PeerId(1)),
+            coord
+                .pending_removals
+                .iter()
+                .any(|(id, _)| *id == PeerId(1)),
             "dead peer should be queued for removal"
         );
         assert!(
-            !coord.pending_removals.iter().any(|(id, _)| *id == PeerId(2)),
+            !coord
+                .pending_removals
+                .iter()
+                .any(|(id, _)| *id == PeerId(2)),
             "live peer must not be queued"
         );
 
@@ -3351,7 +3357,12 @@ mod tests {
     #[tokio::test]
     async fn has_live_peer_for_address_ignores_finished() {
         let mut coord = bare_coordinator();
-        insert_peer_with_task(&mut coord, PeerId(1), "zombie:3001", finished_handle().await);
+        insert_peer_with_task(
+            &mut coord,
+            PeerId(1),
+            "zombie:3001",
+            finished_handle().await,
+        );
         let live_task = tokio::spawn(std::future::pending::<()>());
         let live_abort = live_task.abort_handle();
         insert_peer_with_task(&mut coord, PeerId(2), "alive:3001", live_task);

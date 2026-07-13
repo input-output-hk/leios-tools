@@ -17,7 +17,7 @@ use minicbor::encode::Error as EncodeError;
 use minicbor::{Decoder, Encoder};
 
 use super::{
-    EraTxId, Message, TxBody, TxId, TxIdAndSize, MAX_TX_SIZE, MAX_UNACKED, ORIGIN_ERA, TX_ID_SIZE,
+    EraTxBody, EraTxId, Message, TxBody, TxId, TxIdAndSize, MAX_TX_SIZE, MAX_UNACKED, TX_ID_SIZE,
 };
 
 /// CBOR tag 24 ("encoded CBOR data item"), wrapping the era-tagged tx
@@ -81,28 +81,29 @@ impl<'a> minicbor::Decode<'a, ()> for EraTxId {
     }
 }
 
-// --- TxBody encode/decode ---
+// --- EraTxBody encode/decode ---
 //
 // cardano-node sends each tx body in `MsgReplyTxs` as
 // `[era, #6.24(bytes)]` — era-tagged with the body wrapped in CBOR
-// tag 24 ("encoded CBOR data item"). We keep only the raw body bytes;
-// the era we originate is `ORIGIN_ERA` (received bodies aren't re-sent).
+// tag 24 ("encoded CBOR data item"). We carry the era through so a body we
+// received can be re-announced with its original era rather than a fixed
+// constant (see [`EraTxBody`]).
 
 fn encode_tx_body<W: minicbor::encode::Write>(
-    tx: &TxBody,
+    tx: &EraTxBody,
     e: &mut Encoder<W>,
     _ctx: &mut (),
 ) -> Result<(), EncodeError<W::Error>> {
     e.array(2)?;
-    e.u16(ORIGIN_ERA)?;
+    e.u16(tx.era)?;
     e.tag(minicbor::data::Tag::new(CBOR_TAG))?;
-    e.bytes(tx.get_slice())?;
+    e.bytes(tx.body.get_slice())?;
     Ok(())
 }
 
-fn decode_tx_body<'a>(d: &mut Decoder<'a>, _ctx: &mut ()) -> Result<TxBody, DecodeError> {
+fn decode_tx_body<'a>(d: &mut Decoder<'a>, _ctx: &mut ()) -> Result<EraTxBody, DecodeError> {
     let _len = d.array()?;
-    let _era = d.u16()?;
+    let era = d.u16()?;
     let tag = d.tag()?;
     if tag.as_u64() != CBOR_TAG {
         return Err(DecodeError::message(format!(
@@ -117,7 +118,10 @@ fn decode_tx_body<'a>(d: &mut Decoder<'a>, _ctx: &mut ()) -> Result<TxBody, Deco
             raw.len()
         )));
     }
-    Ok(TxBody::new_with_slice(raw))
+    Ok(EraTxBody {
+        era,
+        body: TxBody::new_with_slice(raw),
+    })
 }
 
 // --- TxIdAndSize encode/decode ---
@@ -412,12 +416,24 @@ mod tests {
     #[test]
     fn reply_txs_round_trip() {
         let msg = Message::MsgReplyTxs {
-            txs: vec![make_tx_body(&[1, 2, 3]), make_tx_body(&[4, 5, 6])],
+            txs: vec![
+                EraTxBody {
+                    era: 7,
+                    body: make_tx_body(&[1, 2, 3]),
+                },
+                EraTxBody {
+                    era: 6,
+                    body: make_tx_body(&[4, 5, 6]),
+                },
+            ],
         };
         let decoded = round_trip(&msg);
         match decoded {
             Message::MsgReplyTxs { txs } => {
                 assert_eq!(txs.len(), 2);
+                // Era is preserved per-body across the round trip.
+                assert_eq!(txs[0].era, 7);
+                assert_eq!(txs[1].era, 6);
             }
             other => panic!("expected MsgReplyTxs, got {other:?}"),
         }
@@ -489,16 +505,22 @@ mod tests {
         let body_b: Vec<u8> = (0..1500).map(|i| (i * 31) as u8).collect();
         let msg = Message::MsgReplyTxs {
             txs: vec![
-                TxBody::new_with_vec(body_a.clone()),
-                TxBody::new_with_vec(body_b.clone()),
+                EraTxBody {
+                    era: 7,
+                    body: TxBody::new_with_vec(body_a.clone()),
+                },
+                EraTxBody {
+                    era: 7,
+                    body: TxBody::new_with_vec(body_b.clone()),
+                },
             ],
         };
         let decoded = round_trip(&msg);
         match decoded {
             Message::MsgReplyTxs { txs } => {
                 assert_eq!(txs.len(), 2);
-                assert_eq!(txs[0].get_slice(), &body_a);
-                assert_eq!(txs[1].get_slice(), &body_b);
+                assert_eq!(txs[0].body.get_slice(), &body_a);
+                assert_eq!(txs[1].body.get_slice(), &body_b);
             }
             other => panic!("expected MsgReplyTxs, got {other:?}"),
         }
@@ -593,7 +615,9 @@ mod tests {
         match decoded {
             Message::MsgReplyTxs { txs } => {
                 assert_eq!(txs.len(), 1);
-                assert_eq!(txs[0].get_slice(), &body);
+                assert_eq!(txs[0].body.get_slice(), &body);
+                // The real dev-net era (7 = Dijkstra) is preserved on decode.
+                assert_eq!(txs[0].era, 7);
             }
             other => panic!("expected MsgReplyTxs, got {other:?}"),
         }

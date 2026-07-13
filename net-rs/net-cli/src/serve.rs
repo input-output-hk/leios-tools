@@ -199,7 +199,7 @@ pub async fn run(
             NetworkEvent::PeerDisconnected { peer_id, reason } => {
                 println!("  {peer_id} disconnected: {reason}");
             }
-            NetworkEvent::TransactionReceived { peer_id, body } => {
+            NetworkEvent::TransactionReceived { peer_id, body, .. } => {
                 println!(
                     "  txsubmission: received tx from {peer_id} ({} bytes)",
                     body.len()

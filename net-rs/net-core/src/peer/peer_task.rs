@@ -1402,6 +1402,7 @@ mod tests {
             tx_id: TxId::new_with_array([0x44; 32]),
             body: TxBody::new_with_vec(vec![0x45, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E]), // CBOR bytes(5)
             size: 5,
+            era: ts::ORIGIN_ERA,
         };
         tx_sender.send(tx).await.unwrap();
 
@@ -1409,11 +1410,12 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             let (_id, event) = server_event_rx.recv().await.unwrap();
             match event {
-                PeerEvent::TransactionReceived { body } => {
+                PeerEvent::TransactionReceived { body, era } => {
                     assert_eq!(
                         body,
                         TxBody::new_with_vec(vec![0x45, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E])
                     );
+                    assert_eq!(era, ts::ORIGIN_ERA);
                 }
                 other => panic!("expected TransactionReceived, got {other:?}"),
             }
