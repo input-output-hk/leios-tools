@@ -1241,18 +1241,21 @@ impl PraosState {
             "block validated, publishing to chain store"
         );
         fx.push(inject);
-        // Prune old state. Chain structure + headers are kept for the full
-        // `k` window (needed to evaluate and anchor a reorg up to security
-        // depth). Block *bodies* are the expensive part and are only needed
-        // to serve slightly-behind peers or to replay a fork switch — so
-        // they get a (configurable) tighter tip-hot window, well below `k`.
+        // Prune old state. Chain structure (`chain_tree`) and pending
+        // announced headers (`authentic_headers`) are kept for the full `k`
+        // window — needed to evaluate and anchor a reorg up to security depth.
+        // Block *bodies* are the expensive part and are only needed to serve
+        // slightly-behind peers or to replay a fork switch — so they get a
+        // (configurable) tighter tip-hot window, well below `k`. The bodies'
+        // bookkeeping maps (`validated`, `header_first_seen`) track the body
+        // window, not `k`: they're only useful while the body is held.
         // Anything dropped from `block_cache` is re-fetched on demand: it
         // also leaves `validated`, so the "held" check in `leading_missing_run`
         // reports it missing (→ `WaitingForBlocks` → `BlockFetch`) and the
         // dedup in `on_block_received` accepts the re-fetched copy.
         if let Some(adopted) = self.adopted_tip_hash {
             if let Some(bn) = self.chain_tree.block_number(&adopted) {
-                // Structure + headers: pruned at `k`.
+                // Chain structure + pending announced headers: pruned at `k`.
                 if bn > self.security_param_k {
                     let min = bn - self.security_param_k;
                     self.chain_tree.prune_below(min);
@@ -1261,7 +1264,8 @@ impl PraosState {
                     // below the k window so they can't accumulate.
                     self.authentic_headers.retain(|_, (bn, _)| *bn >= min);
                 }
-                // Bodies: pruned at the tighter tip-hot window when set,
+                // Bodies (and their `validated` / `header_first_seen`
+                // bookkeeping): pruned at the tighter tip-hot window when set,
                 // otherwise at `k` (archive / full-history default). The window
                 // is clamped to `k` so a `Some(w)` with `w >= k` is inert —
                 // bodies never outlive the k-pruned chain structure, which
