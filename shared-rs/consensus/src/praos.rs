@@ -64,6 +64,11 @@ pub const BLOCK_FETCH_COOLDOWN: Duration = Duration::from_secs(2);
 /// validation.
 pub const STUCK_THRESHOLD: Duration = Duration::from_secs(30);
 
+/// Max entries retained in [`PraosState::cert_seen`] for cert-equivocation
+/// detection. Bounds memory: only recent elections can plausibly still receive
+/// a second (conflicting) certificate, so the oldest are dropped past this cap.
+pub const CERT_SEEN_CAP: usize = 512;
+
 /// Minimum interval between stuck-rollup WARNs.  The per-event INFO logs
 /// already fire ~1/sec; this rollup is a synthesised once-per-minute
 /// summary aimed at an operator skimming logs.
@@ -293,6 +298,17 @@ pub struct PraosState {
     /// [`Self::take_last_rollback_depth`] so net-node can telemeter the rollback
     /// depth for the `bounded_rollback_violation` safety sensor.
     pub last_rollback_depth: Option<u64>,
+    /// First certificate hash seen per EB election slot, for node-side
+    /// certificate-equivocation detection. When a second cert arrives for an
+    /// `eb_slot` already here with a *different* `eb_hash`, two conflicting
+    /// certificates exist for one election — the highest-severity CIP-0164
+    /// safety breach (only possible with adversarial committee weight
+    /// ≥ 2·τ−1 = 0.5). Bounded to [`CERT_SEEN_CAP`] entries.
+    pub cert_seen: BTreeMap<u64, [u8; 32]>,
+    /// EB slots at which certificate equivocation was detected since the last
+    /// drain. Consumed via [`Self::take_cert_equivocations`] so net-node can
+    /// telemeter it for the `certificate_equivocation` safety sensor.
+    pub cert_equivocations: Vec<u64>,
     /// Wall-clock instant of the last successful validation.  Drives the
     /// once-per-minute "chain stuck" rollup WARN; `None` until the first
     /// block is validated so a freshly-booted node doesn't immediately
@@ -394,6 +410,8 @@ impl PraosState {
             chain_tree: ChainTree::new(),
             adopted_tip_hash: None,
             last_rollback_depth: None,
+            cert_seen: BTreeMap::new(),
+            cert_equivocations: Vec::new(),
             self_produced: BTreeSet::new(),
             block_cache: BTreeMap::new(),
             validated: BTreeSet::new(),
@@ -980,6 +998,7 @@ impl PraosState {
                 slot: cert.eb_slot,
                 hash: cert.eb_hash,
             });
+            self.note_cert_for_equivocation(cert.eb_slot, cert.eb_hash);
         }
         else if header.certified_eb {
             if let Some(prev_hash) = &header.prev_hash {
@@ -1376,6 +1395,47 @@ impl PraosState {
     /// a `RolledBack` outcome to stamp the depth onto the telemetry event.
     pub fn take_last_rollback_depth(&mut self) -> Option<u64> {
         self.last_rollback_depth.take()
+    }
+
+    /// Take (consume) the EB slots at which certificate equivocation was detected
+    /// since the last call. Net-node drains this after processing received blocks
+    /// to emit `CertEquivocationDetected` for the `certificate_equivocation`
+    /// safety sensor.
+    pub fn take_cert_equivocations(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.cert_equivocations)
+    }
+
+    /// Node-side certificate-equivocation detection (CIP-0164 safety). Records
+    /// the first cert hash seen per election `eb_slot`; a later cert for the same
+    /// slot with a DIFFERENT `eb_hash` means two conflicting certificates exist
+    /// for one election — the highest-severity safety breach (only possible with
+    /// adversarial committee weight ≥ 2·τ−1 = 0.5). Detections accumulate in
+    /// `cert_equivocations` for the caller to drain. Bounds `cert_seen` to
+    /// [`CERT_SEEN_CAP`], dropping the oldest elections.
+    fn note_cert_for_equivocation(&mut self, eb_slot: u64, eb_hash: [u8; 32]) {
+        match self.cert_seen.get(&eb_slot) {
+            Some(prev) if *prev != eb_hash => {
+                tracing::error!(
+                    node_id = %self.node_id,
+                    eb_slot,
+                    first = %hex32(prev),
+                    second = %hex32(&eb_hash),
+                    "CERTIFICATE EQUIVOCATION: two conflicting certs for one election"
+                );
+                self.cert_equivocations.push(eb_slot);
+            }
+            Some(_) => {} // duplicate of the same cert — not equivocation
+            None => {
+                self.cert_seen.insert(eb_slot, eb_hash);
+                while self.cert_seen.len() > CERT_SEEN_CAP {
+                    if let Some((&oldest, _)) = self.cert_seen.iter().next() {
+                        self.cert_seen.remove(&oldest);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Deliberately roll the *own* adopted chain back by `depth` blocks
@@ -2990,6 +3050,25 @@ mod tests {
         let fx = s.on_block_applied(pt(100, 1), Instant::now());
         assert!(fx.is_empty());
         assert!(!s.validated.contains(&h(1)));
+    }
+
+    #[test]
+    fn cert_equivocation_detects_conflicting_certs_per_election() {
+        let mut s = PraosState::new("test".to_string(), 100);
+        // First cert for election slot 10 — recorded, no detection.
+        s.note_cert_for_equivocation(10, h(1));
+        assert!(s.take_cert_equivocations().is_empty());
+        // Duplicate (same slot, same hash) — not equivocation.
+        s.note_cert_for_equivocation(10, h(1));
+        assert!(s.take_cert_equivocations().is_empty());
+        // Different EB hash, SAME election slot — EQUIVOCATION.
+        s.note_cert_for_equivocation(10, h(2));
+        assert_eq!(s.take_cert_equivocations(), vec![10]);
+        // Drain consumes it.
+        assert!(s.take_cert_equivocations().is_empty());
+        // A cert for a different slot is an independent election — no detection.
+        s.note_cert_for_equivocation(11, h(3));
+        assert!(s.take_cert_equivocations().is_empty());
     }
 
     #[test]
