@@ -287,6 +287,12 @@ pub struct PraosState {
     pub queued_validator_tip: Option<[u8; 32]>,
     /// Hash of the last block the validator has actually `Applied`.
     pub last_validated_tip: Option<[u8; 32]>,
+    /// Depth (in blocks) of the most recent adopted rollback, captured at
+    /// switch time — before `adopted_tip_hash` is re-anchored, while the old
+    /// tip's height is still known. Consumed once via
+    /// [`Self::take_last_rollback_depth`] so net-node can telemeter the rollback
+    /// depth for the `bounded_rollback_violation` safety sensor.
+    pub last_rollback_depth: Option<u64>,
     /// Wall-clock instant of the last successful validation.  Drives the
     /// once-per-minute "chain stuck" rollup WARN; `None` until the first
     /// block is validated so a freshly-booted node doesn't immediately
@@ -387,6 +393,7 @@ impl PraosState {
             block_body_retention_blocks: None,
             chain_tree: ChainTree::new(),
             adopted_tip_hash: None,
+            last_rollback_depth: None,
             self_produced: BTreeSet::new(),
             block_cache: BTreeMap::new(),
             validated: BTreeSet::new(),
@@ -1364,6 +1371,13 @@ impl PraosState {
         fx
     }
 
+    /// Take (consume) the depth of the most recent adopted rollback, if one
+    /// occurred since the last call. Net-node reads this right after processing
+    /// a `RolledBack` outcome to stamp the depth onto the telemetry event.
+    pub fn take_last_rollback_depth(&mut self) -> Option<u64> {
+        self.last_rollback_depth.take()
+    }
+
     /// Deliberately roll the *own* adopted chain back by `depth` blocks
     /// and re-anchor at that ancestor, abandoning the suffix, so the next
     /// block produced forks from there.  Emits `InjectRollback` so the
@@ -1415,6 +1429,9 @@ impl PraosState {
         self.header_first_seen
             .retain(|h, _| self.block_cache.contains_key(h));
 
+        // A deliberate self-reorg of exactly `depth` blocks (ancestors.get(depth)
+        // succeeded, so the chain was long enough). Record it for the sensor.
+        self.last_rollback_depth = Some(depth);
         info!(
             node_id = %self.node_id,
             %target,
@@ -2097,7 +2114,15 @@ impl PraosState {
     ) {
         let needs_rollback = ancestor != [0u8; 32] || self.adopted_tip_hash.is_some();
         if needs_rollback && self.queued_validator_tip != Some(ancestor) {
+            // Capture the rollback depth BEFORE re-anchoring adopted_tip_hash:
+            // old height minus the ancestor's height. Feeds the
+            // bounded_rollback_violation safety sensor via take_last_rollback_depth.
+            let old_bn = self
+                .adopted_tip_hash
+                .and_then(|h| self.chain_tree.block_number(&h))
+                .unwrap_or(0);
             if ancestor == [0u8; 32] {
+                self.last_rollback_depth = Some(old_bn);
                 fx.push(PraosEffect::ValidatorRollback {
                     target: Point::Origin,
                 });
@@ -2115,6 +2140,8 @@ impl PraosState {
                         return;
                     }
                 };
+                let ancestor_bn = self.chain_tree.block_number(&ancestor).unwrap_or(old_bn);
+                self.last_rollback_depth = Some(old_bn.saturating_sub(ancestor_bn));
                 fx.push(PraosEffect::ValidatorRollback {
                     target: ancestor_point,
                 });

@@ -2176,7 +2176,9 @@ mod tests {
                 eb_hash: h, reason, ..
             } => {
                 assert_eq!(*h, eb_hash);
-                assert_eq!(*reason, expected);
+                // Compare by tag so struct-variant field values (e.g. MissingTX
+                // counts) don't have to be hardcoded in the expected value.
+                assert_eq!(reason.tag(), expected.tag(), "reason {reason:?} != {expected:?}");
             }
             other => panic!("expected NoVote, got {other:?}"),
         }
