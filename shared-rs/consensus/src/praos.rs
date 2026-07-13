@@ -3016,6 +3016,9 @@ mod tests {
         assert!(!s.equivocating_rb_slots.contains(&1));
         assert!(!s.header_hashes_by_slot_issuer.keys().any(|(sl, _)| *sl == 1));
         assert!(s.header_hashes_by_slot_issuer.keys().any(|(sl, _)| *sl == 100));
+    }
+
+    #[test]
     fn tip_hot_retention_prunes_bodies_but_keeps_structure() {
         // k large so the k-prune never fires; body window = 2 blocks.
         let mut s = PraosState::new("test".to_string(), 1000);
