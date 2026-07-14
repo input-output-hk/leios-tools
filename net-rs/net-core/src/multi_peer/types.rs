@@ -64,8 +64,13 @@ pub enum NetworkEvent {
         to: Point,
     },
 
-    /// New peers discovered via PeerSharing.
-    PeersDiscovered { peers: Vec<PeerAddress> },
+    /// New peers discovered via PeerSharing. `from` is the peer that
+    /// answered the share request — recursion drivers use it to walk the
+    /// graph outward from a specific answering peer.
+    PeersDiscovered {
+        from: PeerId,
+        peers: Vec<PeerAddress>,
+    },
 
     /// A transaction was received from an inbound peer (via TxSubmission server).
     TransactionReceived { peer_id: PeerId, body: TxBody },
@@ -146,8 +151,15 @@ pub enum NetworkCommand {
         peer_id: Option<PeerId>,
     },
 
-    /// Request peers from connected nodes (triggers PeerSharing).
+    /// Request peers from connected nodes (triggers PeerSharing). Targets
+    /// a single arbitrary connected peer.
     DiscoverPeers,
+
+    /// Request peers from a specific connected peer (targeted PeerSharing).
+    /// Used by the discovery driver to recurse outward from a known peer,
+    /// rather than the arbitrary peer `DiscoverPeers` picks. If `peer_id`
+    /// is no longer connected the command is a no-op.
+    DiscoverPeersFrom { peer_id: PeerId, amount: u8 },
 
     /// Ask a specific peer to re-run ChainSync intersection with fresh
     /// candidates from the current local chain. Used when a previous

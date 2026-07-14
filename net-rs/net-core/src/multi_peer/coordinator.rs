@@ -681,7 +681,10 @@ impl Coordinator {
             }
 
             PeerEvent::PeersDiscovered { peers } => {
-                self.emit_event(NetworkEvent::PeersDiscovered { peers });
+                self.emit_event(NetworkEvent::PeersDiscovered {
+                    from: peer_id,
+                    peers,
+                });
             }
 
             PeerEvent::TransactionReceived { body } => {
@@ -943,6 +946,13 @@ impl Coordinator {
                 // Send to a random connected peer.
                 if let Some(&peer_id) = self.peers.keys().next() {
                     self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount: 10 });
+                }
+            }
+
+            NetworkCommand::DiscoverPeersFrom { peer_id, amount } => {
+                // Targeted request. No-op if the peer has since disconnected.
+                if self.peers.contains_key(&peer_id) {
+                    self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount });
                 }
             }
 
@@ -2953,7 +2963,10 @@ mod tests {
         // close. We use a dummy event variant that's cheap to construct.
         for _ in 0..(app_channel_cap - MIN_EMIT_HEADROOM + 1) {
             net_event_sender
-                .try_send(NetworkEvent::PeersDiscovered { peers: Vec::new() })
+                .try_send(NetworkEvent::PeersDiscovered {
+                    from: PeerId(0),
+                    peers: Vec::new(),
+                })
                 .expect("pre-fill should succeed");
         }
         assert!(
