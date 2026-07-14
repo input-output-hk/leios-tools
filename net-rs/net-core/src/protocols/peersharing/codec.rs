@@ -30,7 +30,12 @@ impl minicbor::Encode<()> for PeerAddress {
             PeerAddress::IPv4 { addr, port } => {
                 e.array(3)?;
                 e.u32(0)?;
-                e.u32(u32::from(*addr))?;
+                // IPv4 travels as a `HostAddress` word in *host* byte order on
+                // the Cardano wire (little-endian in practice — every node is
+                // LE), i.e. the byte-swapped IP integer. `u32::from(Ipv4Addr)`
+                // is big-endian, so swap or we emit reversed octets that decode
+                // to bogus (often multicast) addresses on the peer.
+                e.u32(u32::from(*addr).swap_bytes())?;
                 e.u16(*port)?;
             }
             PeerAddress::IPv6 { addr, port } => {
@@ -64,8 +69,10 @@ impl<'a> minicbor::Decode<'a, ()> for PeerAddress {
             0 => {
                 let ip = d.u32()?;
                 let port = d.u16()?;
+                // IPv4 word is host byte order on the wire (see encode); swap
+                // back to a big-endian IP integer.
                 Ok(PeerAddress::IPv4 {
-                    addr: Ipv4Addr::from(ip),
+                    addr: Ipv4Addr::from(ip.swap_bytes()),
                     port,
                 })
             }
@@ -241,6 +248,31 @@ mod tests {
             }
             other => panic!("expected MsgSharePeers, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ipv4_wire_byte_order_matches_cardano() {
+        // Captured from cardano-main2.everstake.one (mainnet): it shared the
+        // Hetzner relay 65.109.51.228:3001 as the wire word 0xE4336D41 — the
+        // IPv4 HostAddress is host (little-endian) byte order, so the octets
+        // are reversed vs a big-endian integer. Decoding the raw bytes must
+        // recover 65.109.51.228, not the multicast address 228.51.109.65.
+        //
+        // Bytes: 83               array(3)
+        //        00               tag 0 (IPv4)
+        //        1a e4 33 6d 41   u32 0xE4336D41
+        //        19 0b b9         u16 3001
+        let wire = [0x83u8, 0x00, 0x1a, 0xe4, 0x33, 0x6d, 0x41, 0x19, 0x0b, 0xb9];
+        let decoded: PeerAddress = minicbor::decode(&wire).unwrap();
+        assert_eq!(
+            decoded,
+            PeerAddress::IPv4 {
+                addr: Ipv4Addr::new(65, 109, 51, 228),
+                port: 3001,
+            }
+        );
+        // And we must re-encode to exactly those bytes (wire compatibility).
+        assert_eq!(minicbor::to_vec(&decoded).unwrap(), wire);
     }
 
     #[test]
