@@ -37,6 +37,10 @@ jobs:
         with:
           toolchain: "1.92.0"
           cache-workspaces: ${{ matrix.workspace }}
+          # This is a build/compile check, not a lint gate — don't turn the
+          # action's default `-D warnings` into build failures on pre-existing
+          # warnings. Warnings policy is enforced separately (clippy/fmt).
+          rustflags: ""
       # --all-targets so test/bench/example code is compiled too (not run),
       # catching breakage in test modules as well as library/binary code.
       - name: Build workspace
