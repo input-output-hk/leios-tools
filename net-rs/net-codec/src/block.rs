@@ -14,6 +14,13 @@ use crate::{Point, MAX_BLOCK_SIZE};
 /// Number of base fields in a Shelley+ block array (before Leios extensions).
 const BLOCK_BASE_FIELDS: u64 = 4;
 
+/// First era tag whose block wraps the transaction list one level deeper.
+/// Pre-Leios eras (Conway = 6, Dijkstra = 7) encode `tx_bodies` directly as
+/// block field 1; Leios (era ≥ 8) encodes field 1 as a body wrapper
+/// `[?, tx_list, ?, ?]` where `tx_list` holds `[tx_body, witness_set, aux]`
+/// triples.
+const LEIOS_ERA: u32 = 8;
+
 /// Soft cap on the number of `praos_inspect` parse-failure WARN lines
 /// emitted per process.  Without this, `praos_inspect()` silently
 /// returns `ParsedBodyInfo::default()` on any decode error and the
@@ -28,6 +35,69 @@ const BODY_PARSE_FAIL_WARN_BUDGET: usize = 5;
 const BODY_PARSE_FAIL_PROBE_BYTES: usize = 256;
 
 static BODY_PARSE_FAIL_WARNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Count (and skip over) a CBOR array's elements, definite or indefinite.
+fn count_and_skip_array(d: &mut Decoder) -> Result<u32, DecodeError> {
+    match d.array()? {
+        Some(n) => {
+            let n = u32::try_from(n)
+                .map_err(|_| DecodeError::message("array length exceeds u32"))?;
+            for _ in 0..n {
+                d.skip()?;
+            }
+            Ok(n)
+        }
+        None => {
+            let mut n: u32 = 0;
+            while d.datatype()? != minicbor::data::Type::Break {
+                d.skip()?;
+                n = n.saturating_add(1);
+            }
+            d.skip()?; // consume the break
+            Ok(n)
+        }
+    }
+}
+
+/// Count the transactions in a Leios (era ≥ 8) block body wrapper.
+///
+/// The wrapper is `[?, tx_list, ?, ?]` (null placeholders around the payload);
+/// `tx_list` is the array of `[tx_body, witness_set, aux]` triples. Return the
+/// length of that inner tx list — the real transaction count — by descending
+/// into the first array-typed element of the wrapper.
+fn count_leios_tx_list(d: &mut Decoder) -> Result<u32, DecodeError> {
+    use minicbor::data::Type;
+    fn is_array(t: Type) -> bool {
+        matches!(t, Type::Array | Type::ArrayIndef)
+    }
+
+    let mut count = 0u32;
+    let mut found = false;
+    match d.array()? {
+        Some(n) => {
+            for _ in 0..n {
+                if !found && is_array(d.datatype()?) {
+                    count = count_and_skip_array(d)?;
+                    found = true;
+                } else {
+                    d.skip()?;
+                }
+            }
+        }
+        None => {
+            while d.datatype()? != Type::Break {
+                if !found && is_array(d.datatype()?) {
+                    count = count_and_skip_array(d)?;
+                    found = true;
+                } else {
+                    d.skip()?;
+                }
+            }
+            d.skip()?; // consume the break
+        }
+    }
+    Ok(count)
+}
 
 // --- LeiosBlockInfo ---
 
@@ -252,29 +322,21 @@ impl BlockBody {
 
         // Field 0: header — skip.
         inner.skip()?;
-        // Field 1: tx_bodies — `[* transaction_body]`. Accept both
-        // definite and indefinite-length arrays: dev-relay blocks
-        // around the Leios era encode tx_bodies as `9f ... ff` and
-        // returning Err here would silently default the whole body
-        // info (`field_count=0`), masking the actual shape downstream.
-        let tx_count = match inner.array()? {
-            Some(n) => {
-                let n = u32::try_from(n)
-                    .map_err(|_| DecodeError::message("tx_bodies length exceeds u32"))?;
-                for _ in 0..n {
-                    inner.skip()?;
-                }
-                n
-            }
-            None => {
-                let mut n: u32 = 0;
-                while inner.datatype()? != minicbor::data::Type::Break {
-                    inner.skip()?;
-                    n = n.saturating_add(1);
-                }
-                inner.skip()?; // consume the break
-                n
-            }
+        // Field 1: transactions.
+        //   Pre-Leios (era < 8): field 1 is `tx_bodies` (`[* transaction_body]`)
+        //     directly — count its length.
+        //   Leios (era ≥ 8): field 1 is a body wrapper `[?, tx_list, ?, ?]`
+        //     (the other slots are null placeholders) whose `tx_list` holds the
+        //     `[tx_body, witness_set, aux]` triples. Descend one level so we
+        //     count the actual transactions — counting the wrapper's own length
+        //     reports a constant 4 tx/block regardless of the real payload.
+        // Both accept definite and indefinite arrays: dev-relay blocks around
+        // the Leios era encode arrays as `9f … ff`, and returning Err would
+        // silently default the whole body info (`field_count = 0`).
+        let tx_count = if era >= LEIOS_ERA {
+            count_leios_tx_list(&mut inner)?
+        } else {
+            count_and_skip_array(&mut inner)?
         };
         // Skip the rest of the Conway base: tx_witness_sets,
         // auxiliary_data_set, invalid_transactions.  We treat the count
@@ -607,6 +669,73 @@ mod tests {
         oe.bytes(&inner_buf).unwrap();
 
         outer_buf
+    }
+
+    /// Build a Leios (era ≥ 8) block whose body field 1 is the wrapper
+    /// `[null, tx_list, null, null]`, with `tx_count` triples in `tx_list`.
+    /// Mirrors the shape observed live on the dev testnet (each triple is
+    /// `[tx_body, witness_set, aux]`).
+    fn build_leios_block_with_tx_count(era: u8, tx_count: u64) -> Vec<u8> {
+        use std::io::Write as _;
+
+        // Inner block: [header, body_wrapper]
+        let mut block_buf = Vec::new();
+        let mut be = Encoder::new(&mut block_buf);
+        be.array(2).unwrap();
+        be.bytes(&[0x80]).unwrap(); // dummy header
+        // body wrapper: [null, tx_list, null, null]
+        be.array(4).unwrap();
+        be.null().unwrap();
+        be.array(tx_count).unwrap(); // tx_list
+        for _ in 0..tx_count {
+            // each tx is a triple [body, witnesses, aux] — contents don't
+            // matter for the count, only the outer array length.
+            be.array(3).unwrap();
+            be.map(0).unwrap();
+            be.map(0).unwrap();
+            be.null().unwrap();
+        }
+        be.null().unwrap();
+        be.null().unwrap();
+
+        // Outer: [era_tag, block]
+        let mut inner_buf = Vec::new();
+        let mut ie = Encoder::new(&mut inner_buf);
+        ie.array(2).unwrap();
+        ie.u32(era as u32).unwrap();
+        ie.writer_mut().write_all(&block_buf).unwrap();
+
+        // Wrap in #6.24
+        let mut outer_buf = Vec::new();
+        let mut oe = Encoder::new(&mut outer_buf);
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner_buf).unwrap();
+        outer_buf
+    }
+
+    #[test]
+    fn leios_era8_counts_inner_tx_list_not_wrapper() {
+        // Regression: era-8 block body field 1 is a 4-slot wrapper
+        // `[null, tx_list, null, null]`. The count must be the tx_list length
+        // (here 436, as seen on the dev testnet), NOT the wrapper's length (4).
+        let raw = build_leios_block_with_tx_count(8, 436);
+        let info = BlockBody::opaque(raw).praos_inspect();
+        assert_eq!(info.tx_count, 436, "must count the inner tx_list, not the wrapper");
+
+        // A different count to prove it isn't hard-wired.
+        let raw = build_leios_block_with_tx_count(8, 7);
+        assert_eq!(BlockBody::opaque(raw).praos_inspect().tx_count, 7);
+
+        // Empty Leios block.
+        let raw = build_leios_block_with_tx_count(8, 0);
+        assert_eq!(BlockBody::opaque(raw).praos_inspect().tx_count, 0);
+    }
+
+    #[test]
+    fn pre_leios_still_counts_tx_bodies_directly() {
+        // Era 7 (Dijkstra) keeps the flat layout: field 1 IS tx_bodies.
+        let raw = build_test_block_with_tx_count(7, 5, None);
+        assert_eq!(BlockBody::opaque(raw).praos_inspect().tx_count, 5);
     }
 
     #[test]
