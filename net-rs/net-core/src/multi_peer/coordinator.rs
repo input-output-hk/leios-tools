@@ -158,11 +158,18 @@ const REINTERSECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const REINTERSECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Delay before the first reconnection attempt to an outbound peer. Also the
-/// value the exponential backoff resets to once a peer successfully connects
-/// (proving it is reachable) — see the `PeerEvent::Connected` handler.
+/// value the exponential backoff resets to once a peer holds a *stable*
+/// connection (see `STABLE_CONNECTION_DWELL` and `remove_peer`).
 const BASE_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// Cap on the exponential reconnection backoff.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Minimum time a connection must stay up to count as "stable" and reset the
+/// reconnection backoff to the base. A peer that completes the handshake but
+/// then drops the session within this window (e.g. a non-public node that
+/// accepts, handshakes, then closes) does NOT reset the backoff — so we don't
+/// hammer it once a second forever. Only genuinely-held connections (a relay
+/// that serves us for a while before cycling) reset it.
+const STABLE_CONNECTION_DWELL: Duration = Duration::from_secs(10);
 
 /// Per-peer state tracked by the coordinator.
 struct PeerState {
@@ -182,6 +189,10 @@ struct PeerState {
     fragment: ChainFragment,
     /// Backoff for next reconnection attempt if this peer fails.
     reconnect_backoff: Duration,
+    /// When this connection became established (`PeerEvent::Connected`). Used at
+    /// disconnect to decide whether the connection was stable enough to reset
+    /// the backoff. `None` until connected.
+    connected_at: Option<Instant>,
     /// Simulated inbound delay. Events from this peer are delayed by this
     /// duration before processing. Zero = no delay.
     inbound_delay: Duration,
@@ -223,6 +234,15 @@ struct Coordinator {
     pending_fetches: HashMap<Point, PeerId>,
     /// Peers waiting to be reconnected (address, next attempt time, current backoff).
     reconnect_queue: Vec<(String, Instant, Duration)>,
+    /// Addresses added via `AddDiscoveredPeer` that have *not yet connected*.
+    /// While an address is in this set, `remove_peer` skips reconnection —
+    /// a first-dial failure to a discovery-sourced peer frees its slot rather
+    /// than joining the reconnect queue forever. A successful connect removes
+    /// the address (promotion), after which it reconnects like any peer.
+    /// Configured (`AddPeer`) peers never enter this set, so they always
+    /// reconnect. Bounded background re-dial of never-connected speculative
+    /// peers is the discovery driver's responsibility, not the coordinator's.
+    speculative_peers: HashSet<String>,
     /// Per-address re-intersection throttle: `(next_allowed, backoff)`.
     /// A peer on an unreconcilable fork re-intersects in a tight loop;
     /// `ReIntersect` is rate-limited per *address* (stable across the
@@ -295,6 +315,7 @@ impl Coordinator {
             best_tip: None,
             pending_fetches: HashMap::new(),
             reconnect_queue: Vec::new(),
+            speculative_peers: HashSet::new(),
             chain_store,
             leios_store,
             fragment_sizes: Arc::new(Mutex::new(HashMap::new())),
@@ -439,6 +460,7 @@ impl Coordinator {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         self.sync_fragment_size(peer_id, 0);
@@ -520,16 +542,20 @@ impl Coordinator {
                 };
                 peer.mux_stats = Some(mux_stats);
                 peer.downstream = Some(downstream);
-                // A successful connection (TCP + handshake) proves the peer is
-                // reachable, so reset its reconnection backoff to the base.
-                // Without this, a relay that cleanly cycles the connection on a
-                // fixed server-side timer (e.g. a ~60s session cap) ratchets the
-                // backoff to MAX after a handful of cycles and never recovers,
-                // leaving us disconnected ~30s out of every ~90s (a ~66% duty
-                // cycle that throttles sync throughput). Backoff should escalate
-                // only across attempts that never connect. See leios-tools#54.
-                peer.reconnect_backoff = BASE_RECONNECT_BACKOFF;
+                // Record when the connection came up. The backoff is reset at
+                // disconnect *only if* the connection stayed up past
+                // STABLE_CONNECTION_DWELL — a relay that cleanly cycles on a
+                // fixed server-side timer (e.g. a ~60s session cap) resets and
+                // recovers, while a peer that handshakes then drops the session
+                // in milliseconds keeps escalating instead of being retried
+                // once a second forever. See leios-tools#54.
+                peer.connected_at = Some(Instant::now());
                 let address = peer.address.clone();
+                // Promote a speculative (discovery-sourced) peer on its first
+                // successful connect: it has proven reachable, so from now on
+                // it reconnects like any configured peer rather than being
+                // dropped on disconnect.
+                self.speculative_peers.remove(&address);
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
@@ -681,7 +707,10 @@ impl Coordinator {
             }
 
             PeerEvent::PeersDiscovered { peers } => {
-                self.emit_event(NetworkEvent::PeersDiscovered { peers });
+                self.emit_event(NetworkEvent::PeersDiscovered {
+                    from: peer_id,
+                    peers,
+                });
             }
 
             PeerEvent::TransactionReceived { body, era } => {
@@ -829,6 +858,26 @@ impl Coordinator {
                 }
             }
 
+            NetworkCommand::AddDiscoveredPeer { address } => {
+                if self.blocklist.contains(&address) {
+                    tracing::debug!(%address, "AddDiscoveredPeer refused: address is blocklisted");
+                } else if self.has_live_peer_for_address(&address) {
+                    tracing::debug!(%address, "ignoring AddDiscoveredPeer — address already connected");
+                } else if self.reap_finished_peers() >= self.config.max_peers {
+                    tracing::warn!(
+                        "max peers ({}) reached, ignoring AddDiscoveredPeer",
+                        self.config.max_peers
+                    );
+                } else {
+                    // Mark speculative *before* dialing so a first-dial failure
+                    // is recognised in `remove_peer` and does not schedule an
+                    // (infinite, slot-hungry) reconnect. A successful connect
+                    // promotes it out of the set.
+                    self.speculative_peers.insert(address.clone());
+                    self.add_peer(address);
+                }
+            }
+
             NetworkCommand::FetchBlock { point } => {
                 // Find the best peer to fetch from: peer's chain fragment
                 // must contain the requested point, then pick lowest RTT.
@@ -943,6 +992,13 @@ impl Coordinator {
                 // Send to a random connected peer.
                 if let Some(&peer_id) = self.peers.keys().next() {
                     self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount: 10 });
+                }
+            }
+
+            NetworkCommand::DiscoverPeersFrom { peer_id, amount } => {
+                // Targeted request. No-op if the peer has since disconnected.
+                if self.peers.contains_key(&peer_id) {
+                    self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount });
                 }
             }
 
@@ -1124,13 +1180,37 @@ impl Coordinator {
             // peers carry an ip_guard and should not reconnect — the remote
             // side re-initiates those.
             if peer.ip_guard.is_none() {
-                let backoff = peer.reconnect_backoff;
-                let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
-                self.reconnect_queue.push((
-                    peer.address.clone(),
-                    Instant::now() + backoff,
-                    next_backoff,
-                ));
+                if self.speculative_peers.remove(&peer.address) {
+                    // A discovery-sourced peer whose first dial never connected
+                    // (a connect would have promoted it out of the set). Don't
+                    // reconnect — free the slot. The discovery driver re-dials
+                    // it on a bounded background schedule if it's worth another
+                    // try, re-marking it speculative via `AddDiscoveredPeer`.
+                    tracing::debug!(
+                        address = %peer.address,
+                        "not reconnecting speculative peer that never connected"
+                    );
+                } else {
+                    // Reset the backoff to base only if the connection was
+                    // stable (held past STABLE_CONNECTION_DWELL). A peer that
+                    // handshakes then drops within that window keeps its
+                    // escalated backoff, so a connect-then-instantly-drop peer
+                    // backs off to the cap instead of looping ~1/s forever.
+                    let stable = peer
+                        .connected_at
+                        .is_some_and(|c| c.elapsed() >= STABLE_CONNECTION_DWELL);
+                    let backoff = if stable {
+                        BASE_RECONNECT_BACKOFF
+                    } else {
+                        peer.reconnect_backoff
+                    };
+                    let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    self.reconnect_queue.push((
+                        peer.address.clone(),
+                        Instant::now() + backoff,
+                        next_backoff,
+                    ));
+                }
             } else {
                 // Inbound (accepted) peers key `reintersect_throttle` on
                 // their ephemeral remote socket address, which never recurs.
@@ -1281,6 +1361,7 @@ impl Coordinator {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         self.sync_fragment_size(peer_id, 0);
@@ -1723,6 +1804,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -1816,6 +1898,7 @@ mod tests {
                     mux_stats: None,
                     downstream: None,
                     last_rolled_back_to: None,
+                    connected_at: None,
                 },
             );
         }
@@ -1920,6 +2003,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -1954,19 +2038,18 @@ mod tests {
         assert_eq!(coordinator.reconnect_queue[0].0, "test:3001");
     }
 
-    /// A successful connection must reset an escalated reconnection backoff, so
-    /// a relay that cleanly cycles the connection on a fixed timer doesn't
-    /// ratchet us to MAX_RECONNECT_BACKOFF forever (leios-tools#54).
-    #[tokio::test]
-    async fn connected_resets_escalated_reconnect_backoff() {
+    /// Helper: build a coordinator with one outbound peer whose backoff has
+    /// already ratcheted up, connected `dwell` ago. Returns (coordinator, id,
+    /// net_event_receiver).
+    fn coordinator_with_connected_peer(
+        dwell: Duration,
+    ) -> (Coordinator, PeerId, mpsc::Receiver<NetworkEvent>) {
         let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
-        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (net_event_sender, net_event_receiver) = mpsc::channel(64);
         let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
-
-        let config = CoordinatorConfig::default();
         let (chain_store, _chain_rx) = ChainStore::new(100);
         let mut coordinator = Coordinator::new(
-            config,
+            CoordinatorConfig::default(),
             peer_event_sender,
             peer_event_receiver,
             net_event_sender,
@@ -1974,11 +2057,8 @@ mod tests {
             chain_store,
             None,
         );
-
         let peer_id = PeerId(0);
         let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
-        // Insert a peer whose backoff has already ratcheted up from repeated
-        // pre-connection failures.
         coordinator.peers.insert(
             peer_id,
             PeerState {
@@ -1995,10 +2075,165 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: Some(Instant::now() - dwell),
+            },
+        );
+        (coordinator, peer_id, net_event_receiver)
+    }
+
+    /// A *stable* connection (held past STABLE_CONNECTION_DWELL) that then drops
+    /// resets the escalated backoff to base, so a relay that cleanly cycles on a
+    /// fixed timer doesn't ratchet to MAX forever (leios-tools#54).
+    #[tokio::test]
+    async fn stable_connection_resets_escalated_reconnect_backoff() {
+        // Connected comfortably longer ago than the dwell threshold.
+        let (mut coordinator, peer_id, _rx) =
+            coordinator_with_connected_peer(STABLE_CONNECTION_DWELL + Duration::from_secs(5));
+
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connection reset by peer".to_string(),
+                },
+            )
+            .await;
+
+        // Reset to base: the next escalation starts from 2s, not the 30s cap.
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
+        assert_eq!(coordinator.reconnect_queue[0].2, Duration::from_secs(2));
+    }
+
+    /// A connect-then-instantly-drop peer (session shorter than the dwell) does
+    /// NOT reset the backoff, so it keeps escalating to the cap instead of
+    /// reconnecting once a second forever.
+    #[tokio::test]
+    async fn flapping_connection_keeps_escalating_backoff() {
+        // Connected only moments ago — well within the dwell threshold.
+        let (mut coordinator, peer_id, _rx) =
+            coordinator_with_connected_peer(Duration::from_millis(30));
+
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "chainsync: mux error: mux shut down".to_string(),
+                },
+            )
+            .await;
+
+        // No reset: escalates from the pre-connection 16s to the 30s cap.
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
+        assert_eq!(coordinator.reconnect_queue[0].2, MAX_RECONNECT_BACKOFF);
+    }
+
+    /// A speculative (discovery-sourced) peer whose *first* dial never connects
+    /// must NOT be queued for reconnection — the slot is freed and re-dial is
+    /// left to the discovery driver. Otherwise every never-connectable NAT
+    /// address discovery surfaces would clog the reconnect queue forever.
+    #[tokio::test]
+    async fn speculative_peer_not_reconnected_if_never_connected() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        // Mark the address speculative (as `AddDiscoveredPeer` would) and give
+        // it a live PeerState — but never deliver a `Connected` event.
+        let peer_id = PeerId(0);
+        coordinator.speculative_peers.insert("disc:3001".to_string());
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "disc:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: BASE_RECONNECT_BACKOFF,
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
-        // The connection succeeds (TCP + handshake).
+        // First dial fails before ever connecting.
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connection refused".to_string(),
+                },
+            )
+            .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerDisconnected
+
+        // Not reconnected, and the speculative marker is cleared.
+        assert!(coordinator.peers.is_empty());
+        assert!(
+            coordinator.reconnect_queue.is_empty(),
+            "speculative never-connected peer must not be requeued"
+        );
+        assert!(!coordinator.speculative_peers.contains("disc:3001"));
+    }
+
+    /// Once a speculative peer connects it is *promoted*: a later disconnect
+    /// reconnects it like any configured peer.
+    #[tokio::test]
+    async fn speculative_peer_reconnects_after_promotion() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        let peer_id = PeerId(0);
+        coordinator.speculative_peers.insert("disc:3001".to_string());
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "disc:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: BASE_RECONNECT_BACKOFF,
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+                connected_at: None,
+            },
+        );
+
+        // First dial connects → promotion out of the speculative set.
         coordinator
             .handle_peer_event(
                 peer_id,
@@ -2009,16 +2244,9 @@ mod tests {
             )
             .await;
         let _ = net_event_receiver.try_recv(); // drain PeerConnected
+        assert!(!coordinator.speculative_peers.contains("disc:3001"));
 
-        // Backoff is reset to the base by the successful connection.
-        assert_eq!(
-            coordinator.peers[&peer_id].reconnect_backoff,
-            BASE_RECONNECT_BACKOFF,
-        );
-
-        // When the relay then cleanly cuts us, the next reconnection escalates
-        // from the base (2s), not from the pre-connection ceiling (which would
-        // have capped at MAX_RECONNECT_BACKOFF = 30s).
+        // A subsequent disconnect now reconnects, like a configured peer.
         coordinator
             .handle_peer_event(
                 peer_id,
@@ -2027,8 +2255,9 @@ mod tests {
                 },
             )
             .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerDisconnected
         assert_eq!(coordinator.reconnect_queue.len(), 1);
-        assert_eq!(coordinator.reconnect_queue[0].2, Duration::from_secs(2));
+        assert_eq!(coordinator.reconnect_queue[0].0, "disc:3001");
     }
 
     #[tokio::test]
@@ -2067,6 +2296,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2162,6 +2392,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2309,6 +2540,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         cmd_receiver
@@ -2859,6 +3091,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2953,7 +3186,10 @@ mod tests {
         // close. We use a dummy event variant that's cheap to construct.
         for _ in 0..(app_channel_cap - MIN_EMIT_HEADROOM + 1) {
             net_event_sender
-                .try_send(NetworkEvent::PeersDiscovered { peers: Vec::new() })
+                .try_send(NetworkEvent::PeersDiscovered {
+                    from: PeerId(0),
+                    peers: Vec::new(),
+                })
                 .expect("pre-fill should succeed");
         }
         assert!(
@@ -3308,6 +3544,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -3403,6 +3640,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
     }

@@ -64,8 +64,13 @@ pub enum NetworkEvent {
         to: Point,
     },
 
-    /// New peers discovered via PeerSharing.
-    PeersDiscovered { peers: Vec<PeerAddress> },
+    /// New peers discovered via PeerSharing. `from` is the peer that
+    /// answered the share request — recursion drivers use it to walk the
+    /// graph outward from a specific answering peer.
+    PeersDiscovered {
+        from: PeerId,
+        peers: Vec<PeerAddress>,
+    },
 
     /// A transaction was received from an inbound peer (via TxSubmission server).
     /// `era` is the tx's HardFork era, carried so the app can re-announce it
@@ -137,7 +142,20 @@ pub struct PeerInfo {
 #[non_exhaustive]
 pub enum NetworkCommand {
     /// Add a peer by address. The coordinator will connect and manage it.
+    /// Configured/seed peers use this: they reconnect indefinitely even if a
+    /// dial has never yet succeeded (a relay down at startup must be retried).
     AddPeer { address: String },
+
+    /// Add a *speculative* (discovery-sourced) peer by address. Identical to
+    /// `AddPeer` in the protocols it runs, but with a different reconnection
+    /// policy: until the address has connected at least once, the coordinator
+    /// will NOT keep reconnecting it (a first-dial failure frees the slot
+    /// instead of clogging the reconnect queue with never-connectable NAT
+    /// addresses). A successful connect *promotes* it — thereafter it
+    /// reconnects like any `AddPeer`. Re-trying a never-connected speculative
+    /// peer is the discovery layer's job (bounded background re-dial), not the
+    /// coordinator's.
+    AddDiscoveredPeer { address: String },
 
     /// Fetch a specific block. The coordinator picks the best peer.
     FetchBlock { point: Point },
@@ -152,8 +170,15 @@ pub enum NetworkCommand {
         peer_id: Option<PeerId>,
     },
 
-    /// Request peers from connected nodes (triggers PeerSharing).
+    /// Request peers from connected nodes (triggers PeerSharing). Targets
+    /// a single arbitrary connected peer.
     DiscoverPeers,
+
+    /// Request peers from a specific connected peer (targeted PeerSharing).
+    /// Used by the discovery driver to recurse outward from a known peer,
+    /// rather than the arbitrary peer `DiscoverPeers` picks. If `peer_id`
+    /// is no longer connected the command is a no-op.
+    DiscoverPeersFrom { peer_id: PeerId, amount: u8 },
 
     /// Ask a specific peer to re-run ChainSync intersection with fresh
     /// candidates from the current local chain. Used when a previous

@@ -92,8 +92,8 @@ pub async fn run(
             NetworkEvent::BlockReceived { point, body } => {
                 println!("  block received: {} ({} bytes)", point, body.raw.len());
             }
-            NetworkEvent::PeersDiscovered { peers } => {
-                println!("  discovered {} peer(s):", peers.len());
+            NetworkEvent::PeersDiscovered { from, peers } => {
+                println!("  discovered {} peer(s) from {from}:", peers.len());
                 for peer in &peers {
                     println!("    {peer}");
                 }
