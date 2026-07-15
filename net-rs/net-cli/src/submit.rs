@@ -50,6 +50,8 @@ fn generate_random_tx(rng: &mut StdRng, min_size: usize, max_size: usize) -> Pen
         tx_id: TxId::new_with_array(hash),
         body: TxBody::new_with_vec(payload),
         size: size as u32,
+        // Locally generated: stamp our origin era (current dev net = Dijkstra).
+        era: txsubmission::ORIGIN_ERA,
     }
 }
 

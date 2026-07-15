@@ -68,7 +68,13 @@ pub enum NetworkEvent {
     PeersDiscovered { peers: Vec<PeerAddress> },
 
     /// A transaction was received from an inbound peer (via TxSubmission server).
-    TransactionReceived { peer_id: PeerId, body: TxBody },
+    /// `era` is the tx's HardFork era, carried so the app can re-announce it
+    /// with its original era rather than a fixed constant.
+    TransactionReceived {
+        peer_id: PeerId,
+        body: TxBody,
+        era: u16,
+    },
 
     /// TxSubmission client: a peer requested `count` tx ids (blocking mode).
     TxsRequested { peer_id: PeerId, count: u16 },

@@ -32,6 +32,29 @@ pub fn blake2b_256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Canonical Cardano transaction id for a full wire transaction.
+///
+/// In Cardano the `TxId` is Blake2b-256 of the **transaction body only** — the
+/// first element of the serialized transaction `[body, witness_set, is_valid,
+/// auxiliary_data]` — *not* the hash of the whole tx. LeiosFetch (and N2N
+/// TxSubmission) deliver the full tx, so hashing the whole blob yields a
+/// non-canonical id that no other node will recognise (it fails to match the
+/// EB manifest and trips `ProtocolErrorTxNotRequested` on re-announce).
+///
+/// This extracts the raw CBOR bytes of the body element (verbatim, as they were
+/// serialized) and hashes those. Returns `None` if `tx` isn't a CBOR array with
+/// at least one element.
+pub fn wire_tx_id(tx: &[u8]) -> Option<[u8; 32]> {
+    let mut d = minicbor::Decoder::new(tx);
+    // Outer transaction array: `[body, witness_set, is_valid, aux_data]`
+    // (fixed- or indefinite-length; we only need to step past the header).
+    d.array().ok()?;
+    let start = d.position();
+    d.skip().ok()?; // skip the transaction_body element
+    let end = d.position();
+    tx.get(start..end).map(blake2b_256)
+}
+
 use minicbor::decode::Error as DecodeError;
 use minicbor::encode::Error as EncodeError;
 use minicbor::{Decode, Decoder, Encode, Encoder};
@@ -101,6 +124,46 @@ pub fn encode_points<W: minicbor::encode::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_tx_id_hashes_body_element_only() {
+        // A minimal full tx: [body, witness_set, is_valid, aux_data].
+        // body element is itself a CBOR map {0: [], 1: []} here — the exact
+        // shape doesn't matter, only that it's element 0.
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(4).unwrap();
+        // element 0: transaction_body
+        e.map(2).unwrap();
+        e.u8(0).unwrap().array(0).unwrap();
+        e.u8(1).unwrap().array(0).unwrap();
+        // element 1: witness_set
+        e.map(0).unwrap();
+        // element 2: is_valid
+        e.bool(true).unwrap();
+        // element 3: aux_data
+        e.null().unwrap();
+        let tx = e.into_writer();
+
+        // Independently serialize just the body to get its raw bytes.
+        let mut be = minicbor::Encoder::new(Vec::new());
+        be.map(2).unwrap();
+        be.u8(0).unwrap().array(0).unwrap();
+        be.u8(1).unwrap().array(0).unwrap();
+        let body = be.into_writer();
+
+        let id = wire_tx_id(&tx).expect("valid tx");
+        assert_eq!(id, blake2b_256(&body), "txid must hash the body element");
+        assert_ne!(
+            id,
+            blake2b_256(&tx),
+            "txid must NOT hash the whole tx (the bug we're fixing)"
+        );
+    }
+
+    #[test]
+    fn wire_tx_id_rejects_non_array() {
+        assert!(wire_tx_id(&[0x01]).is_none()); // a bare int, not a tx array
+    }
 
     #[test]
     fn point_origin_round_trip() {

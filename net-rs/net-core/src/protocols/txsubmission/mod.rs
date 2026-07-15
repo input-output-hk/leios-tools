@@ -37,17 +37,46 @@ pub const MAX_UNACKED: usize = 10;
 /// Maximum size of a single encoded tx body.
 pub const MAX_TX_SIZE: usize = 2_500_000;
 
-/// HFC era index stamped on tx-ids / bodies we *originate* on the wire.
-/// cardano-node wraps every `GenTxId` and tx body as `[era, ..]`;
-/// ids/bodies we receive carry the peer's era and are echoed back
-/// verbatim (see [`EraTxId`]), so this constant only applies to
-/// transactions we produce locally.
+/// HFC era index stamped on tx-ids / bodies we *originate* locally (i.e. txs
+/// we generate ourselves, not ones we received and re-announce).
 ///
-/// Set to Dijkstra (8) deliberately: Leios — the only reason we'd
-/// generate txs here — lands in Dijkstra. The live dev net's tx
-/// generator still emits era 7 (not yet bumped), which we observe on the
-/// wire and echo on the pull path; that doesn't change what *we* stamp.
-pub const ORIGIN_ERA: u16 = 8;
+/// cardano-node wraps every `GenTxId` and tx body as `[era, ..]`, where `era`
+/// is the HardFork-combinator era index: Byron=0, Shelley=1, Allegra=2, Mary=3,
+/// Alonzo=4, Babbage=5, Conway=6, **Dijkstra=7**. Valid indices are 0..=7; a
+/// value of 8 is past the end of the era list and makes cardano-node's
+/// `decodeNS` reject the id/body ("invalid index 8") and drop the connection.
+///
+/// Received txs carry their peer's real era end-to-end via [`PendingTx::era`]
+/// and are echoed back with that era (see [`EraTxBody`] / [`EraTxId`]); this
+/// constant is only the fallback for txs we produce ourselves, which on the
+/// current all-Dijkstra dev net is Dijkstra = 7.
+pub const ORIGIN_ERA: u16 = 7;
+
+/// Highest valid HardFork-combinator era index (Dijkstra = 7 today). Any era
+/// index above this is past the end of cardano-node's era list, so a tx-id or
+/// body stamped with it makes the peer's `decodeNS` fail ("invalid index N")
+/// and drop the connection.
+///
+/// We re-announce received txs with their original era ([`PendingTx::era`]).
+/// A misbehaving upstream can hand us an out-of-range era, which — passed
+/// through verbatim — would get us dropped by an innocent downstream peer. So
+/// we normalise on the way out ([`wire_era`]) rather than propagate the poison.
+///
+/// Bump this (and [`ORIGIN_ERA`]) at each hard fork as new eras are added.
+pub const MAX_ERA: u16 = 7;
+
+/// Normalise an era index for the wire: a received era within range is echoed
+/// verbatim; an out-of-range era (> [`MAX_ERA`]) is a poisoned/garbage value we
+/// must not re-announce, so it falls back to [`ORIGIN_ERA`]. Applied to every
+/// era we put on the wire so the advertised id-era and the delivered body-era
+/// stay consistent for a given tx.
+fn wire_era(era: u16) -> u16 {
+    if era > MAX_ERA {
+        ORIGIN_ERA
+    } else {
+        era
+    }
+}
 
 // --- Types ---
 pub const TX_ID_SIZE: usize = 32;
@@ -82,6 +111,20 @@ pub struct PendingTx {
     pub tx_id: TxId,
     pub body: TxBody,
     pub size: u32,
+    /// HardFork era index for this tx, carried end-to-end so it is echoed
+    /// back on the wire exactly as the tx was received (rather than being
+    /// re-stamped with a fixed constant). For txs we originate locally this
+    /// is [`ORIGIN_ERA`].
+    pub era: u16,
+}
+
+/// A transaction body tagged with its HardFork era, as it appears in
+/// `MsgReplyTxs` on the wire (`[era, #6.24(bytes)]`). Mirrors [`EraTxId`] so
+/// the era survives a receive-then-re-announce round trip.
+#[derive(Debug, Clone)]
+pub struct EraTxBody {
+    pub era: u16,
+    pub body: TxBody,
 }
 
 // --- State machine ---
@@ -119,7 +162,9 @@ pub enum Message {
     /// announced them in.
     MsgRequestTxs { tx_ids: Vec<EraTxId> },
     /// Client replies with full transactions. [3, [...]]
-    MsgReplyTxs { txs: Vec<TxBody> },
+    /// Bodies are era-tagged ([`EraTxBody`]) so the era survives a
+    /// receive-then-re-announce round trip.
+    MsgReplyTxs { txs: Vec<EraTxBody> },
     /// Client terminates (only valid in StTxIdsBlocking). [4]
     MsgDone,
 }
@@ -218,6 +263,18 @@ fn ack_and_prune(
     }
 }
 
+/// The canonical Praos `TxId` a tx must be announced under on the TxSubmission
+/// wire: blake2b-256 of the transaction *body* (the ledger-effect id the peer
+/// re-derives from the delivered body). This differs from the node's internal
+/// `PendingTx::tx_id`, which is the `TxHash` (whole-tx hash) that Leios EBs key
+/// on — so we translate here, at the Praos wire boundary. Falls back to the
+/// whole-blob hash for txs that aren't parseable CBOR (e.g. synthetic test txs).
+fn praos_tx_id(tx: &PendingTx) -> TxId {
+    let hash =
+        net_codec::wire_tx_id(tx.body.get_slice()).unwrap_or_else(|| tx.body.get_blake2b_256());
+    TxId::new_with_array(hash)
+}
+
 /// Run the client (tx provider) side of the TxSubmission protocol.
 ///
 /// Sends MsgInit, then responds to server requests by pulling transactions
@@ -283,9 +340,9 @@ pub async fn run_client(
                 let reply: Vec<TxIdAndSize> = new_txs
                     .iter()
                     .map(|tx| TxIdAndSize {
-                        tx_id: tx.tx_id.clone(),
+                        tx_id: praos_tx_id(tx),
                         size: tx.size,
-                        era: ORIGIN_ERA,
+                        era: wire_era(tx.era),
                     })
                     .collect();
 
@@ -320,9 +377,9 @@ pub async fn run_client(
                 let reply: Vec<TxIdAndSize> = new_txs
                     .iter()
                     .map(|tx| TxIdAndSize {
-                        tx_id: tx.tx_id.clone(),
+                        tx_id: praos_tx_id(tx),
                         size: tx.size,
-                        era: ORIGIN_ERA,
+                        era: wire_era(tx.era),
                     })
                     .collect();
 
@@ -342,12 +399,17 @@ pub async fn run_client(
                 // Look up requested tx bodies from the pending set.
                 let mut txs = Vec::new();
                 for requested_id in &tx_ids {
+                    // The peer requests by the canonical Praos TxId we announced
+                    // (`praos_tx_id`), which differs from our internal TxHash key.
                     if let Some(pos) = pending_bodies
                         .iter()
-                        .position(|p| p.tx_id == requested_id.tx_id)
+                        .position(|p| praos_tx_id(p) == requested_id.tx_id)
                     {
                         let pending = pending_bodies.remove(pos).expect("position valid");
-                        txs.push(pending.body);
+                        txs.push(EraTxBody {
+                            era: wire_era(pending.era),
+                            body: pending.body,
+                        });
                     }
                     // Per spec: omitted txs are treated as never announced.
                 }
@@ -560,7 +622,56 @@ mod tests {
             tx_id: TxId::new_with_array([id_byte; 32]),
             body: TxBody::new_with_vec(vec![id_byte; size]),
             size: size as u32,
+            era: ORIGIN_ERA,
         }
+    }
+
+    #[test]
+    fn praos_tx_id_is_body_hash_not_whole_tx() {
+        // A real tx is `[body, witness_set, is_valid?, aux]`. The Praos TxId we
+        // announce on the wire must be blake2b(body element), NOT the whole-tx
+        // hash we key on internally (TxHash), nor the arbitrary stored tx_id.
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(3).unwrap();
+        e.map(1).unwrap();
+        e.u8(0).unwrap().array(0).unwrap(); // body: {0: []}
+        e.map(0).unwrap(); // witness set
+        e.null().unwrap(); // aux data
+        let tx = e.into_writer();
+        let pending = PendingTx {
+            tx_id: TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
+            body: TxBody::new_with_slice(&tx),
+            size: tx.len() as u32,
+            era: ORIGIN_ERA,
+        };
+        let announced = praos_tx_id(&pending);
+        assert_eq!(
+            announced,
+            TxId::new_with_array(net_codec::wire_tx_id(&tx).unwrap()),
+            "announced id must be the canonical body-element TxId"
+        );
+        assert_ne!(
+            announced, pending.tx_id,
+            "must not be the internal TxHash key"
+        );
+        assert_ne!(
+            announced,
+            TxId::new_with_array(pending.body.get_blake2b_256()),
+            "must not be the whole-tx hash"
+        );
+    }
+
+    #[test]
+    fn wire_era_normalises_out_of_range() {
+        // In-range eras (including the boundary) are echoed verbatim.
+        assert_eq!(wire_era(0), 0);
+        assert_eq!(wire_era(ORIGIN_ERA), ORIGIN_ERA);
+        assert_eq!(wire_era(MAX_ERA), MAX_ERA);
+        // Out-of-range eras — a poisoned/garbage value from a misbehaving
+        // upstream — fall back to ORIGIN_ERA rather than being re-announced and
+        // getting us dropped downstream ("invalid index N").
+        assert_eq!(wire_era(MAX_ERA + 1), ORIGIN_ERA);
+        assert_eq!(wire_era(u16::MAX), ORIGIN_ERA);
     }
 
     #[test]
@@ -683,6 +794,7 @@ mod tests {
                     tx_id: tx1_id,
                     body: tx1.body.clone(),
                     size: 1500,
+                    era: ORIGIN_ERA,
                 })
                 .await
                 .unwrap();
@@ -691,6 +803,7 @@ mod tests {
                     tx_id: tx2_id,
                     body: tx2.body.clone(),
                     size: 2000,
+                    era: ORIGIN_ERA,
                 })
                 .await
                 .unwrap();

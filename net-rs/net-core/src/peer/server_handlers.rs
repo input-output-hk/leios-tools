@@ -583,12 +583,21 @@ async fn fetch_fresh_txs(
         return Some(count);
     }
 
-    runner.send(&TsMsg::MsgRequestTxs { tx_ids: fresh }).await.ok();
+    runner
+        .send(&TsMsg::MsgRequestTxs { tx_ids: fresh })
+        .await
+        .ok();
     match runner.recv().await {
         Ok(TsMsg::MsgReplyTxs { txs }) => {
             for tx in &txs {
                 let _ = event_sender
-                    .send((peer_id, PeerEvent::TransactionReceived { body: tx.clone() }))
+                    .send((
+                        peer_id,
+                        PeerEvent::TransactionReceived {
+                            body: tx.body.clone(),
+                            era: tx.era,
+                        },
+                    ))
                     .await;
             }
             if skipped > 0 {
@@ -741,8 +750,7 @@ pub async fn serve_txsubmission(
                     continue;
                 }
 
-                match fetch_fresh_txs(&mut runner, &tx_dedup, tx_ids, peer_id, &event_sender)
-                    .await
+                match fetch_fresh_txs(&mut runner, &tx_dedup, tx_ids, peer_id, &event_sender).await
                 {
                     Some(ack) => outstanding = ack,
                     None => break,

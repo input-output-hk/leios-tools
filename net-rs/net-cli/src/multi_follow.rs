@@ -98,7 +98,7 @@ pub async fn run(
                     println!("    {peer}");
                 }
             }
-            NetworkEvent::TransactionReceived { peer_id, body } => {
+            NetworkEvent::TransactionReceived { peer_id, body, .. } => {
                 println!("  tx received from {peer_id} ({} bytes)", body.len());
             }
             NetworkEvent::LeiosBlockAnnounced { .. } => {

@@ -684,8 +684,8 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeersDiscovered { peers });
             }
 
-            PeerEvent::TransactionReceived { body } => {
-                self.emit_event(NetworkEvent::TransactionReceived { peer_id, body });
+            PeerEvent::TransactionReceived { body, era } => {
+                self.emit_event(NetworkEvent::TransactionReceived { peer_id, body, era });
             }
 
             // Leios events — deduplicated with offer tracking for smart routing.
