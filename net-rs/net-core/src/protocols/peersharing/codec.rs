@@ -68,8 +68,7 @@ impl<'a> minicbor::Decode<'a, ()> for PeerAddress {
             0 => {
                 let ip = d.u32()?;
                 let port = d.u16()?;
-                // IPv4 word is host byte order on the wire (see encode); swap
-                // back to a big-endian IP integer.
+                // IPv4 is encoded as a little-endian (byte-reversed) u32 on the wire; swap back.
                 Ok(PeerAddress::IPv4 {
                     addr: Ipv4Addr::from(ip.swap_bytes()),
                     port,
