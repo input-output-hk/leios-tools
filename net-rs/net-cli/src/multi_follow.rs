@@ -135,6 +135,20 @@ pub async fn run(
                 println!("  leios: EB received at {point} ({} bytes)", block.len());
             }
             NetworkEvent::LeiosVotesReceived { peer_id, votes } => {
+                // Surface per-vote voter_id (the CIP-0164 committee seat index,
+                // word16) and the announcing-RB hash prefix so callers can see
+                // *which* committee seats are voting, not just how many votes.
+                // voter_id decodes independently of BLS-signature validity.
+                for v in &votes {
+                    println!(
+                        "  leios: vote from {peer_id} voter_id={} rb={:02x}{:02x}{:02x}{:02x}",
+                        v.voter_id,
+                        v.announcing_rb_hash[0],
+                        v.announcing_rb_hash[1],
+                        v.announcing_rb_hash[2],
+                        v.announcing_rb_hash[3],
+                    );
+                }
                 println!("  leios: {} vote(s) received from {peer_id}", votes.len());
             }
             NetworkEvent::LeiosBlockTxsReceived {
