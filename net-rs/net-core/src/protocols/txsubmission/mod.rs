@@ -52,6 +52,32 @@ pub const MAX_TX_SIZE: usize = 2_500_000;
 /// current all-Dijkstra dev net is Dijkstra = 7.
 pub const ORIGIN_ERA: u16 = 7;
 
+/// Highest valid HardFork-combinator era index (Dijkstra = 7 today). Any era
+/// index above this is past the end of cardano-node's era list, so a tx-id or
+/// body stamped with it makes the peer's `decodeNS` fail ("invalid index N")
+/// and drop the connection.
+///
+/// We re-announce received txs with their original era ([`PendingTx::era`]).
+/// A misbehaving upstream can hand us an out-of-range era, which — passed
+/// through verbatim — would get us dropped by an innocent downstream peer. So
+/// we normalise on the way out ([`wire_era`]) rather than propagate the poison.
+///
+/// Bump this (and [`ORIGIN_ERA`]) at each hard fork as new eras are added.
+pub const MAX_ERA: u16 = 7;
+
+/// Normalise an era index for the wire: a received era within range is echoed
+/// verbatim; an out-of-range era (> [`MAX_ERA`]) is a poisoned/garbage value we
+/// must not re-announce, so it falls back to [`ORIGIN_ERA`]. Applied to every
+/// era we put on the wire so the advertised id-era and the delivered body-era
+/// stay consistent for a given tx.
+fn wire_era(era: u16) -> u16 {
+    if era > MAX_ERA {
+        ORIGIN_ERA
+    } else {
+        era
+    }
+}
+
 // --- Types ---
 pub const TX_ID_SIZE: usize = 32;
 
@@ -316,7 +342,7 @@ pub async fn run_client(
                     .map(|tx| TxIdAndSize {
                         tx_id: praos_tx_id(tx),
                         size: tx.size,
-                        era: tx.era,
+                        era: wire_era(tx.era),
                     })
                     .collect();
 
@@ -353,7 +379,7 @@ pub async fn run_client(
                     .map(|tx| TxIdAndSize {
                         tx_id: praos_tx_id(tx),
                         size: tx.size,
-                        era: tx.era,
+                        era: wire_era(tx.era),
                     })
                     .collect();
 
@@ -381,7 +407,7 @@ pub async fn run_client(
                     {
                         let pending = pending_bodies.remove(pos).expect("position valid");
                         txs.push(EraTxBody {
-                            era: pending.era,
+                            era: wire_era(pending.era),
                             body: pending.body,
                         });
                     }
@@ -633,6 +659,19 @@ mod tests {
             TxId::new_with_array(pending.body.get_blake2b_256()),
             "must not be the whole-tx hash"
         );
+    }
+
+    #[test]
+    fn wire_era_normalises_out_of_range() {
+        // In-range eras (including the boundary) are echoed verbatim.
+        assert_eq!(wire_era(0), 0);
+        assert_eq!(wire_era(ORIGIN_ERA), ORIGIN_ERA);
+        assert_eq!(wire_era(MAX_ERA), MAX_ERA);
+        // Out-of-range eras — a poisoned/garbage value from a misbehaving
+        // upstream — fall back to ORIGIN_ERA rather than being re-announced and
+        // getting us dropped downstream ("invalid index N").
+        assert_eq!(wire_era(MAX_ERA + 1), ORIGIN_ERA);
+        assert_eq!(wire_era(u16::MAX), ORIGIN_ERA);
     }
 
     #[test]
