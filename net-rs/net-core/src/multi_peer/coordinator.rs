@@ -103,10 +103,10 @@ use crate::peer::connect::{self, DuplexConnection};
 use crate::peer::duplex_task::{
     run_accepted_duplex_task, run_duplex_task, AcceptedDuplexTaskConfig, DuplexTaskConfig,
 };
-use crate::peer::server_handlers::TxDedup;
 use crate::peer::peer_task::{
     client_protocol_configs, run_peer_task, server_protocol_configs, PeerTaskConfig,
 };
+use crate::peer::server_handlers::TxDedup;
 use crate::peer::types::{PeerCommand, PeerEvent};
 use crate::peer::{ConnectionMode, PeerId};
 use crate::store::chain_store::ChainStore;
@@ -156,6 +156,13 @@ const MIN_EMIT_HEADROOM: usize = 1024;
 const REINTERSECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Cap on the per-address re-intersection backoff.
 const REINTERSECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Delay before the first reconnection attempt to an outbound peer. Also the
+/// value the exponential backoff resets to once a peer successfully connects
+/// (proving it is reachable) — see the `PeerEvent::Connected` handler.
+const BASE_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+/// Cap on the exponential reconnection backoff.
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Per-peer state tracked by the coordinator.
 struct PeerState {
@@ -441,7 +448,7 @@ impl Coordinator {
 
     /// Assign a new PeerId and spawn a peer task with default backoff.
     fn add_peer(&mut self, address: String) -> PeerId {
-        self.add_peer_with_backoff(address, Duration::from_secs(1))
+        self.add_peer_with_backoff(address, BASE_RECONNECT_BACKOFF)
     }
 
     /// Queue for removal every peer whose task has already exited, and
@@ -513,6 +520,15 @@ impl Coordinator {
                 };
                 peer.mux_stats = Some(mux_stats);
                 peer.downstream = Some(downstream);
+                // A successful connection (TCP + handshake) proves the peer is
+                // reachable, so reset its reconnection backoff to the base.
+                // Without this, a relay that cleanly cycles the connection on a
+                // fixed server-side timer (e.g. a ~60s session cap) ratchets the
+                // backoff to MAX after a handful of cycles and never recovers,
+                // leaving us disconnected ~30s out of every ~90s (a ~66% duty
+                // cycle that throttles sync throughput). Backoff should escalate
+                // only across attempts that never connect. See leios-tools#54.
+                peer.reconnect_backoff = BASE_RECONNECT_BACKOFF;
                 let address = peer.address.clone();
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
@@ -1095,8 +1111,6 @@ impl Coordinator {
 
     /// Remove a peer, notify the application, and schedule reconnection.
     async fn remove_peer(&mut self, peer_id: PeerId, reason: String) {
-        const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
         if let Some(peer) = self.peers.remove(&peer_id) {
             peer.task_handle.abort();
             if let Ok(mut map) = self.fragment_sizes.lock() {
@@ -1111,7 +1125,7 @@ impl Coordinator {
             // side re-initiates those.
             if peer.ip_guard.is_none() {
                 let backoff = peer.reconnect_backoff;
-                let next_backoff = (backoff * 2).min(MAX_BACKOFF);
+                let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                 self.reconnect_queue.push((
                     peer.address.clone(),
                     Instant::now() + backoff,
@@ -1203,10 +1217,10 @@ impl Coordinator {
                 self.reconnect_queue
                     .push((address, Instant::now() + next_backoff, next_backoff));
             } else {
-                // Spawn a new peer task with the escalated backoff.
-                // If it connects successfully and later fails, remove_peer
-                // will use this backoff. On sustained success the backoff
-                // could be reset (future improvement).
+                // Spawn a new peer task with the escalated backoff. If it
+                // connects successfully, the `PeerEvent::Connected` handler
+                // resets the backoff to the base, so only attempts that never
+                // connect keep escalating.
                 let peer_id = self.add_peer_with_backoff(address.clone(), next_backoff);
                 tracing::info!("reconnecting to {address} as {peer_id}");
             }
@@ -1938,6 +1952,83 @@ mod tests {
         // Should be queued for reconnection.
         assert_eq!(coordinator.reconnect_queue.len(), 1);
         assert_eq!(coordinator.reconnect_queue[0].0, "test:3001");
+    }
+
+    /// A successful connection must reset an escalated reconnection backoff, so
+    /// a relay that cleanly cycles the connection on a fixed timer doesn't
+    /// ratchet us to MAX_RECONNECT_BACKOFF forever (leios-tools#54).
+    #[tokio::test]
+    async fn connected_resets_escalated_reconnect_backoff() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+
+        let config = CoordinatorConfig::default();
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            config,
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        let peer_id = PeerId(0);
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        // Insert a peer whose backoff has already ratcheted up from repeated
+        // pre-connection failures.
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "test:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: Duration::from_secs(16),
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+            },
+        );
+
+        // The connection succeeds (TCP + handshake).
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Connected {
+                    mux_stats: Arc::new(crate::mux::MuxStats::new()),
+                    downstream: crate::peer::new_downstream_flag(),
+                },
+            )
+            .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerConnected
+
+        // Backoff is reset to the base by the successful connection.
+        assert_eq!(
+            coordinator.peers[&peer_id].reconnect_backoff,
+            BASE_RECONNECT_BACKOFF,
+        );
+
+        // When the relay then cleanly cuts us, the next reconnection escalates
+        // from the base (2s), not from the pre-connection ceiling (which would
+        // have capped at MAX_RECONNECT_BACKOFF = 30s).
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connection reset by peer".to_string(),
+                },
+            )
+            .await;
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
+        assert_eq!(coordinator.reconnect_queue[0].2, Duration::from_secs(2));
     }
 
     #[tokio::test]
@@ -3330,11 +3421,17 @@ mod tests {
         let live = coord.reap_finished_peers();
         assert_eq!(live, 1, "only the live peer should be counted");
         assert!(
-            coord.pending_removals.iter().any(|(id, _)| *id == PeerId(1)),
+            coord
+                .pending_removals
+                .iter()
+                .any(|(id, _)| *id == PeerId(1)),
             "dead peer should be queued for removal"
         );
         assert!(
-            !coord.pending_removals.iter().any(|(id, _)| *id == PeerId(2)),
+            !coord
+                .pending_removals
+                .iter()
+                .any(|(id, _)| *id == PeerId(2)),
             "live peer must not be queued"
         );
 
@@ -3351,7 +3448,12 @@ mod tests {
     #[tokio::test]
     async fn has_live_peer_for_address_ignores_finished() {
         let mut coord = bare_coordinator();
-        insert_peer_with_task(&mut coord, PeerId(1), "zombie:3001", finished_handle().await);
+        insert_peer_with_task(
+            &mut coord,
+            PeerId(1),
+            "zombie:3001",
+            finished_handle().await,
+        );
         let live_task = tokio::spawn(std::future::pending::<()>());
         let live_abort = live_task.abort_handle();
         insert_peer_with_task(&mut coord, PeerId(2), "alive:3001", live_task);
