@@ -1,0 +1,55 @@
+name: "build"
+
+# Full-workspace compile check on every PR and on merge to main. Guards
+# against cross-crate breakage that the narrowly-scoped per-component
+# workflows miss — e.g. a change to a shared crate (net-core, shared-consensus)
+# that fails to compile in a downstream member such as net-cli, which is not a
+# dependency of any other binary and so was otherwise never exercised by CI.
+on:
+  pull_request:
+    paths:
+      - "net-rs/**"
+      - "shared-rs/**"
+      - "sim-rs/**"
+      - "data/**"
+      - ".github/workflows/build.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "net-rs/**"
+      - "shared-rs/**"
+      - "sim-rs/**"
+      - "data/**"
+      - ".github/workflows/build.yaml"
+
+# Least privilege: this workflow only checks out and compiles code (build
+# scripts and proc-macros from the dependency tree run during `cargo build`),
+# so read access is all it needs. Restricting the GITHUB_TOKEN caps the blast
+# radius if a compromised build step tries to use it.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "build ${{ matrix.workspace }}"
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        workspace: [net-rs, shared-rs, sim-rs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.92.0"
+          cache-workspaces: ${{ matrix.workspace }}
+          # This is a build/compile check, not a lint gate — don't turn the
+          # action's default `-D warnings` into build failures on pre-existing
+          # warnings. Warnings policy is enforced separately (clippy/fmt).
+          rustflags: ""
+      # --all-targets so test/bench/example code is compiled too (not run),
+      # catching breakage in test modules as well as library/binary code.
+      - name: Build workspace
+        working-directory: ${{ matrix.workspace }}
+        run: cargo build --workspace --all-targets
