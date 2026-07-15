@@ -158,11 +158,18 @@ const REINTERSECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const REINTERSECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Delay before the first reconnection attempt to an outbound peer. Also the
-/// value the exponential backoff resets to once a peer successfully connects
-/// (proving it is reachable) — see the `PeerEvent::Connected` handler.
+/// value the exponential backoff resets to once a peer holds a *stable*
+/// connection (see `STABLE_CONNECTION_DWELL` and `remove_peer`).
 const BASE_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 /// Cap on the exponential reconnection backoff.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Minimum time a connection must stay up to count as "stable" and reset the
+/// reconnection backoff to the base. A peer that completes the handshake but
+/// then drops the session within this window (e.g. a non-public node that
+/// accepts, handshakes, then closes) does NOT reset the backoff — so we don't
+/// hammer it once a second forever. Only genuinely-held connections (a relay
+/// that serves us for a while before cycling) reset it.
+const STABLE_CONNECTION_DWELL: Duration = Duration::from_secs(10);
 
 /// Per-peer state tracked by the coordinator.
 struct PeerState {
@@ -182,6 +189,10 @@ struct PeerState {
     fragment: ChainFragment,
     /// Backoff for next reconnection attempt if this peer fails.
     reconnect_backoff: Duration,
+    /// When this connection became established (`PeerEvent::Connected`). Used at
+    /// disconnect to decide whether the connection was stable enough to reset
+    /// the backoff. `None` until connected.
+    connected_at: Option<Instant>,
     /// Simulated inbound delay. Events from this peer are delayed by this
     /// duration before processing. Zero = no delay.
     inbound_delay: Duration,
@@ -449,6 +460,7 @@ impl Coordinator {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         self.sync_fragment_size(peer_id, 0);
@@ -530,15 +542,14 @@ impl Coordinator {
                 };
                 peer.mux_stats = Some(mux_stats);
                 peer.downstream = Some(downstream);
-                // A successful connection (TCP + handshake) proves the peer is
-                // reachable, so reset its reconnection backoff to the base.
-                // Without this, a relay that cleanly cycles the connection on a
-                // fixed server-side timer (e.g. a ~60s session cap) ratchets the
-                // backoff to MAX after a handful of cycles and never recovers,
-                // leaving us disconnected ~30s out of every ~90s (a ~66% duty
-                // cycle that throttles sync throughput). Backoff should escalate
-                // only across attempts that never connect. See leios-tools#54.
-                peer.reconnect_backoff = BASE_RECONNECT_BACKOFF;
+                // Record when the connection came up. The backoff is reset at
+                // disconnect *only if* the connection stayed up past
+                // STABLE_CONNECTION_DWELL — a relay that cleanly cycles on a
+                // fixed server-side timer (e.g. a ~60s session cap) resets and
+                // recovers, while a peer that handshakes then drops the session
+                // in milliseconds keeps escalating instead of being retried
+                // once a second forever. See leios-tools#54.
+                peer.connected_at = Some(Instant::now());
                 let address = peer.address.clone();
                 // Promote a speculative (discovery-sourced) peer on its first
                 // successful connect: it has proven reachable, so from now on
@@ -1180,7 +1191,19 @@ impl Coordinator {
                         "not reconnecting speculative peer that never connected"
                     );
                 } else {
-                    let backoff = peer.reconnect_backoff;
+                    // Reset the backoff to base only if the connection was
+                    // stable (held past STABLE_CONNECTION_DWELL). A peer that
+                    // handshakes then drops within that window keeps its
+                    // escalated backoff, so a connect-then-instantly-drop peer
+                    // backs off to the cap instead of looping ~1/s forever.
+                    let stable = peer
+                        .connected_at
+                        .is_some_and(|c| c.elapsed() >= STABLE_CONNECTION_DWELL);
+                    let backoff = if stable {
+                        BASE_RECONNECT_BACKOFF
+                    } else {
+                        peer.reconnect_backoff
+                    };
                     let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
                     self.reconnect_queue.push((
                         peer.address.clone(),
@@ -1338,6 +1361,7 @@ impl Coordinator {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         self.sync_fragment_size(peer_id, 0);
@@ -1780,6 +1804,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -1873,6 +1898,7 @@ mod tests {
                     mux_stats: None,
                     downstream: None,
                     last_rolled_back_to: None,
+                    connected_at: None,
                 },
             );
         }
@@ -1977,6 +2003,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2011,19 +2038,18 @@ mod tests {
         assert_eq!(coordinator.reconnect_queue[0].0, "test:3001");
     }
 
-    /// A successful connection must reset an escalated reconnection backoff, so
-    /// a relay that cleanly cycles the connection on a fixed timer doesn't
-    /// ratchet us to MAX_RECONNECT_BACKOFF forever (leios-tools#54).
-    #[tokio::test]
-    async fn connected_resets_escalated_reconnect_backoff() {
+    /// Helper: build a coordinator with one outbound peer whose backoff has
+    /// already ratcheted up, connected `dwell` ago. Returns (coordinator, id,
+    /// net_event_receiver).
+    fn coordinator_with_connected_peer(
+        dwell: Duration,
+    ) -> (Coordinator, PeerId, mpsc::Receiver<NetworkEvent>) {
         let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
-        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (net_event_sender, net_event_receiver) = mpsc::channel(64);
         let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
-
-        let config = CoordinatorConfig::default();
         let (chain_store, _chain_rx) = ChainStore::new(100);
         let mut coordinator = Coordinator::new(
-            config,
+            CoordinatorConfig::default(),
             peer_event_sender,
             peer_event_receiver,
             net_event_sender,
@@ -2031,11 +2057,8 @@ mod tests {
             chain_store,
             None,
         );
-
         let peer_id = PeerId(0);
         let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
-        // Insert a peer whose backoff has already ratcheted up from repeated
-        // pre-connection failures.
         coordinator.peers.insert(
             peer_id,
             PeerState {
@@ -2052,30 +2075,21 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: Some(Instant::now() - dwell),
             },
         );
+        (coordinator, peer_id, net_event_receiver)
+    }
 
-        // The connection succeeds (TCP + handshake).
-        coordinator
-            .handle_peer_event(
-                peer_id,
-                PeerEvent::Connected {
-                    mux_stats: Arc::new(crate::mux::MuxStats::new()),
-                    downstream: crate::peer::new_downstream_flag(),
-                },
-            )
-            .await;
-        let _ = net_event_receiver.try_recv(); // drain PeerConnected
+    /// A *stable* connection (held past STABLE_CONNECTION_DWELL) that then drops
+    /// resets the escalated backoff to base, so a relay that cleanly cycles on a
+    /// fixed timer doesn't ratchet to MAX forever (leios-tools#54).
+    #[tokio::test]
+    async fn stable_connection_resets_escalated_reconnect_backoff() {
+        // Connected comfortably longer ago than the dwell threshold.
+        let (mut coordinator, peer_id, _rx) =
+            coordinator_with_connected_peer(STABLE_CONNECTION_DWELL + Duration::from_secs(5));
 
-        // Backoff is reset to the base by the successful connection.
-        assert_eq!(
-            coordinator.peers[&peer_id].reconnect_backoff,
-            BASE_RECONNECT_BACKOFF,
-        );
-
-        // When the relay then cleanly cuts us, the next reconnection escalates
-        // from the base (2s), not from the pre-connection ceiling (which would
-        // have capped at MAX_RECONNECT_BACKOFF = 30s).
         coordinator
             .handle_peer_event(
                 peer_id,
@@ -2084,8 +2098,33 @@ mod tests {
                 },
             )
             .await;
+
+        // Reset to base: the next escalation starts from 2s, not the 30s cap.
         assert_eq!(coordinator.reconnect_queue.len(), 1);
         assert_eq!(coordinator.reconnect_queue[0].2, Duration::from_secs(2));
+    }
+
+    /// A connect-then-instantly-drop peer (session shorter than the dwell) does
+    /// NOT reset the backoff, so it keeps escalating to the cap instead of
+    /// reconnecting once a second forever.
+    #[tokio::test]
+    async fn flapping_connection_keeps_escalating_backoff() {
+        // Connected only moments ago — well within the dwell threshold.
+        let (mut coordinator, peer_id, _rx) =
+            coordinator_with_connected_peer(Duration::from_millis(30));
+
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "chainsync: mux error: mux shut down".to_string(),
+                },
+            )
+            .await;
+
+        // No reset: escalates from the pre-connection 16s to the 30s cap.
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
+        assert_eq!(coordinator.reconnect_queue[0].2, MAX_RECONNECT_BACKOFF);
     }
 
     /// A speculative (discovery-sourced) peer whose *first* dial never connects
@@ -2129,6 +2168,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2189,6 +2229,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2255,6 +2296,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2350,6 +2392,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -2497,6 +2540,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
         cmd_receiver
@@ -3047,6 +3091,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -3499,6 +3544,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
 
@@ -3594,6 +3640,7 @@ mod tests {
                 mux_stats: None,
                 downstream: None,
                 last_rolled_back_to: None,
+                connected_at: None,
             },
         );
     }
