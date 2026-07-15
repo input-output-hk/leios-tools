@@ -84,17 +84,19 @@ fn count_leios_tx_list(d: &mut Decoder) -> Result<u32, DecodeError> {
                 }
             }
         }
-        None => {
-            while d.datatype()? != Type::Break {
-                if !found && is_array(d.datatype()?) {
-                    count = count_and_skip_array(d)?;
-                    found = true;
-                } else {
-                    d.skip()?;
-                }
+        None => loop {
+            let t = d.datatype()?;
+            if t == Type::Break {
+                d.skip()?; // consume the break
+                break;
             }
-            d.skip()?; // consume the break
-        }
+            if !found && is_array(t) {
+                count = count_and_skip_array(d)?;
+                found = true;
+            } else {
+                d.skip()?;
+            }
+        },
     }
     Ok(count)
 }
