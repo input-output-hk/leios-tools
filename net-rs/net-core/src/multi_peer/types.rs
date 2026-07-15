@@ -136,7 +136,20 @@ pub struct PeerInfo {
 #[non_exhaustive]
 pub enum NetworkCommand {
     /// Add a peer by address. The coordinator will connect and manage it.
+    /// Configured/seed peers use this: they reconnect indefinitely even if a
+    /// dial has never yet succeeded (a relay down at startup must be retried).
     AddPeer { address: String },
+
+    /// Add a *speculative* (discovery-sourced) peer by address. Identical to
+    /// `AddPeer` in the protocols it runs, but with a different reconnection
+    /// policy: until the address has connected at least once, the coordinator
+    /// will NOT keep reconnecting it (a first-dial failure frees the slot
+    /// instead of clogging the reconnect queue with never-connectable NAT
+    /// addresses). A successful connect *promotes* it — thereafter it
+    /// reconnects like any `AddPeer`. Re-trying a never-connected speculative
+    /// peer is the discovery layer's job (bounded background re-dial), not the
+    /// coordinator's.
+    AddDiscoveredPeer { address: String },
 
     /// Fetch a specific block. The coordinator picks the best peer.
     FetchBlock { point: Point },

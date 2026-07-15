@@ -223,6 +223,15 @@ struct Coordinator {
     pending_fetches: HashMap<Point, PeerId>,
     /// Peers waiting to be reconnected (address, next attempt time, current backoff).
     reconnect_queue: Vec<(String, Instant, Duration)>,
+    /// Addresses added via `AddDiscoveredPeer` that have *not yet connected*.
+    /// While an address is in this set, `remove_peer` skips reconnection —
+    /// a first-dial failure to a discovery-sourced peer frees its slot rather
+    /// than joining the reconnect queue forever. A successful connect removes
+    /// the address (promotion), after which it reconnects like any peer.
+    /// Configured (`AddPeer`) peers never enter this set, so they always
+    /// reconnect. Bounded background re-dial of never-connected speculative
+    /// peers is the discovery driver's responsibility, not the coordinator's.
+    speculative_peers: HashSet<String>,
     /// Per-address re-intersection throttle: `(next_allowed, backoff)`.
     /// A peer on an unreconcilable fork re-intersects in a tight loop;
     /// `ReIntersect` is rate-limited per *address* (stable across the
@@ -295,6 +304,7 @@ impl Coordinator {
             best_tip: None,
             pending_fetches: HashMap::new(),
             reconnect_queue: Vec::new(),
+            speculative_peers: HashSet::new(),
             chain_store,
             leios_store,
             fragment_sizes: Arc::new(Mutex::new(HashMap::new())),
@@ -530,6 +540,11 @@ impl Coordinator {
                 // only across attempts that never connect. See leios-tools#54.
                 peer.reconnect_backoff = BASE_RECONNECT_BACKOFF;
                 let address = peer.address.clone();
+                // Promote a speculative (discovery-sourced) peer on its first
+                // successful connect: it has proven reachable, so from now on
+                // it reconnects like any configured peer rather than being
+                // dropped on disconnect.
+                self.speculative_peers.remove(&address);
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
@@ -828,6 +843,26 @@ impl Coordinator {
                         self.config.max_peers
                     );
                 } else {
+                    self.add_peer(address);
+                }
+            }
+
+            NetworkCommand::AddDiscoveredPeer { address } => {
+                if self.blocklist.contains(&address) {
+                    tracing::debug!(%address, "AddDiscoveredPeer refused: address is blocklisted");
+                } else if self.has_live_peer_for_address(&address) {
+                    tracing::debug!(%address, "ignoring AddDiscoveredPeer — address already connected");
+                } else if self.reap_finished_peers() >= self.config.max_peers {
+                    tracing::warn!(
+                        "max peers ({}) reached, ignoring AddDiscoveredPeer",
+                        self.config.max_peers
+                    );
+                } else {
+                    // Mark speculative *before* dialing so a first-dial failure
+                    // is recognised in `remove_peer` and does not schedule an
+                    // (infinite, slot-hungry) reconnect. A successful connect
+                    // promotes it out of the set.
+                    self.speculative_peers.insert(address.clone());
                     self.add_peer(address);
                 }
             }
@@ -1134,13 +1169,25 @@ impl Coordinator {
             // peers carry an ip_guard and should not reconnect — the remote
             // side re-initiates those.
             if peer.ip_guard.is_none() {
-                let backoff = peer.reconnect_backoff;
-                let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
-                self.reconnect_queue.push((
-                    peer.address.clone(),
-                    Instant::now() + backoff,
-                    next_backoff,
-                ));
+                if self.speculative_peers.remove(&peer.address) {
+                    // A discovery-sourced peer whose first dial never connected
+                    // (a connect would have promoted it out of the set). Don't
+                    // reconnect — free the slot. The discovery driver re-dials
+                    // it on a bounded background schedule if it's worth another
+                    // try, re-marking it speculative via `AddDiscoveredPeer`.
+                    tracing::debug!(
+                        address = %peer.address,
+                        "not reconnecting speculative peer that never connected"
+                    );
+                } else {
+                    let backoff = peer.reconnect_backoff;
+                    let next_backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    self.reconnect_queue.push((
+                        peer.address.clone(),
+                        Instant::now() + backoff,
+                        next_backoff,
+                    ));
+                }
             } else {
                 // Inbound (accepted) peers key `reintersect_throttle` on
                 // their ephemeral remote socket address, which never recurs.
@@ -2039,6 +2086,137 @@ mod tests {
             .await;
         assert_eq!(coordinator.reconnect_queue.len(), 1);
         assert_eq!(coordinator.reconnect_queue[0].2, Duration::from_secs(2));
+    }
+
+    /// A speculative (discovery-sourced) peer whose *first* dial never connects
+    /// must NOT be queued for reconnection — the slot is freed and re-dial is
+    /// left to the discovery driver. Otherwise every never-connectable NAT
+    /// address discovery surfaces would clog the reconnect queue forever.
+    #[tokio::test]
+    async fn speculative_peer_not_reconnected_if_never_connected() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        // Mark the address speculative (as `AddDiscoveredPeer` would) and give
+        // it a live PeerState — but never deliver a `Connected` event.
+        let peer_id = PeerId(0);
+        coordinator.speculative_peers.insert("disc:3001".to_string());
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "disc:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: BASE_RECONNECT_BACKOFF,
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+            },
+        );
+
+        // First dial fails before ever connecting.
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connection refused".to_string(),
+                },
+            )
+            .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerDisconnected
+
+        // Not reconnected, and the speculative marker is cleared.
+        assert!(coordinator.peers.is_empty());
+        assert!(
+            coordinator.reconnect_queue.is_empty(),
+            "speculative never-connected peer must not be requeued"
+        );
+        assert!(!coordinator.speculative_peers.contains("disc:3001"));
+    }
+
+    /// Once a speculative peer connects it is *promoted*: a later disconnect
+    /// reconnects it like any configured peer.
+    #[tokio::test]
+    async fn speculative_peer_reconnects_after_promotion() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        let peer_id = PeerId(0);
+        coordinator.speculative_peers.insert("disc:3001".to_string());
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "disc:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: BASE_RECONNECT_BACKOFF,
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                last_rolled_back_to: None,
+            },
+        );
+
+        // First dial connects → promotion out of the speculative set.
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Connected {
+                    mux_stats: Arc::new(crate::mux::MuxStats::new()),
+                    downstream: crate::peer::new_downstream_flag(),
+                },
+            )
+            .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerConnected
+        assert!(!coordinator.speculative_peers.contains("disc:3001"));
+
+        // A subsequent disconnect now reconnects, like a configured peer.
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connection reset by peer".to_string(),
+                },
+            )
+            .await;
+        let _ = net_event_receiver.try_recv(); // drain PeerDisconnected
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
+        assert_eq!(coordinator.reconnect_queue[0].0, "disc:3001");
     }
 
     #[tokio::test]
