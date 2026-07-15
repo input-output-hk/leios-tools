@@ -23,6 +23,13 @@ on:
       - "data/**"
       - ".github/workflows/build.yaml"
 
+# Least privilege: this workflow only checks out and compiles code (build
+# scripts and proc-macros from the dependency tree run during `cargo build`),
+# so read access is all it needs. Restricting the GITHUB_TOKEN caps the blast
+# radius if a compromised build step tries to use it.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: "build ${{ matrix.workspace }}"

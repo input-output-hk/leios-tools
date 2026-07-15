@@ -12,6 +12,11 @@ on:
       - "data/**"
       - "sim-rs/**"
 
+# Least privilege: this workflow only checks out and builds/tests, so read
+# access is all the GITHUB_TOKEN needs.
+permissions:
+  contents: read
+
 jobs:
   sim-rs-check:
     name: "Test"
