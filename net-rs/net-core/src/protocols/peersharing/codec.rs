@@ -30,11 +30,10 @@ impl minicbor::Encode<()> for PeerAddress {
             PeerAddress::IPv4 { addr, port } => {
                 e.array(3)?;
                 e.u32(0)?;
-                // IPv4 travels as a `HostAddress` word in *host* byte order on
-                // the Cardano wire (little-endian in practice — every node is
-                // LE), i.e. the byte-swapped IP integer. `u32::from(Ipv4Addr)`
-                // is big-endian, so swap or we emit reversed octets that decode
-                // to bogus (often multicast) addresses on the peer.
+                // Cardano PeerSharing encodes IPv4 as a `HostAddress` u32 in
+                // little-endian (byte-reversed) order. `u32::from(Ipv4Addr)` is
+                // big-endian (network order), so we must swap bytes to match the
+                // on-wire representation and avoid reversed-octet addresses.
                 e.u32(u32::from(*addr).swap_bytes())?;
                 e.u16(*port)?;
             }
