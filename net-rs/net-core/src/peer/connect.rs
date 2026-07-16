@@ -21,6 +21,10 @@ pub struct Connection {
     /// The peer's resolved socket address (the concrete IP:port the TCP
     /// connection landed on — useful for round-robin DNS hosts).
     pub resolved_addr: SocketAddr,
+    /// The peer's advertised `peer_sharing` from the handshake (1 = shares,
+    /// 0 = declines). We must not send it a PeerSharing request when 0, or it
+    /// RSTs the whole connection. Defaults to 1 when unknown.
+    pub peer_sharing: u8,
 }
 
 /// A duplex connection with separate channel sets for initiator and responder.
@@ -34,6 +38,9 @@ pub struct DuplexConnection {
     /// connection landed on — useful when the host is a round-robin DNS
     /// name, to attribute activity to a specific backend).
     pub resolved_addr: SocketAddr,
+    /// The peer's advertised `peer_sharing` from the handshake (1 = shares,
+    /// 0 = declines). See [`Connection::peer_sharing`]. Defaults to 1.
+    pub peer_sharing: u8,
 }
 
 /// Connect to a Cardano node, set up the mux with the given protocols,
@@ -101,9 +108,16 @@ pub async fn connect_and_handshake_with_config(
     let hs_result =
         handshake::run_client(CodecSend::new(hs_send), CodecRecv::new(hs_recv), versions).await;
 
+    let peer_sharing;
     match hs_result {
-        Ok(handshake::HandshakeResult::Accepted { version_number, .. }) => {
-            tracing::info!("handshake accepted: version {version_number}");
+        Ok(handshake::HandshakeResult::Accepted {
+            version_number,
+            params,
+        }) => {
+            peer_sharing = remote_peer_sharing(&params);
+            tracing::info!(
+                "handshake accepted: version {version_number}, peer_sharing={peer_sharing}"
+            );
         }
         Ok(handshake::HandshakeResult::Refused(reason)) => {
             running.abort();
@@ -123,7 +137,17 @@ pub async fn connect_and_handshake_with_config(
         running,
         channels,
         resolved_addr: addr,
+        peer_sharing,
     })
+}
+
+/// The peer's advertised `peer_sharing` from its accepted version params, or 1
+/// (assume it shares) if the params can't be decoded — we only ever want to
+/// *skip* peers we positively know declined, never over-restrict discovery.
+fn remote_peer_sharing(params: &[u8]) -> u8 {
+    n2n::VersionData::decode(params)
+        .map(|v| v.peer_sharing)
+        .unwrap_or(1)
 }
 
 /// Accept a connection and perform the server-side handshake.
@@ -206,6 +230,9 @@ pub async fn handshake_accepted(
         running,
         channels,
         resolved_addr: peer_addr,
+        // Inbound peer: default to assuming it shares (we don't gate inbound
+        // discovery queries on it today).
+        peer_sharing: 1,
     })
 }
 
@@ -278,6 +305,8 @@ pub async fn handshake_accepted_duplex(
         initiator_channels,
         responder_channels,
         resolved_addr: peer_addr,
+        // Inbound peer: default to assuming it shares.
+        peer_sharing: 1,
     })
 }
 
@@ -336,9 +365,14 @@ pub async fn connect_duplex(
     let hs_result =
         handshake::run_client(CodecSend::new(hs_send), CodecRecv::new(hs_recv), versions).await;
 
+    let peer_sharing;
     match hs_result {
-        Ok(handshake::HandshakeResult::Accepted { version_number, .. }) => {
-            tracing::info!("handshake accepted (duplex): version {version_number}");
+        Ok(handshake::HandshakeResult::Accepted {
+            version_number,
+            params,
+        }) => {
+            peer_sharing = remote_peer_sharing(&params);
+            tracing::info!("handshake accepted (duplex): version {version_number}, peer_sharing={peer_sharing}");
         }
         Ok(handshake::HandshakeResult::Refused(reason)) => {
             running.abort();
@@ -359,6 +393,7 @@ pub async fn connect_duplex(
         initiator_channels,
         responder_channels,
         resolved_addr: addr,
+        peer_sharing,
     })
 }
 
@@ -430,5 +465,7 @@ pub async fn accept_duplex(
         initiator_channels,
         responder_channels,
         resolved_addr: peer_addr,
+        // Inbound peer: default to assuming it shares.
+        peer_sharing: 1,
     })
 }

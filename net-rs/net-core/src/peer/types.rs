@@ -31,6 +31,8 @@ pub enum PeerEvent {
     Connected {
         mux_stats: Arc<MuxStats>,
         downstream: super::DownstreamFlag,
+        /// The peer's advertised `peer_sharing` (1 = shares, 0 = declines).
+        peer_sharing: u8,
     },
 
     /// ChainSync: intersection found during `find_intersection`.

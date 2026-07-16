@@ -201,6 +201,11 @@ struct PeerState {
     /// Shared downstream-promotion flag (cold/warm/hot) from this peer's
     /// responder handlers; read at snapshot time. `None` until `Connected`.
     downstream: Option<crate::peer::DownstreamFlag>,
+    /// The peer's advertised `peer_sharing` from the handshake (1 = shares,
+    /// 0 = declines). We skip `DiscoverPeersFrom` (a PeerSharing request) for
+    /// peers that advertised 0 — they RST the whole connection for it. Defaults
+    /// to 1 until `Connected`.
+    peer_sharing: u8,
     /// Last rollback point this peer was notified to, for dedup: we
     /// refuse to forward consecutive `RolledBack` events with the same
     /// point so a chatty peer can't flood the consensus channel.
@@ -286,6 +291,14 @@ struct Coordinator {
     /// connected match).  Empty in the common no-partition case, so the
     /// `contains`/`is_empty` checks are off the data path and free.
     blocklist: HashSet<String>,
+    /// Peers with a PeerSharing request currently outstanding (`peer_id ->
+    /// address`), set when we send `RequestPeers`. If such a peer dies before
+    /// answering, the request almost certainly drew the reset.
+    peershare_inflight: HashMap<PeerId, String>,
+    /// Addresses that reset a PeerSharing request from us — they advertise
+    /// `peer_sharing=1` but don't actually serve it, so we never query them
+    /// for peers again (querying just RSTs the whole connection).
+    peershare_hostile: HashSet<String>,
     /// Node-wide tx-submission dedup, shared into every peer's
     /// `serve_txsubmission` so a tx pulled from one peer isn't re-fetched
     /// (and re-hashed) from every other peer that offers it.
@@ -326,6 +339,8 @@ impl Coordinator {
             pending_removals: Vec::new(),
             leios_offer_dedup: OfferDedup::new(dedup_window),
             blocklist: HashSet::new(),
+            peershare_inflight: HashMap::new(),
+            peershare_hostile: HashSet::new(),
             tx_dedup: Arc::new(Mutex::new(TxDedup::new(TX_DEDUP_CAP))),
         }
     }
@@ -459,6 +474,7 @@ impl Coordinator {
                 inbound_delay,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -529,6 +545,7 @@ impl Coordinator {
             PeerEvent::Connected {
                 mux_stats,
                 downstream,
+                peer_sharing,
             } => {
                 // The peer task's Connected event can race with our
                 // own remove_peer (which clears self.peers and aborts
@@ -542,6 +559,7 @@ impl Coordinator {
                 };
                 peer.mux_stats = Some(mux_stats);
                 peer.downstream = Some(downstream);
+                peer.peer_sharing = peer_sharing;
                 // Record when the connection came up. The backoff is reset at
                 // disconnect *only if* the connection stayed up past
                 // STABLE_CONNECTION_DWELL — a relay that cleanly cycles on a
@@ -707,6 +725,9 @@ impl Coordinator {
             }
 
             PeerEvent::PeersDiscovered { peers } => {
+                // The request was answered — it's not what killed the
+                // connection, so drop the outstanding marker.
+                self.peershare_inflight.remove(&peer_id);
                 self.emit_event(NetworkEvent::PeersDiscovered {
                     from: peer_id,
                     peers,
@@ -996,9 +1017,36 @@ impl Coordinator {
             }
 
             NetworkCommand::DiscoverPeersFrom { peer_id, amount } => {
-                // Targeted request. No-op if the peer has since disconnected.
-                if self.peers.contains_key(&peer_id) {
-                    self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount });
+                // Targeted PeerSharing request. Skip it when the peer has since
+                // disconnected, advertised `peer_sharing = 0` (declined sharing),
+                // or previously reset a request from us (advertises sharing but
+                // doesn't serve it). A request to any of those draws an immediate
+                // RST that tears down the whole connection (chainsync, blockfetch,
+                // the hot upstream), so we honour the flag and don't re-poke a
+                // peer that has proven hostile to sharing.
+                let target = self
+                    .peers
+                    .get(&peer_id)
+                    .map(|p| (p.peer_sharing, p.address.clone()));
+                match target {
+                    Some((0, _)) => {
+                        tracing::debug!(
+                            peer = peer_id.0,
+                            "skipping PeerSharing request: peer advertised peer_sharing=0"
+                        );
+                    }
+                    Some((_, address)) if self.peershare_hostile.contains(&address) => {
+                        tracing::debug!(
+                            peer = peer_id.0,
+                            %address,
+                            "skipping PeerSharing request: peer previously reset one"
+                        );
+                    }
+                    Some((_, address)) => {
+                        self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount });
+                        self.peershare_inflight.insert(peer_id, address);
+                    }
+                    None => {}
                 }
             }
 
@@ -1167,6 +1215,19 @@ impl Coordinator {
 
     /// Remove a peer, notify the application, and schedule reconnection.
     async fn remove_peer(&mut self, peer_id: PeerId, reason: String) {
+        // If a PeerSharing request was still outstanding when this peer died,
+        // the request almost certainly drew the reset — mark the address so we
+        // never query it for peers again. Keeps a misbehaving upstream (one that
+        // advertises sharing but resets the request) connected instead of us
+        // repeatedly RST-ing ourselves off it.
+        if let Some(address) = self.peershare_inflight.remove(&peer_id) {
+            if self.peershare_hostile.insert(address.clone()) {
+                tracing::info!(
+                    %address,
+                    "peer reset a PeerSharing request; will not query it for peers again"
+                );
+            }
+        }
         if let Some(peer) = self.peers.remove(&peer_id) {
             peer.task_handle.abort();
             if let Ok(mut map) = self.fragment_sizes.lock() {
@@ -1360,6 +1421,7 @@ impl Coordinator {
                 inbound_delay,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -1803,6 +1865,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -1897,6 +1960,7 @@ mod tests {
                     inbound_delay: Duration::ZERO,
                     mux_stats: None,
                     downstream: None,
+                    peer_sharing: 1,
                     last_rolled_back_to: None,
                     connected_at: None,
                 },
@@ -2002,6 +2066,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -2074,11 +2139,139 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: Some(Instant::now() - dwell),
             },
         );
         (coordinator, peer_id, net_event_receiver)
+    }
+
+    /// A coordinator with no peers, for the PeerSharing-gate tests. Returns the
+    /// `NetworkEvent` receiver so it stays open (dropping it closes the channel).
+    fn sharing_test_coordinator() -> (Coordinator, mpsc::Receiver<NetworkEvent>) {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+        (coordinator, net_event_receiver)
+    }
+
+    /// Insert a connected outbound peer with the given advertised `peer_sharing`
+    /// and address; return its command receiver so a test can observe whether a
+    /// `RequestPeers` was sent to it.
+    fn insert_connected_peer(
+        coordinator: &mut Coordinator,
+        peer_id: PeerId,
+        peer_sharing: u8,
+        address: &str,
+    ) -> mpsc::Receiver<PeerCommand> {
+        let (cmd_sender, cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: address.to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: Duration::from_secs(1),
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                peer_sharing,
+                last_rolled_back_to: None,
+                connected_at: Some(Instant::now()),
+            },
+        );
+        cmd_receiver
+    }
+
+    #[tokio::test]
+    async fn discover_peers_from_skips_peer_sharing_zero() {
+        // A peer that declined sharing (peer_sharing=0) must not be sent a
+        // PeerSharing request — it would RST the whole connection.
+        let (mut coord, _net_rx) = sharing_test_coordinator();
+        let mut cmd_rx = insert_connected_peer(&mut coord, PeerId(0), 0, "nope:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(0),
+                amount: 10,
+            })
+            .await;
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no RequestPeers should reach a peer_sharing=0 peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_peers_from_queries_a_sharing_peer() {
+        let (mut coord, _net_rx) = sharing_test_coordinator();
+        let mut cmd_rx = insert_connected_peer(&mut coord, PeerId(0), 1, "yes:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(0),
+                amount: 10,
+            })
+            .await;
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(PeerCommand::RequestPeers { amount: 10 })
+            ),
+            "a peer_sharing=1 peer should be queried"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_that_resets_a_peershare_request_is_not_requeried() {
+        // A peer advertises sharing (1) but resets the request: it dies with the
+        // request still outstanding. It must then be marked hostile and never
+        // queried again, even after reconnecting under a fresh peer_id.
+        let (mut coord, _net_rx) = sharing_test_coordinator();
+        let mut cmd_rx = insert_connected_peer(&mut coord, PeerId(0), 1, "liar:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(0),
+                amount: 10,
+            })
+            .await;
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(PeerCommand::RequestPeers { .. })
+        ));
+
+        // Connection resets: the peer is removed with the request outstanding.
+        coord
+            .remove_peer(PeerId(0), "reset by peer".to_string())
+            .await;
+        assert!(coord.peershare_hostile.contains("liar:3001"));
+
+        // Reconnect the same address as a new peer; the re-query is skipped.
+        let mut cmd_rx2 = insert_connected_peer(&mut coord, PeerId(1), 1, "liar:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(1),
+                amount: 10,
+            })
+            .await;
+        assert!(
+            cmd_rx2.try_recv().is_err(),
+            "a peer that reset a request must not be re-queried"
+        );
     }
 
     /// A *stable* connection (held past STABLE_CONNECTION_DWELL) that then drops
@@ -2150,7 +2343,9 @@ mod tests {
         // Mark the address speculative (as `AddDiscoveredPeer` would) and give
         // it a live PeerState — but never deliver a `Connected` event.
         let peer_id = PeerId(0);
-        coordinator.speculative_peers.insert("disc:3001".to_string());
+        coordinator
+            .speculative_peers
+            .insert("disc:3001".to_string());
         let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
         coordinator.peers.insert(
             peer_id,
@@ -2167,6 +2362,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -2211,7 +2407,9 @@ mod tests {
         );
 
         let peer_id = PeerId(0);
-        coordinator.speculative_peers.insert("disc:3001".to_string());
+        coordinator
+            .speculative_peers
+            .insert("disc:3001".to_string());
         let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
         coordinator.peers.insert(
             peer_id,
@@ -2228,6 +2426,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -2240,6 +2439,7 @@ mod tests {
                 PeerEvent::Connected {
                     mux_stats: Arc::new(crate::mux::MuxStats::new()),
                     downstream: crate::peer::new_downstream_flag(),
+                    peer_sharing: 1,
                 },
             )
             .await;
@@ -2295,6 +2495,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -2391,6 +2592,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -2539,6 +2741,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -3090,6 +3293,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -3543,6 +3747,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
@@ -3639,6 +3844,7 @@ mod tests {
                 inbound_delay: Duration::ZERO,
                 mux_stats: None,
                 downstream: None,
+                peer_sharing: 1,
                 last_rolled_back_to: None,
                 connected_at: None,
             },
