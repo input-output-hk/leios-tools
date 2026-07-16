@@ -708,6 +708,7 @@ pub(crate) async fn run_peer_task(mut config: PeerTaskConfig) {
             PeerEvent::Connected {
                 mux_stats: conn.running.stats.clone(),
                 downstream: super::new_downstream_flag(),
+                peer_sharing: conn.peer_sharing,
             },
         ))
         .await;

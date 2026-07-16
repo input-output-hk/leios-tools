@@ -127,6 +127,7 @@ pub(crate) async fn run_duplex_task(config: DuplexTaskConfig) {
             PeerEvent::Connected {
                 mux_stats: conn.running.stats.clone(),
                 downstream: downstream.clone(),
+                peer_sharing: conn.peer_sharing,
             },
         ))
         .await;
@@ -163,6 +164,7 @@ pub(crate) async fn run_accepted_duplex_task(config: AcceptedDuplexTaskConfig) {
             PeerEvent::Connected {
                 mux_stats: conn.running.stats.clone(),
                 downstream: downstream.clone(),
+                peer_sharing: conn.peer_sharing,
             },
         ))
         .await;
