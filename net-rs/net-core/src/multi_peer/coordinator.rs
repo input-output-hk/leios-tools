@@ -1010,9 +1010,22 @@ impl Coordinator {
             }
 
             NetworkCommand::DiscoverPeers => {
-                // Send to a random connected peer.
-                if let Some(&peer_id) = self.peers.keys().next() {
-                    self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount: 10 });
+                // Untargeted discovery: send to the first connected peer that
+                // will actually serve sharing. Apply the same gate as
+                // DiscoverPeersFrom — skip peers that advertised peer_sharing=0
+                // or previously reset a request — so a blind poll can't RST us
+                // off a healthy upstream either, and track it in-flight so a
+                // reset is attributed.
+                let hostile = &self.peershare_hostile;
+                let target = self
+                    .peers
+                    .iter()
+                    .find(|(_, p)| p.peer_sharing != 0 && !hostile.contains(&p.address))
+                    .map(|(&id, p)| (id, p.address.clone()));
+                if let Some((peer_id, address)) = target {
+                    if self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount: 10 }) {
+                        self.peershare_inflight.insert(peer_id, address);
+                    }
                 }
             }
 
@@ -1043,8 +1056,13 @@ impl Coordinator {
                         );
                     }
                     Some((_, address)) => {
-                        self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount });
-                        self.peershare_inflight.insert(peer_id, address);
+                        // Only track the request as in-flight if it was actually
+                        // enqueued. A failed send (channel full/closed) schedules
+                        // the peer's removal; recording in-flight anyway would let
+                        // `remove_peer` mark it hostile for a request it never got.
+                        if self.send_peer_command(peer_id, PeerCommand::RequestPeers { amount }) {
+                            self.peershare_inflight.insert(peer_id, address);
+                        }
                     }
                     None => {}
                 }
@@ -1219,9 +1237,19 @@ impl Coordinator {
         // the request almost certainly drew the reset — mark the address so we
         // never query it for peers again. Keeps a misbehaving upstream (one that
         // advertises sharing but resets the request) connected instead of us
-        // repeatedly RST-ing ourselves off it.
+        // repeatedly RST-ing ourselves off it. But only when the *peer* tore the
+        // connection down: skip the reasons we generate locally (blocklist /
+        // drop-inbound Disconnect, or a full/closed command channel), which say
+        // nothing about the peer's willingness to share and would otherwise
+        // permanently suppress querying an address we disconnected ourselves.
         if let Some(address) = self.peershare_inflight.remove(&peer_id) {
-            if self.peershare_hostile.insert(address.clone()) {
+            let locally_initiated = matches!(
+                reason.as_str(),
+                "disconnect requested"
+                    | "peer command channel full"
+                    | "peer command channel closed"
+            );
+            if !locally_initiated && self.peershare_hostile.insert(address.clone()) {
                 tracing::info!(
                     %address,
                     "peer reset a PeerSharing request; will not query it for peers again"
@@ -2271,6 +2299,44 @@ mod tests {
         assert!(
             cmd_rx2.try_recv().is_err(),
             "a peer that reset a request must not be re-queried"
+        );
+    }
+
+    #[tokio::test]
+    async fn locally_initiated_disconnect_does_not_mark_peershare_hostile() {
+        // A request is outstanding, but *we* tear the connection down (e.g.
+        // blocklist → PeerCommand::Disconnect → "disconnect requested"). That
+        // says nothing about the peer's willingness to share, so it must NOT be
+        // marked hostile — otherwise a peer we disconnected ourselves would be
+        // permanently barred from future PeerSharing queries.
+        let (mut coord, _net_rx) = sharing_test_coordinator();
+        let _cmd_rx = insert_connected_peer(&mut coord, PeerId(0), 1, "innocent:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(0),
+                amount: 10,
+            })
+            .await;
+
+        coord
+            .remove_peer(PeerId(0), "disconnect requested".to_string())
+            .await;
+        assert!(
+            !coord.peershare_hostile.contains("innocent:3001"),
+            "a locally-initiated disconnect must not mark the peer hostile"
+        );
+
+        // Reconnect and confirm it is still queried.
+        let mut cmd_rx2 = insert_connected_peer(&mut coord, PeerId(1), 1, "innocent:3001");
+        coord
+            .handle_network_command(NetworkCommand::DiscoverPeersFrom {
+                peer_id: PeerId(1),
+                amount: 10,
+            })
+            .await;
+        assert!(
+            matches!(cmd_rx2.try_recv(), Ok(PeerCommand::RequestPeers { .. })),
+            "a peer we disconnected ourselves must still be queried on reconnect"
         );
     }
 
