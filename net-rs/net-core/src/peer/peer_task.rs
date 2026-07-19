@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-
+use crate::multi_peer::SyncMethodConfig;
 use crate::mux::scheduler::TrafficClass;
 use crate::mux::{CodecRecv, CodecSend, MuxConfig, ProtocolConfig};
 use crate::protocols::blockfetch::{self, BlockFetch};
@@ -36,6 +36,7 @@ pub(crate) struct PeerTaskConfig {
     pub network_magic: u64,
     pub keepalive_interval: Duration,
     pub sdu_timeout: Duration,
+    pub sync_method: SyncMethodConfig,
     pub chain_store: Arc<ChainStore>,
     pub event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
     pub command_receiver: mpsc::Receiver<PeerCommand>,
@@ -181,13 +182,13 @@ pub(crate) fn server_protocol_configs(leios_enabled: bool) -> Vec<ProtocolConfig
 }
 
 /// Run find_intersection and send the result as IntersectionFound.
-async fn do_intersection(
+/// Builds candidates list from `chain_store` and calls `do_intersection_with_candidates`
+async fn do_intersection_with_candidates(
     runner: &mut Runner<ChainSync>,
-    chain_store: &ChainStore,
+    candidates: Vec<Point>,
     peer_id: PeerId,
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
 ) -> Result<(), String> {
-    let candidates = chain_store.intersection_candidates(32);
     match chainsync::find_intersection(runner, candidates).await {
         Ok(Some((point, _tip))) => {
             let _ = event_sender
@@ -200,6 +201,54 @@ async fn do_intersection(
     }
 }
 
+async fn do_intersection(
+    runner: &mut Runner<ChainSync>,
+    chain_store: &ChainStore,
+    peer_id: PeerId,
+    event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
+) -> Result<(), String> {
+    let candidates = chain_store.intersection_candidates(32);
+    do_intersection_with_candidates(runner, candidates, peer_id, event_sender).await
+}
+
+/// Performs initial intersection search, depending on the sync_method.
+/// We suppose that chain_store has no intersection candidates (i.e., it is
+/// freshly initialized).
+/// Some of intersection search strategies (namely, SyncMethodConfig::Tip)
+/// require two `find_intersection` requests, and only the second one requires
+/// the result forwarding to event_sender.
+async fn do_initial_intersection(
+    runner: &mut Runner<ChainSync>,
+    sync_method: &SyncMethodConfig,
+    chain_store: &ChainStore,
+    peer_id: PeerId,
+    event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
+) -> Result<(), String> {
+    let initial_chain = chain_store.intersection_candidates(32);
+    if initial_chain.iter().any(|x| *x != Point::Origin) {
+        return Err(format!("chain_store: intersection candidates are not trivial: {:?}", initial_chain));
+    }
+
+    let sync_candidates = match sync_method {
+        SyncMethodConfig::None => vec![Point::Origin],
+        SyncMethodConfig::Genesis => vec![Point::Origin],
+        SyncMethodConfig::Tip { .. } => {
+            tracing::info!("Making initial intersection for sync method tip.");
+            match chainsync::find_intersection(runner, vec![Point::Origin]).await {
+                Ok(Some((point, tip))) => {
+                    tracing::info!("Making initial intersection for sync method tip. Chain point: {point:?}, tip: {tip:?}");
+                    vec![tip.point, point, Point::Origin]
+                },
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(format!("chainsync initial intersection: {e}")),
+            }
+        }, // TODO: delay parameter implementation
+        SyncMethodConfig::Point(point) => vec![point.clone(), Point::Origin],
+    };
+
+    do_intersection_with_candidates(runner, sync_candidates, peer_id, event_sender).await
+}
+
 /// Spawn the ChainSync sub-task. Runs find_intersection then request_next loop.
 /// Accepts a `reintersect_rx` signal channel: when a signal arrives, the task
 /// re-runs find_intersection with fresh candidates from the current local chain
@@ -208,16 +257,18 @@ pub(crate) fn spawn_chainsync(
     cs_send: CodecSend,
     cs_recv: CodecRecv,
     peer_id: PeerId,
+    sync_method: SyncMethodConfig,
     chain_store: Arc<ChainStore>,
     event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
     mut reintersect_rx: mpsc::Receiver<()>,
 ) -> JoinHandle<()> {
+    tracing::info!("Spawn chainsync: sync method {sync_method:?}");
     tokio::spawn(async move {
         let mut runner = Runner::<ChainSync>::new(Role::Client, cs_send, cs_recv);
 
         // Initial intersection.
         if let Err(reason) =
-            do_intersection(&mut runner, &chain_store, peer_id, &event_sender).await
+            do_initial_intersection(&mut runner, &sync_method, &chain_store, peer_id, &event_sender).await
         {
             let _ = event_sender
                 .send((peer_id, PeerEvent::Failed { reason }))
@@ -744,6 +795,7 @@ pub(crate) async fn run_peer_task(mut config: PeerTaskConfig) {
         cs_send,
         cs_recv,
         peer_id,
+        config.sync_method.clone(),
         config.chain_store.clone(),
         event_sender.clone(),
         cs_reintersect_receiver,
@@ -1114,6 +1166,7 @@ mod tests {
             cs_send,
             cs_recv,
             peer_id,
+            SyncMethodConfig::default(),
             chain_store,
             event_sender.clone(),
             reintersect_rx,

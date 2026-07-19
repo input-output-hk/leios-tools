@@ -33,6 +33,22 @@ impl fmt::Display for Point {
     }
 }
 
+impl Point{
+    pub fn get_slot(&self) -> Option<u64> {
+        match self {
+            Point::Origin => None,
+            Point::Specific { slot, .. } => Some(*slot),
+        }
+    }
+
+    pub fn get_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Point::Origin => None,
+            Point::Specific { hash, .. } => Some(*hash),
+        }
+    }
+}
+
 impl minicbor::Encode<()> for Point {
     fn encode<W: minicbor::encode::Write>(
         &self,
@@ -169,11 +185,32 @@ pub struct Vote {
 }
 
 /// Hex-encode the first 8 bytes of a hash for display.
-pub(crate) fn hex_prefix(hash: &[u8; 32]) -> String {
+pub fn hex_prefix(hash: &[u8; 32]) -> String {
     hash.iter()
         .take(8)
         .map(|b| format!("{b:02x}"))
         .collect::<String>()
+}
+
+pub fn short_hash(h: &[u8; 32]) -> String {
+    format!("{:02x}{:02x}", h[30], h[31])
+}
+
+/// Decode a hex string into a 32-byte hash.
+///
+/// The inverse of the hex encoding used by [`hex_prefix`]: expects exactly
+/// 64 ASCII hex digits (a 32-byte hash). Returns `None` if the input has the
+/// wrong length or contains a non-hex character.
+pub fn hash_from_hex<const LEN: usize>(s: &str) -> Result<[u8; LEN], String> {
+    if s.len() != LEN*2 {
+        return Err(format!("expected hex string of length {}, got {}", LEN*2, s.len()));
+    }
+    let mut hash = [0u8; LEN];
+    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(pair).map_err(|e| format!("invalid UTF-8 in hex string: {}", e))?;
+        hash[i] = u8::from_str_radix(hex, 16).map_err(|e| format!("invalid hex digit in string: {}", e))?;
+    }
+    Ok(hash)
 }
 
 #[cfg(test)]
@@ -219,5 +256,25 @@ mod tests {
             hash: [0xAB; 32],
         };
         assert_eq!(format!("{p}"), "42/abababababababab");
+    }
+
+    #[test]
+    fn hash_from_hex_round_trip() {
+        let hash = [0xABu8; 32];
+        // Full hex encoding of the hash (64 chars).
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hash_from_hex(&hex), Ok(hash));
+        // Uppercase hex is accepted too.
+        assert_eq!(hash_from_hex(&hex.to_uppercase()), Ok(hash));
+    }
+
+    #[test]
+    fn hash_from_hex_rejects_malformed() {
+        // Wrong length.
+        assert_eq!(hash_from_hex("deadbeef").is_err(), true);
+        assert_eq!(hash_from_hex(&"a".repeat(63)).is_err(), true);
+        // Correct length but a non-hex character.
+        let bad = format!("{}z", "a".repeat(63));
+        assert_eq!(hash_from_hex(&bad).is_err(), true);
     }
 }

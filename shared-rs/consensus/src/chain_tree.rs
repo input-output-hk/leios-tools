@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use crate::mempool::EbKey;
+use crate::types;
 use crate::types::Point;
 
 /// A block entry in a chain tree snapshot, for UI display.
@@ -72,10 +73,6 @@ pub fn is_better_tip(
     } else {
         a_hash < b_hash
     }
-}
-
-fn short_hash(h: &[u8; 32]) -> String {
-    format!("{:02x}{:02x}", h[30], h[31])
 }
 
 /// A node in the chain tree, representing one block header.
@@ -451,8 +448,8 @@ impl ChainTree {
                     .or_else(|| node.announced_eb_hash.as_ref().and_then(&eb_manifest_count));
                 Some(ChainTreeEntry {
                     block_number: node.block_number,
-                    hash: short_hash(h),
-                    prev_hash: node.prev_hash.as_ref().map(short_hash),
+                    hash: types::short_hash(h),
+                    prev_hash: node.prev_hash.as_ref().map(types::short_hash),
                     tx_count: node.tx_count,
                     announced_eb: node.announced_eb_hash.is_some(),
                     certified_eb: node.certified_eb,
