@@ -341,47 +341,57 @@ pub async fn run_client(
                 // acked-but-unrequested bodies — see `ack_and_prune`).
                 ack_and_prune(&mut announced, &mut pending_bodies, ack);
 
-                // Collect available txs from the channel + pending_bodies.
-                let mut new_txs: Vec<PendingTx> = Vec::new();
+                // The blocking reply must announce at least one tx id (or send
+                // MsgDone) — an empty `MsgReplyTxIds` violates StTxIdsBlocking and
+                // desyncs the peer. Since `announce_txs` drops unparseable txs, a
+                // batch of only-unparseable txs yields an empty reply; loop and
+                // block for more until we can announce at least one.
+                let reply = loop {
+                    // Collect available txs from the channel + pending_bodies.
+                    let mut new_txs: Vec<PendingTx> = Vec::new();
 
-                // Drain any already-buffered pending bodies into new_txs first.
-                while new_txs.len() < req as usize {
-                    match tx_receiver.try_recv() {
-                        Ok(tx) => new_txs.push(tx),
-                        Err(_) => break,
-                    }
-                }
-
-                // If still empty, notify the application that we need txs,
-                // then block waiting for at least one.
-                if new_txs.is_empty() {
-                    if let Some(ref sender) = request_sender {
-                        let _ = sender.try_send(req);
-                    }
-                    match tx_receiver.recv().await {
-                        Some(tx) => new_txs.push(tx),
-                        None => {
-                            // Channel closed, no more txs — terminate.
-                            runner.send(&Message::MsgDone).await?;
-                            return Ok(());
-                        }
-                    }
-                    // Try to fill up to req.
+                    // Drain any already-buffered pending bodies into new_txs first.
                     while new_txs.len() < req as usize {
                         match tx_receiver.try_recv() {
                             Ok(tx) => new_txs.push(tx),
                             Err(_) => break,
                         }
                     }
-                }
 
-                // Announce only txs with a well-defined canonical Praos id, and
-                // track exactly those for ack/body lookup (announcing fewer ids
-                // than we track would drift the ack FIFO).
-                let reply = announce_txs(&new_txs, &mut announced, &mut pending_bodies);
+                    // If still empty, notify the application that we need txs,
+                    // then block waiting for at least one.
+                    if new_txs.is_empty() {
+                        if let Some(ref sender) = request_sender {
+                            let _ = sender.try_send(req);
+                        }
+                        match tx_receiver.recv().await {
+                            Some(tx) => new_txs.push(tx),
+                            None => {
+                                // Channel closed, no more txs — terminate.
+                                runner.send(&Message::MsgDone).await?;
+                                return Ok(());
+                            }
+                        }
+                        // Try to fill up to req.
+                        while new_txs.len() < req as usize {
+                            match tx_receiver.try_recv() {
+                                Ok(tx) => new_txs.push(tx),
+                                Err(_) => break,
+                            }
+                        }
+                    }
 
-                // Drain new_txs (already cloned into the deques above).
-                drop(new_txs);
+                    // Announce only txs with a well-defined canonical Praos id, and
+                    // track exactly those for ack/body lookup (announcing fewer ids
+                    // than we track would drift the ack FIFO).
+                    let reply = announce_txs(&new_txs, &mut announced, &mut pending_bodies);
+
+                    if !reply.is_empty() {
+                        break reply;
+                    }
+                    // Every tx in this batch was unparseable and dropped; loop to
+                    // block for more rather than send an empty blocking reply.
+                };
 
                 runner
                     .send(&Message::MsgReplyTxIds { tx_ids: reply })
@@ -640,12 +650,12 @@ mod tests {
         // CBOR framing so the total stays ~= `size`.
         let body_len = size.saturating_sub(6).max(1);
         let mut e = minicbor::Encoder::new(Vec::new());
-        let _ = e
-            .array(4)
+        e.array(4)
             .and_then(|e| e.bytes(&vec![id_byte; body_len]))
             .and_then(|e| e.map(0))
             .and_then(|e| e.bool(true))
-            .and_then(|e| e.null());
+            .and_then(|e| e.null())
+            .expect("encoding test tx into a Vec is infallible");
         PendingTx {
             tx_id: TxId::new_with_array([id_byte; 32]),
             body: TxBody::new_with_vec(e.into_writer()),
