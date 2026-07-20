@@ -50,6 +50,8 @@ pub enum ActionSpec {
     },
     #[serde(rename = "echo-to-source")]
     EchoToSource,
+    #[serde(rename = "cert-suppressor")]
+    CertSuppressor,
 }
 
 fn default_lazy_reason() -> NoVoteReason {

@@ -11,6 +11,7 @@
 //! [`super::behaviours`] during the migration; the hook versions are removed in
 //! a later phase.
 
+pub mod cert_suppressor;
 pub mod deep_reorg;
 pub mod drop_inbound;
 pub mod echo_to_source;
@@ -19,6 +20,7 @@ pub mod lie_about_eb_size;
 pub mod rb_equivocator;
 pub mod t22;
 
+pub use cert_suppressor::CertSuppressor;
 pub use deep_reorg::DeepReorg;
 pub use drop_inbound::DropInboundPeers;
 pub use echo_to_source::EchoToSource;

@@ -176,6 +176,27 @@ pub enum NoVoteReason {
     Declined,
 }
 
+impl NoVoteReason {
+    /// Stable, field-free tag for telemetry and aggregation (kebab-case, matching
+    /// the serde `rename_all`). Use this for the wire/telemetry string instead of
+    /// `format!("{self:?}")`: the Debug form of the struct variant `MissingTX`
+    /// includes its fields (e.g. `"MissingTX { required: 1, .. }"`), which breaks
+    /// exact-match aggregation downstream. `tag()` always returns just the variant
+    /// name, so consumers can match it exactly.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            NoVoteReason::LateEB => "late-eb",
+            NoVoteReason::LateRBHeader => "late-rb-header",
+            NoVoteReason::WrongEB => "wrong-eb",
+            NoVoteReason::NoChainTip => "no-chain-tip",
+            NoVoteReason::MissingTX { .. } => "missing-tx",
+            NoVoteReason::EBValidating => "eb-validating",
+            NoVoteReason::EquivocatingRB => "equivocating-rb",
+            NoVoteReason::Declined => "declined",
+        }
+    }
+}
+
 /// Result of evaluating the CIP-0164 voting predicates for one EB.
 ///
 /// `Ok((emit_pv, npv_signature))` means the voter cast at least one
@@ -296,12 +317,19 @@ pub enum LeiosTelemetryEvent {
         eb_slot: u64,
         voted_weight: u64,
         voters: usize,
+        /// Expected total committee weight (quorum denominator) — lets the
+        /// coordinator compute the quorum margin `voted_weight / expected_weight`.
+        expected_weight: u64,
     },
     ElectionExpired {
         eb_slot: u64,
         had_quorum: bool,
+        /// Final accumulated voted weight at end-of-round (incl. failed
+        /// elections) — the true quorum-margin numerator.
         voted_weight: u64,
         voters: usize,
+        /// Quorum denominator (`expected_total_weight`).
+        expected_weight: u64,
     },
     LeiosElectionInfo {
         eb_slot: u64,
@@ -683,6 +711,7 @@ impl LeiosState {
                     had_quorum,
                     voted_weight,
                     voters,
+                    expected_weight,
                     ..
                 } => {
                     fx.push(LeiosEffect::EmitTelemetry(
@@ -691,6 +720,7 @@ impl LeiosState {
                             had_quorum,
                             voted_weight,
                             voters,
+                            expected_weight,
                         },
                     ));
                 }
@@ -713,7 +743,30 @@ impl LeiosState {
                 .retain(|_, (s, _)| *s >= min_keep);
             self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
             self.validated_eb_bodies.retain(|_, s| *s >= min_keep);
-            self.elections.prune_below_slot(min_keep);
+            // Pruned elections emit their final voting tally so the quorum-
+            // margin sensor sees end-of-round weight (incl. elections that
+            // never reached quorum), not the always-~τ formation-time reading.
+            for eff in self.elections.prune_below_slot(min_keep) {
+                if let crate::elections::SlotEffect::Expired {
+                    eb_slot,
+                    had_quorum,
+                    voted_weight,
+                    voters,
+                    expected_weight,
+                    ..
+                } = eff
+                {
+                    fx.push(LeiosEffect::EmitTelemetry(
+                        LeiosTelemetryEvent::ElectionExpired {
+                            eb_slot,
+                            had_quorum,
+                            voted_weight,
+                            voters,
+                            expected_weight,
+                        },
+                    ));
+                }
+            }
             self.candidates.prune_below_slot(min_keep);
         }
         fx
@@ -1156,12 +1209,14 @@ impl LeiosState {
                     eb_slot,
                     voted_weight,
                     voters,
+                    expected_weight,
                 } = formed;
                 fx.push(LeiosEffect::EmitTelemetry(
                     LeiosTelemetryEvent::QuorumReached {
                         eb_slot,
                         voted_weight,
                         voters,
+                        expected_weight,
                     },
                 ));
             }
@@ -2150,7 +2205,9 @@ mod tests {
                 eb_hash: h, reason, ..
             } => {
                 assert_eq!(*h, eb_hash);
-                assert_eq!(*reason, expected);
+                // Compare by tag so struct-variant field values (e.g. MissingTX
+                // counts) don't have to be hardcoded in the expected value.
+                assert_eq!(reason.tag(), expected.tag(), "reason {reason:?} != {expected:?}");
             }
             other => panic!("expected NoVote, got {other:?}"),
         }
