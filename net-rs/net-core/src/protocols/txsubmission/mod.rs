@@ -267,12 +267,50 @@ fn ack_and_prune(
 /// wire: blake2b-256 of the transaction *body* (the ledger-effect id the peer
 /// re-derives from the delivered body). This differs from the node's internal
 /// `PendingTx::tx_id`, which is the `TxHash` (whole-tx hash) that Leios EBs key
-/// on — so we translate here, at the Praos wire boundary. Falls back to the
-/// whole-blob hash for txs that aren't parseable CBOR (e.g. synthetic test txs).
-fn praos_tx_id(tx: &PendingTx) -> TxId {
-    let hash =
-        net_codec::wire_tx_id(tx.body.get_slice()).unwrap_or_else(|| tx.body.get_blake2b_256());
-    TxId::new_with_array(hash)
+/// on — so we translate here, at the Praos wire boundary.
+///
+/// Returns `None` for a tx that doesn't parse as a CBOR transaction: such a tx
+/// has no canonical Praos id and must not be announced. Previously this fell
+/// back to the whole-blob hash, which silently announced the tx under the
+/// *wrong* id namespace (the TxHash Leios keys on) — so a peer could fetch it
+/// by that id but never match it back, stranding it. A silent fallback here is
+/// how that class of bug hid; a parse failure is now surfaced, not papered over.
+fn praos_tx_id(tx: &PendingTx) -> Option<TxId> {
+    net_codec::wire_tx_id(tx.body.get_slice()).map(TxId::new_with_array)
+}
+
+/// Build the `MsgReplyTxIds` payload for a batch of txs, tracking exactly the
+/// announced ones in `announced`/`pending_bodies`. Any tx with no canonical
+/// Praos id (unparseable — see [`praos_tx_id`]) is dropped with a warning
+/// rather than announced under the wrong id namespace; it also stays out of the
+/// tracking deques so the ack FIFO and body-lookup set match what went on wire.
+fn announce_txs(
+    new_txs: &[PendingTx],
+    announced: &mut VecDeque<PendingTx>,
+    pending_bodies: &mut VecDeque<PendingTx>,
+) -> Vec<TxIdAndSize> {
+    let mut reply = Vec::with_capacity(new_txs.len());
+    for tx in new_txs {
+        match praos_tx_id(tx) {
+            Some(tx_id) => {
+                reply.push(TxIdAndSize {
+                    tx_id,
+                    size: tx.size,
+                    era: wire_era(tx.era),
+                });
+                announced.push_back(tx.clone());
+                pending_bodies.push_back(tx.clone());
+            }
+            None => {
+                tracing::warn!(
+                    size = tx.size,
+                    "dropping tx with no canonical Praos wire id (unparseable body); \
+                     not announcing on TxSubmission"
+                );
+            }
+        }
+    }
+    reply
 }
 
 /// Run the client (tx provider) side of the TxSubmission protocol.
@@ -303,57 +341,57 @@ pub async fn run_client(
                 // acked-but-unrequested bodies — see `ack_and_prune`).
                 ack_and_prune(&mut announced, &mut pending_bodies, ack);
 
-                // Collect available txs from the channel + pending_bodies.
-                let mut new_txs: Vec<PendingTx> = Vec::new();
+                // The blocking reply must announce at least one tx id (or send
+                // MsgDone) — an empty `MsgReplyTxIds` violates StTxIdsBlocking and
+                // desyncs the peer. Since `announce_txs` drops unparseable txs, a
+                // batch of only-unparseable txs yields an empty reply; loop and
+                // block for more until we can announce at least one.
+                let reply = loop {
+                    // Collect available txs from the channel + pending_bodies.
+                    let mut new_txs: Vec<PendingTx> = Vec::new();
 
-                // Drain any already-buffered pending bodies into new_txs first.
-                while new_txs.len() < req as usize {
-                    match tx_receiver.try_recv() {
-                        Ok(tx) => new_txs.push(tx),
-                        Err(_) => break,
-                    }
-                }
-
-                // If still empty, notify the application that we need txs,
-                // then block waiting for at least one.
-                if new_txs.is_empty() {
-                    if let Some(ref sender) = request_sender {
-                        let _ = sender.try_send(req);
-                    }
-                    match tx_receiver.recv().await {
-                        Some(tx) => new_txs.push(tx),
-                        None => {
-                            // Channel closed, no more txs — terminate.
-                            runner.send(&Message::MsgDone).await?;
-                            return Ok(());
-                        }
-                    }
-                    // Try to fill up to req.
+                    // Drain any already-buffered pending bodies into new_txs first.
                     while new_txs.len() < req as usize {
                         match tx_receiver.try_recv() {
                             Ok(tx) => new_txs.push(tx),
                             Err(_) => break,
                         }
                     }
-                }
 
-                let reply: Vec<TxIdAndSize> = new_txs
-                    .iter()
-                    .map(|tx| TxIdAndSize {
-                        tx_id: praos_tx_id(tx),
-                        size: tx.size,
-                        era: wire_era(tx.era),
-                    })
-                    .collect();
+                    // If still empty, notify the application that we need txs,
+                    // then block waiting for at least one.
+                    if new_txs.is_empty() {
+                        if let Some(ref sender) = request_sender {
+                            let _ = sender.try_send(req);
+                        }
+                        match tx_receiver.recv().await {
+                            Some(tx) => new_txs.push(tx),
+                            None => {
+                                // Channel closed, no more txs — terminate.
+                                runner.send(&Message::MsgDone).await?;
+                                return Ok(());
+                            }
+                        }
+                        // Try to fill up to req.
+                        while new_txs.len() < req as usize {
+                            match tx_receiver.try_recv() {
+                                Ok(tx) => new_txs.push(tx),
+                                Err(_) => break,
+                            }
+                        }
+                    }
 
-                // Track announced txs for body lookups and ack tracking.
-                for tx in &new_txs {
-                    announced.push_back(tx.clone());
-                    pending_bodies.push_back(tx.clone());
-                }
+                    // Announce only txs with a well-defined canonical Praos id, and
+                    // track exactly those for ack/body lookup (announcing fewer ids
+                    // than we track would drift the ack FIFO).
+                    let reply = announce_txs(&new_txs, &mut announced, &mut pending_bodies);
 
-                // Drain new_txs (already cloned above).
-                drop(new_txs);
+                    if !reply.is_empty() {
+                        break reply;
+                    }
+                    // Every tx in this batch was unparseable and dropped; loop to
+                    // block for more rather than send an empty blocking reply.
+                };
 
                 runner
                     .send(&Message::MsgReplyTxIds { tx_ids: reply })
@@ -374,19 +412,7 @@ pub async fn run_client(
                     }
                 }
 
-                let reply: Vec<TxIdAndSize> = new_txs
-                    .iter()
-                    .map(|tx| TxIdAndSize {
-                        tx_id: praos_tx_id(tx),
-                        size: tx.size,
-                        era: wire_era(tx.era),
-                    })
-                    .collect();
-
-                for tx in &new_txs {
-                    announced.push_back(tx.clone());
-                    pending_bodies.push_back(tx.clone());
-                }
+                let reply = announce_txs(&new_txs, &mut announced, &mut pending_bodies);
 
                 drop(new_txs);
 
@@ -403,7 +429,7 @@ pub async fn run_client(
                     // (`praos_tx_id`), which differs from our internal TxHash key.
                     if let Some(pos) = pending_bodies
                         .iter()
-                        .position(|p| praos_tx_id(p) == requested_id.tx_id)
+                        .position(|p| praos_tx_id(p).as_ref() == Some(&requested_id.tx_id))
                     {
                         let pending = pending_bodies.remove(pos).expect("position valid");
                         txs.push(EraTxBody {
@@ -618,9 +644,21 @@ mod tests {
     }
 
     fn make_test_tx(id_byte: u8, size: usize) -> PendingTx {
+        // A parseable tx array `[body, {}, true, null]` so the body-only wire
+        // id (`praos_tx_id`) is well-defined; body bytes vary by `id_byte` so
+        // distinct test txs get distinct wire ids. Reserve a few bytes for the
+        // CBOR framing so the total stays ~= `size`.
+        let body_len = size.saturating_sub(6).max(1);
+        let mut e = minicbor::Encoder::new(Vec::new());
+        e.array(4)
+            .and_then(|e| e.bytes(&vec![id_byte; body_len]))
+            .and_then(|e| e.map(0))
+            .and_then(|e| e.bool(true))
+            .and_then(|e| e.null())
+            .expect("encoding test tx into a Vec is infallible");
         PendingTx {
             tx_id: TxId::new_with_array([id_byte; 32]),
-            body: TxBody::new_with_vec(vec![id_byte; size]),
+            body: TxBody::new_with_vec(e.into_writer()),
             size: size as u32,
             era: ORIGIN_ERA,
         }
@@ -644,7 +682,7 @@ mod tests {
             size: tx.len() as u32,
             era: ORIGIN_ERA,
         };
-        let announced = praos_tx_id(&pending);
+        let announced = praos_tx_id(&pending).expect("parseable tx has a canonical id");
         assert_eq!(
             announced,
             TxId::new_with_array(net_codec::wire_tx_id(&tx).unwrap()),

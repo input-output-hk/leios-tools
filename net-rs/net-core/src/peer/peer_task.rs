@@ -1398,11 +1398,15 @@ mod tests {
         let ts_handle =
             spawn_txsubmission(client_send, client_recv, peer_id, tx_receiver, event_sender);
 
-        // Send a transaction.
+        // Send a transaction. The body is a parseable tx array
+        // `[bytes(body), {}, true, null]` so it has a canonical Praos wire id
+        // (`praos_tx_id`); an unparseable body would now be dropped, not sent.
         let tx = PendingTx {
             tx_id: TxId::new_with_array([0x44; 32]),
-            body: TxBody::new_with_vec(vec![0x45, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E]), // CBOR bytes(5)
-            size: 5,
+            body: TxBody::new_with_vec(vec![
+                0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6,
+            ]),
+            size: 9,
             era: ts::ORIGIN_ERA,
         };
         tx_sender.send(tx).await.unwrap();
@@ -1414,7 +1418,9 @@ mod tests {
                 PeerEvent::TransactionReceived { body, era } => {
                     assert_eq!(
                         body,
-                        TxBody::new_with_vec(vec![0x45, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E])
+                        TxBody::new_with_vec(vec![
+                            0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6,
+                        ])
                     );
                     assert_eq!(era, ts::ORIGIN_ERA);
                 }
