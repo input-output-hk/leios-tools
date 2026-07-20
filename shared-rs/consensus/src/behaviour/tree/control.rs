@@ -45,12 +45,38 @@ pub struct PraosControl {
     /// parent RB's announced EB, killing that EB's certification (strict
     /// parent-only cert rule) without touching quorum.
     pub suppress_cert: bool,
-    /// Announce a FAKE EB on any RB this node produces this slot, with this many
-    /// phantom (nonexistent) transactions in its manifest (the `fake-eb`
-    /// pen-test action). The EB body (manifest) is served, but the referenced
-    /// txs exist nowhere, so honest voters fetch the EB, fail to fetch the txs,
-    /// and decline `MissingTX`. `None` = honest.
-    pub fake_eb_txs: Option<u32>,
+    /// Announce a fabricated EB on any RB this node produces this slot (the
+    /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
+    /// variant — see [`FakeEbKind`].
+    pub fake_eb: Option<FakeEbKind>,
+}
+
+/// Which fabricated-EB pen-test to run, and its manifest size. The family
+/// announces an EB the adversary never legitimately assembled; the variants
+/// differ in whether the referenced txs can be fetched by honest voters,
+/// which probes different parts of the pipeline:
+///
+/// - [`Phantom`](FakeEbKind::Phantom) — "Phantom Tx EB": the manifest lists
+///   `n_txs` nonexistent tx hashes and the adversary pins **no** bodies. Honest
+///   voters fetch the EB, fail to fetch its txs, and decline `MissingTX`. The
+///   EB has no backing and must never reach quorum. Probes missing-tx handling
+///   and fetch resource-waste.
+/// - [`Dummy`](FakeEbKind::Dummy) — "Dummy Tx EB": the manifest lists `n_txs`
+///   fabricated txs AND the adversary pins matching (servable) bodies. Honest
+///   voters fetch the EB and its txs **successfully** — no `MissingTX` — so the
+///   EB clears the availability gate despite referencing txs that were never in
+///   any honest mempool. Probes soundness: does anything downstream reject an
+///   available-but-fabricated EB, or does it reach quorum?
+///
+/// A third variant, "Mega Tx EB" (oversized manifest / declared size, for
+/// resource-exhaustion robustness), is planned — see
+/// `threats/fake-eb/PLAN.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeEbKind {
+    /// Phantom Tx EB — `n_txs` unfetchable phantom txs; no bodies pinned.
+    Phantom { n_txs: u32 },
+    /// Dummy Tx EB — `n_txs` fabricated txs with servable bodies pinned.
+    Dummy { n_txs: u32 },
 }
 
 /// Leios-domain actuator inputs.
@@ -152,6 +178,7 @@ mod tests {
         assert!(!d.praos.drop_inbound);
         assert_eq!(d.praos.body_path, None);
         assert!(!d.praos.suppress_cert);
+        assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
         assert!(!d.leios.echo_to_source);

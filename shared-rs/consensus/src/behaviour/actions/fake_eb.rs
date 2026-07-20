@@ -1,34 +1,61 @@
-//! `fake-eb` — announce a fabricated EB with phantom transactions (pen-test).
+//! Fake-EB pen-test family — announce a fabricated EB on produced RBs.
 //!
-//! Sets `praos.fake_eb_txs = Some(n_txs)`, so on any RB this node produces it
-//! announces an EB whose manifest is `n_txs` random, nonexistent tx hashes. The
-//! EB body (the manifest) is served on fetch, but the referenced txs exist
-//! nowhere — so honest voters fetch the EB, fail to fetch its txs, and decline
-//! `MissingTX`. Probes missing-tx handling + resource waste; the fake EB should
-//! never reach quorum. `n_txs` is the manifest size (the only knob besides the
-//! adversary's stake, i.e. how many RBs it produces). Returns `Running` while
-//! installed.
+//! Two leaves, distinguished by whether the referenced txs can be fetched:
+//!
+//! - [`PhantomTxEb`] — "Phantom Tx EB": manifest of `n_txs` nonexistent tx
+//!   hashes, no bodies pinned. Honest voters fetch the EB, fail to fetch its
+//!   txs, and decline `MissingTX`. The fake EB has no backing and should never
+//!   reach quorum. Probes missing-tx handling + fetch resource waste.
+//! - [`DummyTxEb`] — "Dummy Tx EB": manifest of `n_txs` fabricated txs whose
+//!   bodies the adversary pins so they ARE servable. Honest voters fetch the EB
+//!   and its txs successfully — no `MissingTX` — so the EB clears the
+//!   availability gate despite referencing txs never in any honest mempool.
+//!   Probes soundness.
+//!
+//! Both set `praos.fake_eb`; actuation (manifest construction, and for Dummy
+//! the fabricated-body pinning) lives in net-node (adversarial-tools). `n_txs`
+//! is the manifest size — the only knob besides the adversary's stake (i.e. how
+//! many RBs it produces). Both return `Running` while installed.
 
 use crate::behaviour::tree::actions::LeafAction;
-use crate::behaviour::tree::control::ControlSignal;
+use crate::behaviour::tree::control::{ControlSignal, FakeEbKind};
 use crate::behaviour::tree::env::TickCtx;
 use crate::behaviour::tree::Status;
 
-/// Announces a fake EB with `n_txs` phantom transactions on produced RBs.
+/// Phantom Tx EB — announces an EB of `n_txs` unfetchable phantom txs.
 #[derive(Debug, Clone, Copy)]
-pub struct FakeEbAnnouncer {
+pub struct PhantomTxEb {
     n_txs: u32,
 }
 
-impl FakeEbAnnouncer {
+impl PhantomTxEb {
     pub fn new(n_txs: u32) -> Self {
         Self { n_txs }
     }
 }
 
-impl LeafAction for FakeEbAnnouncer {
+impl LeafAction for PhantomTxEb {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
-        out.praos.fake_eb_txs = Some(self.n_txs);
+        out.praos.fake_eb = Some(FakeEbKind::Phantom { n_txs: self.n_txs });
+        Status::Running
+    }
+}
+
+/// Dummy Tx EB — announces an EB of `n_txs` fabricated txs with servable bodies.
+#[derive(Debug, Clone, Copy)]
+pub struct DummyTxEb {
+    n_txs: u32,
+}
+
+impl DummyTxEb {
+    pub fn new(n_txs: u32) -> Self {
+        Self { n_txs }
+    }
+}
+
+impl LeafAction for DummyTxEb {
+    fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+        out.praos.fake_eb = Some(FakeEbKind::Dummy { n_txs: self.n_txs });
         Status::Running
     }
 }
@@ -38,21 +65,34 @@ mod tests {
     use super::*;
     use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
-    #[test]
-    fn sets_fake_eb_txs() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
+    fn ctx<'a>(env: &'a DynamicEnv, state: &'a NativeChainState) -> TickCtx<'a> {
+        TickCtx {
+            env,
+            state,
             seed: 0,
             action_params: None,
-        };
+        }
+    }
+
+    #[test]
+    fn phantom_sets_phantom_kind() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
         let mut out = ControlSignal::default();
-        let s = FakeEbAnnouncer::new(8).contribute(&ctx, &mut out);
+        let s = PhantomTxEb::new(8).contribute(&ctx(&env, &state), &mut out);
         assert_eq!(s, Status::Running);
-        assert_eq!(out.praos.fake_eb_txs, Some(8));
+        assert_eq!(out.praos.fake_eb, Some(FakeEbKind::Phantom { n_txs: 8 }));
         // Honest default (no tick) announces no fake EB.
-        assert_eq!(ControlSignal::default().praos.fake_eb_txs, None);
+        assert_eq!(ControlSignal::default().praos.fake_eb, None);
+    }
+
+    #[test]
+    fn dummy_sets_dummy_kind() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let mut out = ControlSignal::default();
+        let s = DummyTxEb::new(5).contribute(&ctx(&env, &state), &mut out);
+        assert_eq!(s, Status::Running);
+        assert_eq!(out.praos.fake_eb, Some(FakeEbKind::Dummy { n_txs: 5 }));
     }
 }

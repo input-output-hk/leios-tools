@@ -85,7 +85,8 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
         )),
         ActionSpec::EchoToSource => Box::new(catalogue::EchoToSource),
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
-        ActionSpec::FakeEb { n_txs } => Box::new(catalogue::FakeEbAnnouncer::new(*n_txs)),
+        ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
+        ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
     }
 }
 

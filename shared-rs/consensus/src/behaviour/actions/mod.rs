@@ -22,7 +22,7 @@ pub mod rb_equivocator;
 pub mod t22;
 
 pub use cert_suppressor::CertSuppressor;
-pub use fake_eb::FakeEbAnnouncer;
+pub use fake_eb::{DummyTxEb, PhantomTxEb};
 pub use deep_reorg::DeepReorg;
 pub use drop_inbound::DropInboundPeers;
 pub use echo_to_source::EchoToSource;
