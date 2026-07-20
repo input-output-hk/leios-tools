@@ -52,6 +52,15 @@ pub enum ActionSpec {
     EchoToSource,
     #[serde(rename = "cert-suppressor")]
     CertSuppressor,
+    #[serde(rename = "fake-eb")]
+    FakeEb {
+        #[serde(default = "default_fake_eb_txs")]
+        n_txs: u32,
+    },
+}
+
+fn default_fake_eb_txs() -> u32 {
+    8
 }
 
 fn default_lazy_reason() -> NoVoteReason {

@@ -45,6 +45,12 @@ pub struct PraosControl {
     /// parent RB's announced EB, killing that EB's certification (strict
     /// parent-only cert rule) without touching quorum.
     pub suppress_cert: bool,
+    /// Announce a FAKE EB on any RB this node produces this slot, with this many
+    /// phantom (nonexistent) transactions in its manifest (the `fake-eb`
+    /// pen-test action). The EB body (manifest) is served, but the referenced
+    /// txs exist nowhere, so honest voters fetch the EB, fail to fetch the txs,
+    /// and decline `MissingTX`. `None` = honest.
+    pub fake_eb_txs: Option<u32>,
 }
 
 /// Leios-domain actuator inputs.
