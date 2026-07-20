@@ -8,9 +8,9 @@
 //! tx hash set in wire order (sizes are ignored — the consumer only needs the
 //! hash set + order for bitmap indexing).
 
+use crate::blake2b_256;
 use shared_consensus::mempool::{EbKey, TxId};
 use shared_consensus::Point;
-use crate::blake2b_256;
 
 /// Maximum number of tx-hash entries accepted in an overflow EB manifest.
 ///
@@ -70,9 +70,7 @@ pub fn decode_overflow_eb(point: &Point, blob: &[u8]) -> Option<(Option<EbKey>, 
     let eb_hash = blake2b_256(blob);
     let eb_key = match point {
         Point::Origin => None,
-        Point::Specific { slot, .. } => {
-            Some(EbKey::new(*slot, eb_hash))
-        },
+        Point::Specific { slot, .. } => Some(EbKey::new(*slot, eb_hash)),
     };
     Some((eb_key, hashes))
 }
@@ -97,7 +95,10 @@ mod tests {
     use super::*;
     use crate::blake2b_256;
 
-    const BLANK_POINT: Point = Point::Specific { slot: 0, hash: [0u8; 32] };
+    const BLANK_POINT: Point = Point::Specific {
+        slot: 0,
+        hash: [0u8; 32],
+    };
 
     #[test]
     fn encode_overflow_eb_is_deterministic() {

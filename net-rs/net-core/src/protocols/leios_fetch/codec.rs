@@ -145,11 +145,7 @@ fn encode_raw<W: minicbor::encode::Write>(
 
 // --- Decode helpers ---
 
-fn check_max_size(
-    raw: &[u8],
-    max_size: usize,
-    name: &str,
-) -> Result<(), DecodeError> {
+fn check_max_size(raw: &[u8], max_size: usize, name: &str) -> Result<(), DecodeError> {
     if raw.len() > max_size {
         return Err(DecodeError::message(format!(
             "{name} is {} bytes, maximum is {max_size}",
@@ -258,10 +254,10 @@ fn decode_bitmap(d: &mut Decoder<'_>) -> Result<BTreeMap<u16, u64>, DecodeError>
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-    use minicbor::Decode;
     use super::*;
     use crate::types::Point;
+    use minicbor::Decode;
+    use std::convert::Infallible;
 
     fn round_trip(msg: &Message) -> Result<Message, DecodeError> {
         let encoded = minicbor::to_vec(msg).unwrap();
@@ -375,7 +371,7 @@ mod tests {
     fn block_txs_round_trip_impl(
         original_transactions: Vec<TxBody>,
         original_bitmap: BTreeMap<u16, u64>,
-        round_trip: &dyn Fn(&Message) -> Result<Message, DecodeError>
+        round_trip: &dyn Fn(&Message) -> Result<Message, DecodeError>,
     ) -> Result<(), DecodeError> {
         let msg = Message::MsgLeiosBlockTxs {
             point: Point::Specific {
@@ -420,19 +416,26 @@ mod tests {
     }
 
     /// (simplified flawed implementation, to demonstrate CBOR decoding bug)
-    fn non_cbor_encode_leios_block(m: &Message, e: &mut Encoder<Vec<u8>>, _ctx: &mut ())
-        -> Result<(), EncodeError<Infallible>>
-    {
-        if let Message::MsgLeiosBlockTxs { point, transactions, .. } = m
+    fn non_cbor_encode_leios_block(
+        m: &Message,
+        e: &mut Encoder<Vec<u8>>,
+        _ctx: &mut (),
+    ) -> Result<(), EncodeError<Infallible>> {
+        if let Message::MsgLeiosBlockTxs {
+            point,
+            transactions,
+            ..
+        } = m
         {
             e.array(4)?;
             e.u32(3)?;
             minicbor::Encode::encode(point, e, &mut ())?;
             non_cbor_encode_tx_list(e, transactions)?;
             Ok(())
-        }
-        else {
-            Err(EncodeError::message("only MsgLeiosBlockTxs is supported in this test"))
+        } else {
+            Err(EncodeError::message(
+                "only MsgLeiosBlockTxs is supported in this test",
+            ))
         }
     }
 
@@ -449,8 +452,7 @@ mod tests {
                 bitmap: BTreeMap::new(),
                 transactions,
             })
-        }
-        else {
+        } else {
             Err(DecodeError::message(format!(
                 "unknown or unsupported leios_fetch message tag: {tag}"
             )))
@@ -498,7 +500,7 @@ mod tests {
     /// Use simplified flawed implementations to round-trip `message`.
     fn non_cbor_round_trip(message: &Message) -> Result<Message, DecodeError> {
         let mut e = Encoder::new(Vec::new());
-        let _encoded = non_cbor_encode_leios_block(&message, &mut e, &mut ());
+        let _encoded = non_cbor_encode_leios_block(message, &mut e, &mut ());
         let writer = e.into_writer();
         let mut d = Decoder::new(&writer);
         non_cbor_decode_leios_block(&mut d, &mut ())
@@ -521,12 +523,12 @@ mod tests {
     fn non_cbor_block_txs_round_trip() {
         let value1 = TxBody::new_with_slice(
             "Lorem Ipsum es simplemente el texto de relleno de las imprentas y archivos de texto."
-                .as_bytes()
+                .as_bytes(),
         );
 
         // We need some non-ASCII characters to trigger the bug.
         let value2 = TxBody::new_with_slice(
-            "Съешь ещё этих мягких французских булок, да выпей же чаю".as_bytes()
+            "Съешь ещё этих мягких французских булок, да выпей же чаю".as_bytes(),
         );
 
         // Sub-test 1. Correct CBOR, different transactions.
@@ -537,7 +539,10 @@ mod tests {
 
         // ... Inconsistent CBOR encoding: different txs.
         let result = block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &non_cbor_round_trip);
-        assert!(result.unwrap_err().to_string().starts_with("decode error: Round trip transactions mismatch"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .starts_with("decode error: Round trip transactions mismatch"));
 
         // Sub-test 2. Incorrect CBOR
         let value1a = TxBody::new_with_slice("Lorem Ipsum".as_bytes());
@@ -559,7 +564,10 @@ mod tests {
 
         // ... and leads to unrelated decoding errors.
         let result = block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &non_cbor_round_trip);
-        assert_eq!(result.unwrap_err().to_string(), "invalid utf-8 at position 39");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "invalid utf-8 at position 39"
+        );
     }
 
     #[test]

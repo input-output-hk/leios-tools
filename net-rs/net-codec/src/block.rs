@@ -40,8 +40,8 @@ static BODY_PARSE_FAIL_WARNS: AtomicUsize = AtomicUsize::new(0);
 fn count_and_skip_array(d: &mut Decoder) -> Result<u32, DecodeError> {
     match d.array()? {
         Some(n) => {
-            let n = u32::try_from(n)
-                .map_err(|_| DecodeError::message("array length exceeds u32"))?;
+            let n =
+                u32::try_from(n).map_err(|_| DecodeError::message("array length exceeds u32"))?;
             for _ in 0..n {
                 d.skip()?;
             }
@@ -685,7 +685,7 @@ mod tests {
         let mut be = Encoder::new(&mut block_buf);
         be.array(2).unwrap();
         be.bytes(&[0x80]).unwrap(); // dummy header
-        // body wrapper: [null, tx_list, null, null]
+                                    // body wrapper: [null, tx_list, null, null]
         be.array(4).unwrap();
         be.null().unwrap();
         be.array(tx_count).unwrap(); // tx_list
@@ -722,7 +722,10 @@ mod tests {
         // (here 436, as seen on the dev testnet), NOT the wrapper's length (4).
         let raw = build_leios_block_with_tx_count(8, 436);
         let info = BlockBody::opaque(raw).praos_inspect();
-        assert_eq!(info.tx_count, 436, "must count the inner tx_list, not the wrapper");
+        assert_eq!(
+            info.tx_count, 436,
+            "must count the inner tx_list, not the wrapper"
+        );
 
         // A different count to prove it isn't hard-wired.
         let raw = build_leios_block_with_tx_count(8, 7);
