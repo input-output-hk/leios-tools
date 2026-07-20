@@ -69,8 +69,8 @@ pub struct PraosControl {
 ///   available-but-fabricated EB, or does it reach quorum?
 ///
 /// A third variant, "Mega Tx EB" (oversized manifest / declared size, for
-/// resource-exhaustion robustness), is planned — see
-/// `threats/fake-eb/PLAN.md`.
+/// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
+/// in the leios-adversarial-tools repo, which houses the net-node actuation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeEbKind {
     /// Phantom Tx EB — `n_txs` unfetchable phantom txs; no bodies pinned.
