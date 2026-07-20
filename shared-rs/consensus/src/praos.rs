@@ -1422,7 +1422,12 @@ impl PraosState {
                     second = %hex32(&eb_hash),
                     "CERTIFICATE EQUIVOCATION: two conflicting certs for one election"
                 );
-                self.cert_equivocations.push(eb_slot);
+                // Report each equivocating slot at most once per drain window —
+                // several conflicting certs for one slot must not spam the
+                // downstream certificate_equivocation safety sensor.
+                if !self.cert_equivocations.contains(&eb_slot) {
+                    self.cert_equivocations.push(eb_slot);
+                }
             }
             Some(_) => {} // duplicate of the same cert — not equivocation
             None => {
@@ -3069,6 +3074,12 @@ mod tests {
         // A cert for a different slot is an independent election — no detection.
         s.note_cert_for_equivocation(11, h(3));
         assert!(s.take_cert_equivocations().is_empty());
+        // Several conflicting certs for ONE slot before a drain are reported
+        // only once — no duplicate spam to the safety sensor.
+        s.note_cert_for_equivocation(12, h(3)); // first for slot 12 — recorded
+        s.note_cert_for_equivocation(12, h(4)); // conflict -> flag 12
+        s.note_cert_for_equivocation(12, h(5)); // another conflict, same slot
+        assert_eq!(s.take_cert_equivocations(), vec![12]);
     }
 
     #[test]

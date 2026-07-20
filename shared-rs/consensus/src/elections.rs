@@ -431,10 +431,12 @@ impl Elections {
     pub fn prune_below_slot(&mut self, min_slot: u64) -> Vec<SlotEffect> {
         let expected_weight = self.cfg.expected_total_weight;
         let mut expired = Vec::new();
-        self.elections.retain(|hash, e| {
+        self.elections.retain(|_rb_hash, e| {
             if e.announced_slot < min_slot {
                 expired.push(SlotEffect::Expired {
-                    eb_hash: *hash,
+                    // The map is keyed by the announcing-RB hash, so emit the
+                    // election's real EB hash here (not the key).
+                    eb_hash: e.eb_hash,
                     eb_slot: e.announced_slot,
                     had_quorum: e.quorum_reached,
                     voted_weight: e.voter_weights.values().sum(),
@@ -603,19 +605,22 @@ mod tests {
         // signal the quorum-margin sensor needs (voted 40 / expected 100).
         let mut e = test_elections();
         e.on_slot(10);
-        e.announce_from_rb(h(1), 10, h(1));
+        // Distinct RB (election key) and EB hashes so the assertions below catch
+        // any regression that emits the RB hash in the Expired `eb_hash` field.
+        e.announce_from_rb(h(1), 10, h(2));
         e.record_vote(&h(1), b"voter-a".to_vec(), 40);
         let expired = e.prune_below_slot(20);
         assert_eq!(expired.len(), 1);
         match &expired[0] {
             SlotEffect::Expired {
+                eb_hash,
                 eb_slot,
                 had_quorum,
                 voted_weight,
                 voters,
                 expected_weight,
-                ..
             } => {
+                assert_eq!(*eb_hash, h(2)); // the EB hash, not the RB key h(1)
                 assert_eq!(*eb_slot, 10);
                 assert!(!*had_quorum);
                 assert_eq!(*voted_weight, 40);
