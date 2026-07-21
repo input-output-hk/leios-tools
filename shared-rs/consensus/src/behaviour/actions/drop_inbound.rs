@@ -8,7 +8,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Resets inbound peers each slot with the configured probability.
@@ -48,7 +48,7 @@ impl DropInboundPeers {
     }
 }
 
-impl LeafAction for DropInboundPeers {
+impl LeafAction<ConsensusCtx, ControlSignal> for DropInboundPeers {
     fn contribute(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         if self.draws(ctx.state.current_slot) {
             out.praos.drop_inbound = true;

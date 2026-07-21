@@ -8,7 +8,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Forces a `depth`-block reorg every `every_slots` slots.
@@ -44,7 +44,7 @@ impl DeepReorg {
     }
 }
 
-impl LeafAction for DeepReorg {
+impl LeafAction<ConsensusCtx, ControlSignal> for DeepReorg {
     fn contribute(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         if self.due(ctx.state.current_slot) {
             out.praos.reorg_depth = Some(self.depth);

@@ -9,14 +9,14 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Announce without serving the body. No parameters.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnnounceDangling;
 
-impl LeafAction for AnnounceDangling {
+impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceDangling {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.announce_dangling = true;
         Status::Running

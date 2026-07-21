@@ -23,7 +23,27 @@
 
 use std::collections::BTreeMap;
 
-use super::env::{EnvValue, TickCtx, CHAIN_FIELDS};
+use super::env::{ConsensusCtx, EnvValue, TickCtx, TreeContext, CHAIN_FIELDS};
+
+/// A boolean precondition over a tree instantiation's per-tick context.
+///
+/// The generic tree stores conditions as `Box<dyn Condition<C>>`, so the
+/// engine can evaluate a precondition without knowing the concrete context
+/// type. `Debug + Send` so the compiled tree stays inspectable and movable
+/// across tasks (mirroring the leaf-action contract).
+pub trait Condition<C: TreeContext>: std::fmt::Debug + Send {
+    /// Evaluate the predicate against this tick's context view.
+    fn eval(&self, ctx: &C::View<'_>) -> bool;
+}
+
+/// The consensus binding: [`ConditionExpr`] evaluates against a [`TickCtx`].
+/// Delegates to the inherent [`ConditionExpr::eval`] (inherent methods take
+/// precedence over trait methods, so this does not recurse).
+impl Condition<ConsensusCtx> for ConditionExpr {
+    fn eval(&self, ctx: &TickCtx<'_>) -> bool {
+        ConditionExpr::eval(self, ctx)
+    }
+}
 
 /// A parsed, validated boolean predicate over env + chain state.
 #[derive(Debug, Clone, PartialEq)]

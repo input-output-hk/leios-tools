@@ -157,6 +157,54 @@ impl<'a> TickCtx<'a> {
     }
 }
 
+/// Read-side seam for live Action-leaf parameter overrides. The generic tick
+/// applies overrides through this trait so it never reaches into a concrete
+/// context's internals; each tree instantiation's per-tick view implements it.
+pub trait ParamOverrides {
+    /// All live overrides addressed to `behaviour_id`, as `(field, value)`
+    /// pairs (store keys `"<behaviour_id>.<field>"`). Empty when nothing is
+    /// addressed to that id.
+    fn action_overrides(&self, behaviour_id: &str) -> Vec<(String, toml::Value)>;
+}
+
+impl ParamOverrides for TickCtx<'_> {
+    fn action_overrides(&self, behaviour_id: &str) -> Vec<(String, toml::Value)> {
+        let Some(store) = self.action_params else {
+            return Vec::new();
+        };
+        let prefix = format!("{behaviour_id}.");
+        // Collect this leaf's overrides under the lock (a `BTreeMap` prefix
+        // range — no full scan), then release the guard before returning so the
+        // caller never holds the read lock across leaf `set_param` calls.
+        let Ok(map) = store.read() else {
+            return Vec::new();
+        };
+        map.range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
+            .collect()
+    }
+}
+
+/// A tree instantiation's read-model family: maps the tick lifetime to the
+/// concrete context type Conditions and Actions read this tick. A marker type
+/// implements this to bind the engine to a concrete context; the per-tick view
+/// may borrow (hence the lifetime-generic associated type), and must expose live
+/// action-parameter overrides via [`ParamOverrides`].
+pub trait TreeContext {
+    /// The borrowed per-tick context view.
+    type View<'a>: ParamOverrides;
+}
+
+/// The consensus tree instantiation: Conditions and Actions read a [`TickCtx`].
+/// An uninhabited marker used only as a type parameter, never constructed.
+#[derive(Debug, Clone, Copy)]
+pub enum ConsensusCtx {}
+
+impl TreeContext for ConsensusCtx {
+    type View<'a> = TickCtx<'a>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

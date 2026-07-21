@@ -350,7 +350,7 @@ impl BtConfig {
                 BehaviourKind::for_ticks(*count, c)
             }
             RawBehaviour::Wait { count } => BehaviourKind::wait(*count),
-            RawBehaviour::Condition(expr) => BehaviourKind::Condition(expr.clone()),
+            RawBehaviour::Condition(expr) => BehaviourKind::Condition(Box::new(expr.clone())),
             RawBehaviour::Honest => BehaviourKind::Action(Box::new(HonestAction)),
             RawBehaviour::Action(spec) => {
                 let action_seed = child_seed(seed, *action_counter);

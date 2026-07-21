@@ -24,13 +24,16 @@ pub mod env;
 pub mod variants;
 
 pub use behaviour::{Behaviour, BehaviourId, BehaviourKind, BehaviourTree};
-pub use condition::{CompareOp, ConditionExpr, ValueRef};
+pub use condition::{CompareOp, Condition, ConditionExpr, ValueRef};
 pub use config::{BtConfig, ConfigError, ModuleMeta, Run};
 pub use control::{
     ControlSignal, EbSizePolicy, LeiosControl, MempoolControl, OutboundControl, PraosControl,
     TxFilterPolicy, VotePolicy,
 };
-pub use env::{ActionParamStore, DynamicEnv, EnvHandle, EnvValue, NativeChainState, TickCtx};
+pub use env::{
+    ActionParamStore, ConsensusCtx, DynamicEnv, EnvHandle, EnvValue, NativeChainState,
+    ParamOverrides, TickCtx, TreeContext,
+};
 pub use variants::{EquivocationVariants, RbVariant};
 
 /// The status a behaviour returns when ticked (spec FR-001).
