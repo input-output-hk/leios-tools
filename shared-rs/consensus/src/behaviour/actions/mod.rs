@@ -11,6 +11,9 @@
 //! [`super::behaviours`] during the migration; the hook versions are removed in
 //! a later phase.
 
+pub mod announce_dangling;
+pub mod announce_equivocate;
+pub mod announce_size_lie;
 pub mod cert_suppressor;
 pub mod fake_eb;
 pub mod deep_reorg;
@@ -21,6 +24,9 @@ pub mod lie_about_eb_size;
 pub mod rb_equivocator;
 pub mod t22;
 
+pub use announce_dangling::AnnounceDangling;
+pub use announce_equivocate::AnnounceEquivocate;
+pub use announce_size_lie::AnnounceSizeLie;
 pub use cert_suppressor::CertSuppressor;
 pub use fake_eb::{DummyTxEb, PhantomTxEb};
 pub use deep_reorg::DeepReorg;

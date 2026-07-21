@@ -831,6 +831,9 @@ fn notification_to_ln_msg(n: &crate::store::leios_store::LeiosNotification) -> L
         LeiosNotification::BlockTxsOffer { point } => LnMsg::MsgLeiosBlockTxsOffer {
             point: point.clone(),
         },
+        LeiosNotification::BlockAnnouncement { header } => LnMsg::MsgLeiosBlockAnnouncement {
+            header: header.clone(),
+        },
         LeiosNotification::Votes { votes, .. } => LnMsg::MsgLeiosVotes {
             votes: votes.clone(),
         },
@@ -1024,6 +1027,14 @@ async fn next_outbound_notification(
                         eb_size,
                         ?sources,
                         "leios_notify: serving EB offer"
+                    );
+                }
+                LnMsg::MsgLeiosBlockAnnouncement { header } => {
+                    tracing::info!(
+                        peer = peer.0,
+                        point = ?header.point(),
+                        ?sources,
+                        "leios_notify: serving EB announcement"
                     );
                 }
                 LnMsg::MsgLeiosBlockTxsOffer { point } => {
