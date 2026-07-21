@@ -13,20 +13,23 @@
 //! matching boxed [`LeafAction`].
 
 use super::control::ControlSignal;
-use super::env::TickCtx;
+use super::env::{ConsensusCtx, TreeContext};
 use super::Status;
 use crate::behaviour::actions as catalogue;
 use crate::behaviour::registry::ActionSpec;
 
-/// The contract every leaf action honours.
+/// The contract every leaf action honours, generic over the tree
+/// instantiation's context family `C` (what it reads) and effect `E` (what it
+/// writes). The consensus instantiation binds `C = ConsensusCtx`
+/// (view = `TickCtx`) and `E = ControlSignal`.
 ///
-/// `contribute` writes the leaf's `ControlSignal` slice and returns its status;
+/// `contribute` writes the leaf's slice of `out` and returns its status;
 /// `reset` is called when the action is halted (a reactive abort) so a stateful
 /// action can drop any carried progress. `Debug + Send` so the compiled tree is
 /// inspectable and movable across tasks.
-pub trait LeafAction: std::fmt::Debug + Send {
+pub trait LeafAction<C: TreeContext, E>: std::fmt::Debug + Send {
     /// Write this leaf's slice of `out` and return its status.
-    fn contribute(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status;
+    fn contribute(&mut self, ctx: &C::View<'_>, out: &mut E) -> Status;
 
     /// Stop contributing and reset progress. Default: nothing to reset.
     fn reset(&mut self) {}
@@ -40,22 +43,26 @@ pub trait LeafAction: std::fmt::Debug + Send {
     fn set_param(&mut self, _field: &str, _value: &toml::Value) {}
 }
 
-/// The honest leaf: contributes nothing (leaves `ControlSignal` at default) and
-/// returns `Success`. The fallback branch of a `Selector`.
+/// The honest leaf: contributes nothing (leaves the effect at default) and
+/// returns `Success`. The fallback branch of a `Selector`. Blanket over every
+/// context/effect — it never reads the context nor writes the effect.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HonestAction;
 
-impl LeafAction for HonestAction {
-    fn contribute(&mut self, _ctx: &TickCtx, _out: &mut ControlSignal) -> Status {
+impl<C: TreeContext, E> LeafAction<C, E> for HonestAction {
+    fn contribute(&mut self, _ctx: &C::View<'_>, _out: &mut E) -> Status {
         Status::Success
     }
 }
 
-/// Materialise an [`ActionSpec`] into a boxed [`LeafAction`].
+/// Materialise an [`ActionSpec`] into a boxed consensus [`LeafAction`].
 ///
 /// `seed` is the deterministic seed for actions that make per-peer/per-slot
 /// random choices (equivocation routing buckets, the inbound-drop draw).
-pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
+pub fn build_action(
+    spec: &ActionSpec,
+    seed: u64,
+) -> Box<dyn LeafAction<ConsensusCtx, ControlSignal>> {
     match spec {
         ActionSpec::RbHeaderEquivocator { ways } => {
             Box::new(catalogue::RbHeaderEquivocator::new(*ways, seed))
@@ -92,10 +99,12 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
 mod tests {
     use super::*;
     use crate::behaviour::tree::control::VotePolicy;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
+    use crate::behaviour::tree::env::{ConsensusCtx, DynamicEnv, NativeChainState, TickCtx};
     use crate::leios::NoVoteReason;
 
-    fn tick_once(action: &mut dyn LeafAction) -> (Status, ControlSignal) {
+    fn tick_once(
+        action: &mut dyn LeafAction<ConsensusCtx, ControlSignal>,
+    ) -> (Status, ControlSignal) {
         let env = DynamicEnv::new();
         let state = NativeChainState::default();
         let ctx = TickCtx {

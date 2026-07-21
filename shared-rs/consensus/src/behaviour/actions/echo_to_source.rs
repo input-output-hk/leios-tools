@@ -7,14 +7,14 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Opens the no-echo gate. No parameters — composition is the only knob.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EchoToSource;
 
-impl LeafAction for EchoToSource {
+impl LeafAction<ConsensusCtx, ControlSignal> for EchoToSource {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.echo_to_source = true;
         Status::Running

@@ -10,7 +10,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, EbSizePolicy};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Installs the linear `eb_size` rewrite policy.
@@ -42,7 +42,7 @@ impl LieAboutEbSize {
     }
 }
 
-impl LeafAction for LieAboutEbSize {
+impl LeafAction<ConsensusCtx, ControlSignal> for LieAboutEbSize {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.offer_eb_size = self.policy();
         Status::Running

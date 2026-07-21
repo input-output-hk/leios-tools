@@ -7,7 +7,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, TxFilterPolicy};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Installs the checksum-threshold tx filter.
@@ -28,7 +28,7 @@ impl T22 {
     }
 }
 
-impl LeafAction for T22 {
+impl LeafAction<ConsensusCtx, ControlSignal> for T22 {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.mempool.tx_filter = TxFilterPolicy::ChecksumThreshold {
             vote: self.vote_threshold,
