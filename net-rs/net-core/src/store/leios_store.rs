@@ -734,10 +734,13 @@ fn notification_evictable(n: &LeiosNotification, cutoff: u64) -> bool {
             Point::Origin => true,
         },
         LeiosNotification::Votes { retention_slot, .. } => *retention_slot < cutoff,
-        // Age out by the announcing header's own slot; keep if unparseable.
+        // Age out by the announcing header's own slot. An unparseable header
+        // (point() == None) can't be aged by slot, so treat it as evictable —
+        // otherwise a peer could crowd the notifications queue with
+        // syntactically-decodable but unparseable headers that never prune.
         LeiosNotification::BlockAnnouncement { header } => match header.point() {
             Some(Point::Specific { slot, .. }) => slot < cutoff,
-            _ => false,
+            _ => true,
         },
     }
 }

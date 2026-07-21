@@ -6,9 +6,10 @@
 //! [`EbSizePolicy::apply`](crate::behaviour::tree::control::EbSizePolicy::apply)
 //! when it bakes `announced_eb = (hash, size)` into the header. Because the size
 //! lives inside the signed header, this is a production-time lie (unlike the
-//! send-time `lie-about-eb-size` on the offer path). The `size = 0` degenerate
-//! (`scale_num = 0`) is the connection-drop probe. Returns `Running` while
-//! installed.
+//! send-time `lie-about-eb-size` on the offer path). With `offset = 0`,
+//! `scale_num = 0` yields the `size = 0` connection-drop probe (the policy is
+//! linear, so a nonzero `offset` still adds through: size becomes `offset`).
+//! Returns `Running` while installed.
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, EbSizePolicy};

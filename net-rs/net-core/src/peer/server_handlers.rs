@@ -1030,9 +1030,11 @@ async fn next_outbound_notification(
                     );
                 }
                 LnMsg::MsgLeiosBlockAnnouncement { header } => {
+                    // Log the cheap parsed slot, not header.point() — the latter
+                    // recomputes a Blake2b hash of the raw CBOR every send.
                     tracing::info!(
                         peer = peer.0,
-                        point = ?header.point(),
+                        slot = ?header.parsed.as_ref().map(|h| h.slot),
                         ?sources,
                         "leios_notify: serving EB announcement"
                     );
