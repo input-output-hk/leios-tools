@@ -77,6 +77,8 @@ pub enum ActionSpec {
     AnnounceDangling,
     #[serde(rename = "announce-equivocate")]
     AnnounceEquivocate,
+    #[serde(rename = "fake-eb-announce")]
+    FakeAnnounce,
 }
 
 fn default_fake_eb_txs() -> u32 {

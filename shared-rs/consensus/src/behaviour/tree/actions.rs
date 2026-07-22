@@ -96,6 +96,7 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
         )),
         ActionSpec::AnnounceDangling => Box::new(catalogue::AnnounceDangling),
         ActionSpec::AnnounceEquivocate => Box::new(catalogue::AnnounceEquivocate),
+        ActionSpec::FakeAnnounce => Box::new(catalogue::FakeAnnounce),
     }
 }
 

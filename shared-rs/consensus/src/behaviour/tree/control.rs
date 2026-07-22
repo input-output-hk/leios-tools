@@ -103,6 +103,13 @@ pub struct LeiosControl {
     /// `true` = emit a second `MsgLeiosBlockAnnouncement` with a different
     /// `announced_eb` for the same election (OCIN equivocation, ≤ 2 rule).
     pub announce_equivocate: bool,
+    /// `true` = emit a `MsgLeiosBlockAnnouncement` for a fabricated EB **without
+    /// winning the slot** — the node holds no stake and never produced the RB,
+    /// yet announces anyway (decoupled from the production lottery). Real nodes
+    /// reject the header at the VRF/KES check (only the elected leader can sign
+    /// a valid RB header); net-rs's fake validation may accept it. The sharpest
+    /// probe of the authorization gate.
+    pub fake_announce: bool,
 }
 
 /// Mempool-domain actuator inputs.
