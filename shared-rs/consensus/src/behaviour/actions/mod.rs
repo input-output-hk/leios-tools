@@ -24,6 +24,7 @@ pub mod lazy_voter;
 pub mod lie_about_eb_size;
 pub mod rb_equivocator;
 pub mod t22;
+pub mod withhold_eb_announce;
 
 pub use announce_dangling::AnnounceDangling;
 pub use announce_equivocate::AnnounceEquivocate;
@@ -38,3 +39,4 @@ pub use lazy_voter::LazyVoter;
 pub use lie_about_eb_size::LieAboutEbSize;
 pub use rb_equivocator::{equivocation_bucket, RbHeaderEquivocator};
 pub use t22::T22;
+pub use withhold_eb_announce::WithholdEbAnnounce;

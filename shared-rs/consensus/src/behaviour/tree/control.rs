@@ -110,6 +110,12 @@ pub struct LeiosControl {
     /// a valid RB header); net-rs's fake validation may accept it. The sharpest
     /// probe of the authorization gate.
     pub fake_announce: bool,
+    /// `true` = **withhold** the EB announcement for EBs this node produces (the
+    /// `withhold-eb-block-announce` action). Normal behaviour (`false`) is to
+    /// announce every produced EB; this suppresses only the announcement — the
+    /// EB body / `MsgLeiosBlockOffer` is unaffected — censoring the fast
+    /// discovery pulse. Default `false` keeps `ControlSignal::default()` honest.
+    pub withhold_announce: bool,
 }
 
 /// Mempool-domain actuator inputs.

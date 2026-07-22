@@ -79,6 +79,8 @@ pub enum ActionSpec {
     AnnounceEquivocate,
     #[serde(rename = "fake-eb-announce")]
     FakeAnnounce,
+    #[serde(rename = "withhold-eb-block-announce")]
+    WithholdEbAnnounce,
 }
 
 fn default_fake_eb_txs() -> u32 {
