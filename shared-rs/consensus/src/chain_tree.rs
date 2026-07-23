@@ -251,7 +251,7 @@ impl ChainTree {
         self.nodes.get(hash).and_then(|n| n.prev_hash)
     }
 
-    pub fn is_chain_start(&self, hash: &[u8; 32]) -> bool {
+    pub fn is_chain_origin(&self, hash: &[u8; 32]) -> bool {
         self.nodes.get(hash).is_some_and(
             |n| matches!(n.status, ChainNodeStatus::ChainStart)
         )

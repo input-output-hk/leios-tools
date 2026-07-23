@@ -194,7 +194,7 @@ pub struct CachedBlock {
 #[derive(Debug, Clone)]
 pub enum OriginKind {
     Genesis,
-    ChainStart,
+    ChainOrigin,
 }
 
 /// Result of a hybrid ancestor walk that uses `chain_tree` first and
@@ -924,8 +924,6 @@ impl PraosState {
         parsed_header: Option<ParsedHeaderInfo>,
         parsed_body: ParsedBodyInfo,
     ) -> (Vec<PraosEffect>, Vec<EbKey>) {
-        info!("TipAdvanced: on_block_received: {point}");
-
         let mut fx = Vec::new();
         let hash = match &point {
             Point::Specific { hash, .. } => *hash,
@@ -1725,17 +1723,14 @@ impl PraosState {
         let mut current = start_hash;
         let reached_origin;
         loop {
-            let parent_opt = if self.chain_tree.is_chain_start(&current) {
-                reached_origin = Some(OriginKind::ChainStart);
+            let parent_opt = if self.chain_tree.is_chain_origin(&current) {
+                reached_origin = Some(OriginKind::ChainOrigin);
                 break;
             } else if self.chain_tree.block_number(&current).is_some() {
-                info!("TipAdvance: prev_hash {}", self.chain_tree.prev_hash(&current).map(|x| hex_prefix(&x)).unwrap_or("None".to_string()));
                 self.chain_tree.prev_hash(&current)
             } else if let Some(cached) = self.block_cache.get(&current) {
-                info!("TipAdvance: cached prev_hash {}", cached.prev_hash.map(|x| hex_prefix(&x)).unwrap_or("None".to_string()));
                 cached.prev_hash
             } else {
-                info!("TipAdvance: no prev_hash");
                 reached_origin = None;
                 break;
             };
@@ -1746,8 +1741,9 @@ impl PraosState {
                     break;
                 }
                 Some(parent) => {
-                    if self.chain_tree.is_chain_start(&parent) {
-                        reached_origin = Some(OriginKind::ChainStart);
+                    if self.chain_tree.is_chain_origin(&parent) {
+                        reached_origin = Some(OriginKind::ChainOrigin);
+                        chain.push(parent);
                         break;
                     }
 
@@ -2222,10 +2218,6 @@ impl PraosState {
         replay: Vec<[u8; 32]>,
         fx: &mut Vec<PraosEffect>,
     ) {
-        tracing::info!("TipAdvanced: execute_switch_internal, ancestor {}, replay {}",
-            short_hash(&ancestor), replay.iter().map(|x| short_hash(x)).collect::<Vec<_>>().join(", ")
-        );
-
         let needs_rollback = ancestor != [0u8; 32] || self.adopted_tip_hash.is_some();
         if needs_rollback && self.queued_validator_tip != Some(ancestor) {
             // Capture the rollback depth BEFORE re-anchoring adopted_tip_hash:
@@ -2286,10 +2278,6 @@ impl PraosState {
         prev_hash: Option<[u8; 32]>,
         fx: &mut Vec<PraosEffect>,
     ) {
-        tracing::info!("TipAdvanced: submit_for_validation_internal, point: {point}, prev_hash: {}",
-            prev_hash.map(|x| short_hash(&x)).unwrap_or("None".to_string())
-        );
-
         let new_hash = match &point {
             Point::Specific { hash, .. } => *hash,
             _ => return,
