@@ -151,6 +151,8 @@ mod tests {
             tx_id: TxId::new_with_slice(&[id; 32]),
             body: TxBody::new_with_vec(vec![0u8; size as usize]),
             size,
+            ours: false,
+            gen_slot: 0,
         }
     }
 

@@ -650,7 +650,7 @@ impl NodeImpl for SharedConsensus {
         // txs only, in `handle_message::Tx`.
         let fx =
             self.mempool
-                .admit_validated(id, TxBody::new_with_vec(Vec::new()), tx.bytes as u32);
+                .admit_validated(id, TxBody::new_with_vec(Vec::new()), tx.bytes as u32, self.current_slot, true);
         self.apply_mempool_effects(&mut out, fx);
         // Announce to every consumer. linear_leios announces only to
         // consumers (downstream peers); we mirror that here.
@@ -747,6 +747,8 @@ impl NodeImpl for SharedConsensus {
                     key.clone(),
                     TxBody::new_with_vec(vec![]),
                     tx.bytes as u32,
+                    self.current_slot,
+                    false,
                 );
                 let admitted = !fx
                     .iter()

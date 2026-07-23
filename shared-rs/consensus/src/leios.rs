@@ -2428,8 +2428,8 @@ mod tests {
 
         let mut mempool = crate::mempool::MempoolState::new(4096);
         // Local mempool has txs 0 (tx_id(1)) and 2 (tx_id(3)); 1 (tx_id(2)) and 3 (tx_id(4)) are missing.
-        mempool.admit_validated(tx_id(1), TxBody::new_with_vec(vec![0u8; 16]), 16);
-        mempool.admit_validated(tx_id(3), TxBody::new_with_vec(vec![0u8; 16]), 16);
+        mempool.admit_validated(tx_id(1), TxBody::new_with_vec(vec![0u8; 16]), 16, false);
+        mempool.admit_validated(tx_id(3), TxBody::new_with_vec(vec![0u8; 16]), 16, false);
 
         let bitmap = state.missing_eb_tx_bitmap(&h(0xAB), &mempool);
         let indices: Vec<u32> = crate::bitmap::iter_indices(&bitmap).collect();
@@ -2443,8 +2443,8 @@ mod tests {
         state.eb_tx_hashes.insert(h(0xCD), (50, manifest));
 
         let mut mempool = crate::mempool::MempoolState::new(4096);
-        mempool.admit_validated(tx_id(5), TxBody::new_with_vec(vec![0u8; 8]), 8);
-        mempool.admit_validated(tx_id(6), TxBody::new_with_vec(vec![0u8; 8]), 8);
+        mempool.admit_validated(tx_id(5), TxBody::new_with_vec(vec![0u8; 8]), 8, false);
+        mempool.admit_validated(tx_id(6), TxBody::new_with_vec(vec![0u8; 8]), 8, false);
 
         let bitmap = state.missing_eb_tx_bitmap(&h(0xCD), &mempool);
         assert!(bitmap.is_empty());
