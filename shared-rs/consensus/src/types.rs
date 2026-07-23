@@ -196,11 +196,10 @@ pub fn short_hash(h: &[u8; 32]) -> String {
     format!("{:02x}{:02x}", h[30], h[31])
 }
 
-/// Decode a hex string into a 32-byte hash.
+/// Decode a hex string into a fixed-size byte array.
 ///
-/// The inverse of the hex encoding used by [`hex_prefix`]: expects exactly
-/// 64 ASCII hex digits (a 32-byte hash). Returns `None` if the input has the
-/// wrong length or contains a non-hex character.
+/// Expects exactly `LEN * 2` ASCII hex digits (two per byte). Returns `Err`
+/// if the input has the wrong length or contains a non-hex character.
 pub fn hash_from_hex<const LEN: usize>(s: &str) -> Result<[u8; LEN], String> {
     if s.len() != LEN*2 {
         return Err(format!("expected hex string of length {}, got {}", LEN*2, s.len()));
