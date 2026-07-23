@@ -226,27 +226,32 @@ async fn do_initial_intersection(
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
 ) -> Result<(), String> {
     let initial_chain = chain_store.intersection_candidates(32);
-    if initial_chain.iter().any(|x| *x != Point::Origin) {
-        return Err(format!("chain_store: intersection candidates are not trivial: {:?}", initial_chain));
+
+    if initial_chain.iter().all(|x| *x == Point::Origin) {
+        tracing::info!("Initial sync, peer {peer_id}, method: {}", sync_method);
+        let sync_candidates = match sync_method {
+            SyncMethodConfig::None => vec![Point::Origin], // TODO: special processing for None
+            SyncMethodConfig::Genesis => vec![Point::Origin],
+            SyncMethodConfig::Tip { .. } => {
+                match chainsync::find_intersection(runner, vec![Point::Origin]).await {
+                    Ok(Some((point, tip))) => {
+                        tracing::info!("Making initial intersection (Tip). Chain point: {point}, tip: {tip}");
+                        vec![tip.point, point, Point::Origin]
+                    },
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(format!("chainsync initial intersection: {e}")),
+                }
+            }, // TODO: delay parameter implementation
+            SyncMethodConfig::Point(point) => vec![point.clone(), Point::Origin],
+        };
+        do_intersection_with_candidates(runner, sync_candidates, peer_id, event_sender, true).await
     }
-
-    let sync_candidates = match sync_method {
-        SyncMethodConfig::None => vec![Point::Origin],
-        SyncMethodConfig::Genesis => vec![Point::Origin],
-        SyncMethodConfig::Tip { .. } => {
-            match chainsync::find_intersection(runner, vec![Point::Origin]).await {
-                Ok(Some((point, tip))) => {
-                    tracing::info!("Making initial intersection (Tip). Chain point: {point}, tip: {tip}");
-                    vec![tip.point, point, Point::Origin]
-                },
-                Ok(None) => return Ok(()),
-                Err(e) => return Err(format!("chainsync initial intersection: {e}")),
-            }
-        }, // TODO: delay parameter implementation
-        SyncMethodConfig::Point(point) => vec![point.clone(), Point::Origin],
-    };
-
-    do_intersection_with_candidates(runner, sync_candidates, peer_id, event_sender, true).await
+    else {
+        tracing::info!("Initial sync, restarting (initial chain len = {}), sync method ignored",
+            initial_chain.len()
+        );
+        do_intersection_with_candidates(runner, initial_chain, peer_id, event_sender, false).await
+    }
 }
 
 /// Spawn the ChainSync sub-task. Runs find_intersection then request_next loop.
