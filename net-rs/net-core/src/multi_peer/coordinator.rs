@@ -579,7 +579,7 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
-            PeerEvent::IntersectionFound { point } => {
+            PeerEvent::IntersectionFound { point, initial } => {
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
                     Some(peer.fragment.len())
@@ -591,7 +591,7 @@ impl Coordinator {
                 }
                 // Forward to consensus so it can store the intersection as
                 // the peer chain's anchor (guaranteed common ancestor).
-                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point });
+                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point, initial });
             }
 
             PeerEvent::HeaderAnnounced { header, tip } => {

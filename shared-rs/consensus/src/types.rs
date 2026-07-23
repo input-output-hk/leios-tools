@@ -185,7 +185,7 @@ pub struct Vote {
 }
 
 /// Hex-encode the first 8 bytes of a hash for display.
-pub fn hex_prefix(hash: &[u8; 32]) -> String {
+pub fn hex_prefix(hash: &[u8]) -> String {
     hash.iter()
         .take(8)
         .map(|b| format!("{b:02x}"))

@@ -188,11 +188,12 @@ async fn do_intersection_with_candidates(
     candidates: Vec<Point>,
     peer_id: PeerId,
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
+    initial: bool,
 ) -> Result<(), String> {
     match chainsync::find_intersection(runner, candidates).await {
         Ok(Some((point, _tip))) => {
             let _ = event_sender
-                .send((peer_id, PeerEvent::IntersectionFound { point }))
+                .send((peer_id, PeerEvent::IntersectionFound { point, initial }))
                 .await;
             Ok(())
         }
@@ -208,7 +209,7 @@ async fn do_intersection(
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
 ) -> Result<(), String> {
     let candidates = chain_store.intersection_candidates(32);
-    do_intersection_with_candidates(runner, candidates, peer_id, event_sender).await
+    do_intersection_with_candidates(runner, candidates, peer_id, event_sender, false).await
 }
 
 /// Performs initial intersection search, depending on the sync_method.
@@ -233,10 +234,9 @@ async fn do_initial_intersection(
         SyncMethodConfig::None => vec![Point::Origin],
         SyncMethodConfig::Genesis => vec![Point::Origin],
         SyncMethodConfig::Tip { .. } => {
-            tracing::info!("Making initial intersection for sync method tip.");
             match chainsync::find_intersection(runner, vec![Point::Origin]).await {
                 Ok(Some((point, tip))) => {
-                    tracing::info!("Making initial intersection for sync method tip. Chain point: {point:?}, tip: {tip:?}");
+                    tracing::info!("Making initial intersection (Tip). Chain point: {point}, tip: {tip}");
                     vec![tip.point, point, Point::Origin]
                 },
                 Ok(None) => return Ok(()),
@@ -246,7 +246,7 @@ async fn do_initial_intersection(
         SyncMethodConfig::Point(point) => vec![point.clone(), Point::Origin],
     };
 
-    do_intersection_with_candidates(runner, sync_candidates, peer_id, event_sender).await
+    do_intersection_with_candidates(runner, sync_candidates, peer_id, event_sender, true).await
 }
 
 /// Spawn the ChainSync sub-task. Runs find_intersection then request_next loop.
@@ -262,7 +262,6 @@ pub(crate) fn spawn_chainsync(
     event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
     mut reintersect_rx: mpsc::Receiver<()>,
 ) -> JoinHandle<()> {
-    tracing::info!("Spawn chainsync: sync method {sync_method:?}");
     tokio::spawn(async move {
         let mut runner = Runner::<ChainSync>::new(Role::Client, cs_send, cs_recv);
 
@@ -292,7 +291,9 @@ pub(crate) fn spawn_chainsync(
                     return;
                 }
             }
-            match chainsync::request_next(&mut runner).await {
+
+            let event = chainsync::request_next(&mut runner).await;
+            match event {
                 Ok(ChainSyncEvent::RollForward { header, tip }) => {
                     let _ = event_sender
                         .send((peer_id, PeerEvent::HeaderAnnounced { header, tip }))
@@ -368,6 +369,8 @@ pub(crate) fn spawn_blockfetch(
         let mut runner = Runner::<BlockFetch>::new(Role::Client, bf_send, bf_recv);
 
         while let Some((from, to)) = fetch_receiver.recv().await {
+            tracing::info!("Fetching blocks {} to {}...", from, to);
+
             match blockfetch::request_range(&mut runner, from.clone(), to.clone()).await {
                 Ok(true) => {
                     // Stream blocks until batch done.
