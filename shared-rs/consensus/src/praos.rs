@@ -1914,7 +1914,11 @@ impl PraosState {
                         tip_block_no: candidate_tip.block_no,
                     };
                 }
-                let reaches_ancestor = walk_result.reached_origin.is_some() || walk.contains(&ancestor);
+                let reaches_ancestor = if ancestor == [0u8; 32] {
+                    walk_result.reached_origin.is_some()
+                } else {
+                    walk.contains(&ancestor)
+                };
                 if !reaches_ancestor {
                     info!(
                         node_id = %self.node_id,
