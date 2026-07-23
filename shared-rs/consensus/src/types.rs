@@ -271,10 +271,10 @@ mod tests {
     #[test]
     fn hash_from_hex_rejects_malformed() {
         // Wrong length.
-        assert_eq!(hash_from_hex("deadbeef").is_err(), true);
-        assert_eq!(hash_from_hex(&"a".repeat(63)).is_err(), true);
+        assert_eq!(hash_from_hex::<32>("deadbeef").is_err(), true);
+        assert_eq!(hash_from_hex::<32>(&"a".repeat(63)).is_err(), true);
         // Correct length but a non-hex character.
         let bad = format!("{}z", "a".repeat(63));
-        assert_eq!(hash_from_hex(&bad).is_err(), true);
+        assert_eq!(hash_from_hex::<32>(&bad).is_err(), true);
     }
 }

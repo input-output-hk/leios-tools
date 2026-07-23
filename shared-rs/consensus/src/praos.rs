@@ -2591,7 +2591,7 @@ mod tests {
     fn record_peer_intersection_sets_anchor() {
         let mut s = fresh();
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(50, 1));
+        s.record_peer_intersection(pid, pt(50, 1), false);
         let chain = s.peer_chains.get(&pid).expect("peer chain present");
         assert!(chain.anchor().is_some());
     }
@@ -3658,7 +3658,7 @@ mod tests {
 
         let walk = s.walk_ancestors_hybrid(h(3));
         assert_eq!(walk.chain, vec![h(3), h(2), h(1)]);
-        assert!(walk.reached_origin);
+        assert!(walk.reached_origin.is_some());
     }
 
     #[test]
@@ -3680,7 +3680,7 @@ mod tests {
         );
         let walk = s.walk_ancestors_hybrid(h(2));
         assert_eq!(walk.chain, vec![h(2), h(1)]);
-        assert!(walk.reached_origin);
+        assert!(walk.reached_origin.is_some());
     }
 
     #[test]
@@ -3688,7 +3688,7 @@ mod tests {
         let s = fresh();
         let walk = s.walk_ancestors_hybrid(h(99));
         assert_eq!(walk.chain, vec![h(99)]);
-        assert!(!walk.reached_origin);
+        assert!(walk.reached_origin.is_none());
     }
 
     // -- Periodic + retry paths ------------------------------------------
@@ -3784,7 +3784,7 @@ mod tests {
         install_validated_block(&mut s, 105, 5, 5, Some(4));
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(105, 5)); // anchor = block 5
+        s.record_peer_intersection(pid, pt(105, 5), false); // anchor = block 5
                                                      // Peer fragment: divergent blocks 11, 12 (prev not in our ancestry).
         s.record_peer_tip(pid, pt(111, 11), 11, 11, h(11), 111, Some(h(99)));
         s.record_peer_tip(pid, pt(112, 12), 12, 12, h(12), 112, Some(h(11)));
@@ -3816,7 +3816,7 @@ mod tests {
         install_validated_block(&mut s, 150, 50, 50, Some(49)); // depth 150 > k
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(150, 50));
+        s.record_peer_intersection(pid, pt(150, 50), false);
         s.record_peer_tip(pid, pt(301, 201), 201, 201, h(201), 301, Some(h(99)));
 
         assert!(
