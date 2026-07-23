@@ -40,6 +40,11 @@ pub struct PraosControl {
     pub drop_inbound: bool,
     /// Override the producer's body-path choice, if `Some`.
     pub body_path: Option<BodyPath>,
+    /// Suppress the certificate on any CertRB this node would produce this slot
+    /// (the `cert-suppressor` action): the adversary omits the cert for its
+    /// parent RB's announced EB, killing that EB's certification (strict
+    /// parent-only cert rule) without touching quorum.
+    pub suppress_cert: bool,
 }
 
 /// Leios-domain actuator inputs.
@@ -140,6 +145,7 @@ mod tests {
         assert_eq!(d.praos.reorg_depth, None);
         assert!(!d.praos.drop_inbound);
         assert_eq!(d.praos.body_path, None);
+        assert!(!d.praos.suppress_cert);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
         assert!(!d.leios.echo_to_source);

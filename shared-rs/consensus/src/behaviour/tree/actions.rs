@@ -84,6 +84,7 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
             *scale_num, *scale_den, *offset,
         )),
         ActionSpec::EchoToSource => Box::new(catalogue::EchoToSource),
+        ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
     }
 }
 

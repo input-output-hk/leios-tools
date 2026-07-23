@@ -48,8 +48,14 @@ pub enum SlotEffect {
         eb_hash: [u8; 32],
         eb_slot: u64,
         had_quorum: bool,
+        /// Final accumulated voted weight for this election (sum of
+        /// `voter_weights`), captured at prune time — the true end-of-round
+        /// tally, including elections that never reached quorum.
         voted_weight: u64,
         voters: usize,
+        /// Quorum denominator (`expected_total_weight`) — lets a consumer
+        /// compute the true quorum margin `voted_weight / expected_weight`.
+        expected_weight: u64,
     },
 }
 
@@ -414,8 +420,35 @@ impl Elections {
     /// under the strict parent-only cert rule, an EB whose announcing
     /// RB is no longer the chain tip is permanently dead, and its
     /// election state is dead weight.
-    pub fn prune_below_slot(&mut self, min_slot: u64) {
-        self.elections.retain(|_, e| e.announced_slot >= min_slot);
+    ///
+    /// Returns a `SlotEffect::Expired` for each dropped election carrying
+    /// its FINAL voting tally (accumulated `voted_weight`, `voters`,
+    /// `had_quorum`) plus the `expected_weight` denominator — the only
+    /// end-of-round signal for the quorum-margin sensor (an election's
+    /// weight at quorum-formation is always ~τ, so a mid-round reading is
+    /// uninformative). Includes elections that never reached quorum.
+    /// Deterministic order: BTreeMap iterates by hash.
+    pub fn prune_below_slot(&mut self, min_slot: u64) -> Vec<SlotEffect> {
+        let expected_weight = self.cfg.expected_total_weight;
+        let mut expired = Vec::new();
+        self.elections.retain(|_rb_hash, e| {
+            if e.announced_slot < min_slot {
+                expired.push(SlotEffect::Expired {
+                    // The map is keyed by the announcing-RB hash, so emit the
+                    // election's real EB hash here (not the key).
+                    eb_hash: e.eb_hash,
+                    eb_slot: e.announced_slot,
+                    had_quorum: e.quorum_reached,
+                    voted_weight: e.voter_weights.values().sum(),
+                    voters: e.voter_weights.len(),
+                    expected_weight,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        expired
     }
 
     /// Slot of the election keyed by `rb_hash` if it is both at quorum
@@ -552,11 +585,50 @@ mod tests {
         e.announce_from_rb(h(2), 15, h(2));
         e.announce_from_rb(h(3), 20, h(3));
         assert_eq!(e.count(), 3);
-        e.prune_below_slot(15);
+        let expired = e.prune_below_slot(15);
         assert_eq!(e.count(), 2);
         assert!(e.phase(&h(1)).is_none());
         assert!(e.phase(&h(2)).is_some());
         assert!(e.phase(&h(3)).is_some());
+        // The pruned election emits an Expired carrying its final tally.
+        assert_eq!(expired.len(), 1);
+        assert!(matches!(
+            expired[0],
+            SlotEffect::Expired { eb_slot: 10, expected_weight: 100, .. }
+        ));
+    }
+
+    #[test]
+    fn prune_emits_final_voting_tally() {
+        // An election that accrued 40 weight (below the 75 quorum) is pruned:
+        // the Expired reports the FINAL accumulated weight + no quorum — the
+        // signal the quorum-margin sensor needs (voted 40 / expected 100).
+        let mut e = test_elections();
+        e.on_slot(10);
+        // Distinct RB (election key) and EB hashes so the assertions below catch
+        // any regression that emits the RB hash in the Expired `eb_hash` field.
+        e.announce_from_rb(h(1), 10, h(2));
+        e.record_vote(&h(1), b"voter-a".to_vec(), 40);
+        let expired = e.prune_below_slot(20);
+        assert_eq!(expired.len(), 1);
+        match &expired[0] {
+            SlotEffect::Expired {
+                eb_hash,
+                eb_slot,
+                had_quorum,
+                voted_weight,
+                voters,
+                expected_weight,
+            } => {
+                assert_eq!(*eb_hash, h(2)); // the EB hash, not the RB key h(1)
+                assert_eq!(*eb_slot, 10);
+                assert!(!*had_quorum);
+                assert_eq!(*voted_weight, 40);
+                assert_eq!(*voters, 1);
+                assert_eq!(*expected_weight, 100);
+            }
+            _ => panic!("expected Expired"),
+        }
     }
 
     #[test]
