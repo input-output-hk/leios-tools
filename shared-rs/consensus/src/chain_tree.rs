@@ -80,7 +80,7 @@ enum ChainNodeStatus {
     Normal,
 
     /// Starts a chain: we know that there are nodes before this one, but they're
-    /// unaccessible for us and it's not a problem.
+    /// inaccessible for us and it's not a problem.
     ChainStart,
 }
 
