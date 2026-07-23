@@ -2888,6 +2888,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: point_100.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -2898,6 +2899,7 @@ mod tests {
                 peer_b,
                 PeerEvent::IntersectionFound {
                     point: point_101.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -2937,6 +2939,7 @@ mod tests {
                     id,
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
+                        initial: false,
                     },
                 )
                 .await;
@@ -2999,6 +3002,7 @@ mod tests {
                     id,
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
+                        initial: false,
                     },
                 )
                 .await;
@@ -3067,6 +3071,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: p100.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -3228,6 +3233,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: point.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -3289,6 +3295,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: intersection.clone(),
+                    initial: false,
                 },
             )
             .await;
