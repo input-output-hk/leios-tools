@@ -201,8 +201,8 @@ pub struct HybridWalk {
 
     /// Non-none value, if the walk terminated at chain origin:
     /// * Genesis for Point::Origin
-    /// * HistoryStart for arbitrary block, specified in sync-method field (artificial
-    ///   history start, which prohibits to go backward behind that block for performance
+    /// * ChainStart for an arbitrary block specified by the sync method (an artificial
+    ///   history start that intentionally prevents backtracking earlier for performance
     ///   optimization purposes).
     pub reached_origin: Option<OriginKind>,
 }
