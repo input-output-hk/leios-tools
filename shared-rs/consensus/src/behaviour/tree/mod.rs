@@ -24,7 +24,7 @@ pub mod env;
 pub mod variants;
 
 pub use behaviour::{Behaviour, BehaviourId, BehaviourKind, BehaviourTree};
-pub use condition::{CompareOp, Condition, ConditionExpr, ValueRef};
+pub use condition::{CompareOp, Condition, ConditionExpr, ValueRef, ValueResolver};
 pub use config::{BtConfig, ConfigError, ModuleMeta, Run};
 pub use control::{
     ControlSignal, EbSizePolicy, LeiosControl, MempoolControl, OutboundControl, PraosControl,
