@@ -12,6 +12,31 @@ sim-rs replays runs from a seed, so a behaviour that needs randomness
 takes a `u64` at construction and seeds its own RNG, never reading the
 clock or the OS entropy pool.
 
+## Tree engine: generic over context + effect
+
+The behaviour-**tree** engine in `tree/` is generic over two parameters:
+
+- **`C` — context**: what `Condition`s read each tick.
+- **`E` — effect**: what `LeafAction`s write each tick.
+
+Consensus is one instantiation and the *default*, so `Behaviour`,
+`BehaviourKind`, and `BehaviourTree` stay bare names — no call-site churn
+for existing consumers (net-node, sim-rs):
+
+| Parameter | Consensus instantiation |
+|---|---|
+| `C` | `ConsensusCtx` (a marker whose `View<'a>` = `TickCtx<'a>`) |
+| `E` | `ControlSignal` |
+
+Seams introduced: `LeafAction<C, E>`, `Condition<C>`, `TreeContext` (a
+GAT — `type View<'a>` — because the per-tick context borrows), and
+`ParamOverrides` (live leaf-param overrides, off the context). A second
+instantiation can reuse the whole engine and TOML grammar with its own
+`C`/`E` and its own leaves/conditions, without touching the consensus one.
+
+Not yet generic: the `config.rs` TOML compiler still builds only the
+consensus instantiation.
+
 ## Hook taxonomy
 
 There are four kinds of hook on the [`Behaviour`] trait. Adding a new

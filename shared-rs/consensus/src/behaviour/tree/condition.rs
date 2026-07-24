@@ -3,16 +3,19 @@
 //! Grammar (see `contracts/bt-config.schema.md`):
 //!
 //! ```text
-//! expr     := or
-//! or       := and ("or" and)*
-//! and      := unary ("and" unary)*
-//! unary    := "not" unary | primary
-//! primary  := compare | contains | "(" expr ")"
-//! compare  := value (">="|">"|"<="|"<"|"=="|"!=") value
-//! contains := value ".contains(" value ")"
-//! value    := envref | chainref | int | string
-//! envref   := "env." DOTTED_IDENT
-//! chainref := "cardano." IDENT
+//! expr      := or
+//! or        := and ("or" and)*
+//! and       := unary ("and" unary)*
+//! unary     := "not" unary | primary
+//! primary   := compare | contains | "(" expr ")"
+//! compare   := value (">="|">"|"<="|"<"|"=="|"!=") value
+//! contains  := value ".contains(" value ")"
+//! value     := envref | chainref | sensorref | identref | number | string
+//! envref    := "env." DOTTED_IDENT
+//! chainref  := "cardano." IDENT
+//! sensorref := "sensor." DOTTED_IDENT
+//! identref  := IDENT                      (bare, e.g. `slot`, `elapsed_ticks`)
+//! number    := DIGITS ("." DIGITS)?       (float when a fraction is present)
 //! ```
 //!
 //! Conditions are parsed and type-validated at load time; a referenced-but-
@@ -20,6 +23,14 @@
 //! load-time error. Membership (`.contains`) is string containment over the
 //! string-typed values (collection chain fields arrive when a condition needs
 //! them).
+//!
+//! The value refs a condition resolves are context-dependent: the consensus
+//! instantiation resolves `env.*`/`cardano.*` (and returns `None` for the
+//! others); a second instantiation binds its own [`ValueResolver`] over the
+//! same parsed grammar to resolve `sensor.*` and bare progress idents. This is
+//! what lets a domain reuse the parser and boolean structure unchanged (FR-001)
+//! while reading its own signals — see [`ValueResolver`] and
+//! [`ConditionExpr::eval_with`].
 
 use std::collections::BTreeMap;
 
@@ -72,15 +83,63 @@ pub enum CompareOp {
     Ne,
 }
 
-/// A leaf value reference in a condition.
+/// A leaf value reference in a condition. Literals resolve context-free; the
+/// reference variants (`Env`/`Chain`/`Sensor`/`Ident`) are resolved through the
+/// per-tick context's [`ValueResolver`], so which of them are meaningful is
+/// decided by the tree instantiation, not the grammar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueRef {
     /// `env.<dotted>` — resolved against the merged env.
     Env(String),
     /// `cardano.<name>` — a [`NativeChainState`] field.
     Chain(String),
+    /// `sensor.<dotted>` — a named reading resolved by the context (e.g. a
+    /// cluster health/activity sensor). Not valid in the consensus context.
+    Sensor(String),
+    /// A bare identifier (e.g. `slot`, `elapsed_ticks`) resolved by the
+    /// context. Not valid in the consensus context.
+    Ident(String),
     LitU64(u64),
+    LitF64(f64),
     LitStr(String),
+}
+
+/// Resolves the context-dependent value references a [`ConditionExpr`] names, so
+/// [`ConditionExpr::eval_with`] is agnostic to the concrete per-tick context.
+/// Literals are resolved by the expression itself; the resolver only ever sees
+/// the reference variants ([`ValueRef::Env`]/[`ValueRef::Chain`]/
+/// [`ValueRef::Sensor`]/[`ValueRef::Ident`]). Returning `None` means "not a
+/// reference this context understands, or absent/wrong type" and yields a
+/// non-matching comparison (never a panic).
+pub trait ValueResolver {
+    /// Resolve a reference to a number, or `None`.
+    fn resolve_number(&self, r: &ValueRef) -> Option<f64>;
+    /// Resolve a reference to a string, or `None`.
+    fn resolve_string(&self, r: &ValueRef) -> Option<String>;
+}
+
+/// The consensus resolver: `cardano.*` reads a [`NativeChainState`] field,
+/// `env.*` reads the merged env; every other reference is `None` (the consensus
+/// context has no sensors or bare progress idents).
+impl ValueResolver for TickCtx<'_> {
+    fn resolve_number(&self, r: &ValueRef) -> Option<f64> {
+        match r {
+            ValueRef::Chain(name) => self.state.numeric_field(name).map(|n| n as f64),
+            ValueRef::Env(name) => self.env.get(name).and_then(EnvValue::as_number),
+            _ => None,
+        }
+    }
+
+    fn resolve_string(&self, r: &ValueRef) -> Option<String> {
+        match r {
+            ValueRef::Env(name) => self
+                .env
+                .get(name)
+                .and_then(EnvValue::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
 }
 
 /// The static type-class a value resolves to, used for validation.
@@ -156,36 +215,46 @@ impl ConditionExpr {
         }
     }
 
-    /// Evaluate the predicate in `ctx`. Assumes [`validate`](Self::validate)
-    /// passed at load; a value that fails to resolve at tick time yields
-    /// `false` rather than panicking (no panics in non-test code).
+    /// Evaluate the predicate against a consensus [`TickCtx`]. Thin wrapper over
+    /// [`eval_with`](Self::eval_with) using the context as its own resolver;
+    /// retained so existing call sites read unchanged.
     pub fn eval(&self, ctx: &TickCtx) -> bool {
+        self.eval_with(ctx)
+    }
+
+    /// Evaluate the predicate, resolving references through `r`. Assumes
+    /// [`validate`](Self::validate) (or the instantiation's own load-time check)
+    /// passed; a value that fails to resolve at tick time yields `false` rather
+    /// than panicking (no panics in non-test code). This is the domain-neutral
+    /// evaluator: the boolean/compare structure is fixed, the references are
+    /// whatever `r` chooses to resolve.
+    pub fn eval_with<R: ValueResolver + ?Sized>(&self, r: &R) -> bool {
         match self {
             ConditionExpr::Compare { lhs, op, rhs } => {
-                if let (Some(a), Some(b)) = (value_number(lhs, ctx), value_number(rhs, ctx)) {
+                if let (Some(a), Some(b)) = (value_number(lhs, r), value_number(rhs, r)) {
                     return apply_num(*op, a, b);
                 }
-                if let (Some(a), Some(b)) = (value_string(lhs, ctx), value_string(rhs, ctx)) {
+                if let (Some(a), Some(b)) = (value_string(lhs, r), value_string(rhs, r)) {
                     return apply_ord(*op, a.as_str(), b.as_str());
                 }
                 false
             }
             ConditionExpr::Contains { container, item } => {
-                match (value_string(container, ctx), value_string(item, ctx)) {
+                match (value_string(container, r), value_string(item, r)) {
                     (Some(c), Some(i)) => c.contains(&i),
                     _ => false,
                 }
             }
-            ConditionExpr::And(xs) => xs.iter().all(|x| x.eval(ctx)),
-            ConditionExpr::Or(xs) => xs.iter().any(|x| x.eval(ctx)),
-            ConditionExpr::Not(x) => !x.eval(ctx),
+            ConditionExpr::And(xs) => xs.iter().all(|x| x.eval_with(r)),
+            ConditionExpr::Or(xs) => xs.iter().any(|x| x.eval_with(r)),
+            ConditionExpr::Not(x) => !x.eval_with(r),
         }
     }
 }
 
 fn type_class(v: &ValueRef, env: &BTreeMap<String, EnvValue>) -> Result<TypeClass, String> {
     match v {
-        ValueRef::LitU64(_) => Ok(TypeClass::Numeric),
+        ValueRef::LitU64(_) | ValueRef::LitF64(_) => Ok(TypeClass::Numeric),
         ValueRef::LitStr(_) => Ok(TypeClass::Str),
         ValueRef::Chain(name) => {
             if CHAIN_FIELDS.contains(&name.as_str()) {
@@ -204,6 +273,15 @@ fn type_class(v: &ValueRef, env: &BTreeMap<String, EnvValue>) -> Result<TypeClas
                 ev.type_name()
             )),
         },
+        // `sensor.*` and bare idents are meaningless in the consensus grammar,
+        // so consensus validation rejects them; a second instantiation runs its
+        // own load-time reference check over these variants.
+        ValueRef::Sensor(name) => Err(format!(
+            "sensor reference sensor.{name} is not valid in this condition context"
+        )),
+        ValueRef::Ident(name) => Err(format!(
+            "reference {name} is not valid in this condition context"
+        )),
     }
 }
 
@@ -211,7 +289,10 @@ fn describe(v: &ValueRef) -> String {
     match v {
         ValueRef::Env(n) => format!("env.{n}"),
         ValueRef::Chain(n) => format!("cardano.{n}"),
+        ValueRef::Sensor(n) => format!("sensor.{n}"),
+        ValueRef::Ident(n) => n.clone(),
         ValueRef::LitU64(n) => n.to_string(),
+        ValueRef::LitF64(n) => n.to_string(),
         ValueRef::LitStr(s) => format!("{s:?}"),
     }
 }
@@ -227,24 +308,20 @@ fn op_str(op: CompareOp) -> &'static str {
     }
 }
 
-fn value_number(v: &ValueRef, ctx: &TickCtx) -> Option<f64> {
+fn value_number<R: ValueResolver + ?Sized>(v: &ValueRef, r: &R) -> Option<f64> {
     match v {
         ValueRef::LitU64(n) => Some(*n as f64),
-        ValueRef::Chain(name) => ctx.state.numeric_field(name).map(|n| n as f64),
-        ValueRef::Env(name) => ctx.env.get(name).and_then(EnvValue::as_number),
+        ValueRef::LitF64(f) => Some(*f),
         ValueRef::LitStr(_) => None,
+        other => r.resolve_number(other),
     }
 }
 
-fn value_string(v: &ValueRef, ctx: &TickCtx) -> Option<String> {
+fn value_string<R: ValueResolver + ?Sized>(v: &ValueRef, r: &R) -> Option<String> {
     match v {
         ValueRef::LitStr(s) => Some(s.clone()),
-        ValueRef::Env(name) => ctx
-            .env
-            .get(name)
-            .and_then(EnvValue::as_str)
-            .map(str::to_owned),
-        _ => None,
+        ValueRef::LitU64(_) | ValueRef::LitF64(_) => None,
+        other => r.resolve_string(other),
     }
 }
 
@@ -435,7 +512,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         match self.peek() {
             Some(b'"') => self.string_lit(),
-            Some(c) if c.is_ascii_digit() => self.int_lit(),
+            Some(c) if c.is_ascii_digit() => self.number_lit(),
             Some(_) if self.rest().starts_with("env.") => {
                 self.pos += "env.".len();
                 let name = self.dotted_ident()?;
@@ -445,6 +522,18 @@ impl<'a> Parser<'a> {
                 self.pos += "cardano.".len();
                 let name = self.ident()?;
                 Ok(ValueRef::Chain(name))
+            }
+            Some(_) if self.rest().starts_with("sensor.") => {
+                self.pos += "sensor.".len();
+                let name = self.dotted_ident()?;
+                Ok(ValueRef::Sensor(name))
+            }
+            // A bare identifier is a context-resolved progress ref (e.g. `slot`,
+            // `elapsed_ticks`). The prefixed forms above are matched first, so a
+            // name like `slotwise` that does not carry a `.` still lands here.
+            Some(c) if is_ident_byte(c) => {
+                let name = self.ident()?;
+                Ok(ValueRef::Ident(name))
             }
             _ => Err(format!("expected a value at column {}", self.pos)),
         }
@@ -465,7 +554,10 @@ impl<'a> Parser<'a> {
         Err("unterminated string literal".to_string())
     }
 
-    fn int_lit(&mut self) -> Result<ValueRef, String> {
+    /// A numeric literal: integer, or a float when a `.<digits>` fraction
+    /// follows. A trailing `.` not followed by a digit is left unconsumed (so a
+    /// hypothetical `10.contains(...)` still parses the membership form).
+    fn number_lit(&mut self) -> Result<ValueRef, String> {
         let start = self.pos;
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
@@ -474,10 +566,29 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let mut is_float = false;
+        if self.peek() == Some(b'.') && self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit)
+        {
+            is_float = true;
+            self.pos += 1; // consume '.'
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
         let text = &self.src[start..self.pos];
-        text.parse::<u64>()
-            .map(ValueRef::LitU64)
-            .map_err(|e| format!("invalid integer {text:?}: {e}"))
+        if is_float {
+            text.parse::<f64>()
+                .map(ValueRef::LitF64)
+                .map_err(|e| format!("invalid number {text:?}: {e}"))
+        } else {
+            text.parse::<u64>()
+                .map(ValueRef::LitU64)
+                .map_err(|e| format!("invalid integer {text:?}: {e}"))
+        }
     }
 
     /// Read an identifier (letters, digits, `_`); no dots.
