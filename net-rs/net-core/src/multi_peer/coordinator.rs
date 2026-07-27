@@ -1332,7 +1332,23 @@ impl Coordinator {
                 self.pending_fetches.remove(point);
             }
 
-            self.emit_event(NetworkEvent::PeerDisconnected { peer_id, reason });
+            // Only report a disconnect for a connection that actually
+            // established. A dial that failed before `PeerEvent::Connected`
+            // (e.g. an unreachable discovered peer) never emitted a
+            // `PeerConnected`, so emitting `PeerDisconnected` here would both
+            // misreport a failed dial as a dropped connection and leave the
+            // application's connect/disconnect stream unpaired. Trace at debug
+            // so failed dials stay diagnosable without flooding the event log.
+            if peer.connected_at.is_some() {
+                self.emit_event(NetworkEvent::PeerDisconnected { peer_id, reason });
+            } else {
+                tracing::debug!(
+                    %peer_id,
+                    address = %peer.address,
+                    %reason,
+                    "dial never connected; suppressing PeerDisconnected event"
+                );
+            }
             // Per-peer offer / fetch cleanup lives in shared-consensus's
             // CandidateTracker now; the consensus layer prunes on the
             // PeerDisconnected event.
@@ -2096,7 +2112,7 @@ mod tests {
                 downstream: None,
                 peer_sharing: 1,
                 last_rolled_back_to: None,
-                connected_at: None,
+                connected_at: Some(Instant::now()),
             },
         );
 
@@ -2129,6 +2145,74 @@ mod tests {
         // Should be queued for reconnection.
         assert_eq!(coordinator.reconnect_queue.len(), 1);
         assert_eq!(coordinator.reconnect_queue[0].0, "test:3001");
+    }
+
+    #[tokio::test]
+    async fn no_disconnect_event_for_dial_that_never_connected() {
+        // A peer whose dial fails before `PeerEvent::Connected` (e.g. an
+        // unreachable discovered address) never emitted a `PeerConnected`, so
+        // it must not emit a `PeerDisconnected` either — otherwise a failed
+        // dial is misreported as a dropped connection and the app's
+        // connect/disconnect stream is left unpaired.
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(64);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            None,
+        );
+
+        let peer_id = PeerId(0);
+        let (cmd_sender, _cmd_receiver) = mpsc::channel(16);
+        coordinator.peers.insert(
+            peer_id,
+            PeerState {
+                address: "unreachable:3001".to_string(),
+                mode: ConnectionMode::InitiatorOnly,
+                ip_guard: None,
+                commands: cmd_sender,
+                task_handle: tokio::spawn(async {}),
+                tip: None,
+                rtt: None,
+                fragment: ChainFragment::new(),
+                reconnect_backoff: Duration::from_secs(1),
+                inbound_delay: Duration::ZERO,
+                mux_stats: None,
+                downstream: None,
+                peer_sharing: 1,
+                last_rolled_back_to: None,
+                // Never connected: the dial failed at the connect step.
+                connected_at: None,
+            },
+        );
+
+        // The dial fails before ever connecting.
+        coordinator
+            .handle_peer_event(
+                peer_id,
+                PeerEvent::Failed {
+                    reason: "connect duplex: Network is unreachable".to_string(),
+                },
+            )
+            .await;
+
+        // No event of any kind should be emitted (no PeerDisconnected, and no
+        // orphaned fetches since the peer never fetched anything).
+        assert!(
+            net_event_receiver.try_recv().is_err(),
+            "a dial that never connected must not emit any NetworkEvent"
+        );
+
+        // Cleanup still happens: the peer is removed and re-queued for a retry.
+        assert!(coordinator.peers.is_empty());
+        assert_eq!(coordinator.reconnect_queue.len(), 1);
     }
 
     /// Helper: build a coordinator with one outbound peer whose backoff has
@@ -2563,7 +2647,7 @@ mod tests {
                 downstream: None,
                 peer_sharing: 1,
                 last_rolled_back_to: None,
-                connected_at: None,
+                connected_at: Some(Instant::now()),
             },
         );
 
@@ -3815,7 +3899,7 @@ mod tests {
                 downstream: None,
                 peer_sharing: 1,
                 last_rolled_back_to: None,
-                connected_at: None,
+                connected_at: Some(Instant::now()),
             },
         );
 
