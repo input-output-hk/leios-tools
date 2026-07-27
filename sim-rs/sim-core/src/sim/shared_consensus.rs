@@ -609,10 +609,11 @@ impl NodeImpl for SharedConsensus {
         let tx_arcs = &self.tx_arcs;
         let tx_known = |key: &TxId| {
             if mempool.eb_pinned.contains_key(key) {
-                TxAvailability::PresentPinned
+                // Ours/gen_slot stats are not supported for sim
+                TxAvailability::Present { pinned: true, ours: false, gen_slot: 0 }
             }
             else if mempool.has_tx(key) || tx_arcs.contains_key(key) {
-                TxAvailability::PresentUnpinned
+                TxAvailability::Present { pinned: false, ours: false, gen_slot: 0 }
             }
             else {
                 TxAvailability::Absent

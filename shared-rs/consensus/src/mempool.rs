@@ -984,7 +984,7 @@ mod tests {
 
     fn tx(id: u8, size: u32) -> (TxId, TxBody, u32) {
         (
-            TxId::new_with_slice(&[id; 32]),
+            TxId::new_with_slice( & [id; 32]),
             TxBody::new_with_vec(vec![0u8; size as usize]),
             size,
         )
@@ -1358,7 +1358,7 @@ mod tests {
 
         // EB bodies merged from peers are never ours, stamped with the slot.
         let (eb_id, eb_body, eb_sz) = tx(4, 10);
-        s.merge_eb_body(&eb_id, eb_body, eb_sz, 43);
+        s.merge_eb_body(MempoolTx::new(eb_id.clone(), eb_body, eb_sz, false, 43));
         let eb = s.eb_pinned.get(&eb_id).unwrap();
         assert!(!eb.ours);
         assert_eq!(eb.gen_slot, 43);
@@ -1443,12 +1443,12 @@ mod tests {
         assert_eq!(s.missing_eb_indices(&eb), vec![0, 1]);
 
         // Merge the second body first (out-of-order delivery is fine).
-        s.merge_eb_body(&id_b, TxBody::new_with_vec(vec![0xB0]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(id_b.clone(), TxBody::new_with_vec(vec![0xB0]), 1, false, 0));
         assert_eq!(s.missing_eb_indices(&eb), vec![0]);
         assert!(s.has_tx(&id_b));
 
         // Then the first.
-        s.merge_eb_body(&id_a, TxBody::new_with_vec(vec![0xA0]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(id_a.clone(), TxBody::new_with_vec(vec![0xA0]), 1, false, 0));
         assert!(s.missing_eb_indices(&eb).is_empty());
     }
 
@@ -1461,8 +1461,8 @@ mod tests {
         let eb = eb_key(30, 0x33);
         s.record_eb_manifest(eb, ids.clone());
         // Only bodies for indices 1 and 3 are locally available.
-        s.merge_eb_body(&ids[1], TxBody::new_with_vec(vec![0x11]), 1, 0);
-        s.merge_eb_body(&ids[3], TxBody::new_with_vec(vec![0x33]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(ids[1].clone(), TxBody::new_with_vec(vec![0x11]), 1, false, 0));
+        s.merge_eb_body(MempoolTx::new(ids[3].clone(), TxBody::new_with_vec(vec![0x33]), 1, false, 0));
 
         // Server gets a bitmap request for [0, 1, 2, 3, 4]; returns only the
         // bodies it has, in ascending index order.
@@ -1488,9 +1488,9 @@ mod tests {
         let mut s = MempoolState::new(10);
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(40, 0x40), vec![id.clone()]);
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1, false, 0));
         // Second call with a different (faked) body must not overwrite.
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xFF]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(id.clone(), TxBody::new_with_vec(vec![0xFF]), 1, false, 0));
         assert_eq!(
             s.get_body_by_id(&id),
             Some(TxBody::new_with_vec(vec![0xCC]))
@@ -1504,7 +1504,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         let (id, body, sz) = tx(1, 100);
         s.admit_validated(id.clone(), body.clone(), sz, 0, false);
-        s.merge_eb_body(&id, body, sz, 0);
+        s.merge_eb_body(MempoolTx::new(id, body, sz, false, 0));
         assert_eq!(s.eb_pinned.len(), 0);
     }
 
@@ -1516,7 +1516,7 @@ mod tests {
         let evicted_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let evictions_initial = s.record_eb_manifest(old_eb, vec![evicted_id.clone()]);
         assert!(evictions_initial.is_empty(), "no evictions on first record");
-        s.merge_eb_body(&evicted_id, TxBody::new_with_vec(vec![0xAA]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(evicted_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1, false, 0));
         assert!(s.has_tx(&evicted_id));
         assert!(s.get_eb_manifest(&old_eb).is_some());
 
@@ -1546,7 +1546,7 @@ mod tests {
         // Old EB with a pinned body.
         let old_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let _ = s.record_eb_manifest(eb_key(1, 0x01), vec![old_id.clone()]);
-        s.merge_eb_body(&old_id, TxBody::new_with_vec(vec![0xAA]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(old_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1, false, 0));
 
         // Produce a new EB far past the retention window — the
         // producer-side path also evicts the aged closure.
@@ -1570,7 +1570,7 @@ mod tests {
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(1, 0x01), vec![id.clone()]);
         s.record_eb_manifest(eb_key(95, 0x02), vec![id.clone()]);
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1, 0);
+        s.merge_eb_body(MempoolTx::new(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1, false, 0));
         // Bump max so the slot=1 EB falls out of the window but slot=95 stays.
         s.record_eb_manifest(eb_key(99, 0x03), vec![]);
         assert!(s.get_eb_manifest(&eb_key(1, 0x01)).is_none());
