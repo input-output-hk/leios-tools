@@ -662,9 +662,13 @@ mod tests {
             .and_then(|e| e.null())
             .expect("encoding test tx into a Vec is infallible");
         PendingTx {
-            tx_id: TxId::new_with_array([id_byte; 32]),
-            body: TxBody::new_with_vec(e.into_writer()),
-            size: size as u32,
+            tx: MempoolTx::new(
+                TxId::new_with_array([id_byte; 32]),
+                TxBody::new_with_vec(e.into_writer()),
+                size as u32,
+                false,
+                0,
+            ),
             era: ORIGIN_ERA,
         }
     }
@@ -682,9 +686,13 @@ mod tests {
         e.null().unwrap(); // aux data
         let tx = e.into_writer();
         let pending = PendingTx {
-            tx_id: TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
-            body: TxBody::new_with_slice(&tx),
-            size: tx.len() as u32,
+            tx: MempoolTx::new(
+                TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
+                TxBody::new_with_slice(&tx),
+                tx.len() as u32,
+                false,
+                0,
+            ),
             era: ORIGIN_ERA,
         };
         let announced = praos_tx_id(&pending).expect("parseable tx has a canonical id");
@@ -694,12 +702,12 @@ mod tests {
             "announced id must be the canonical body-element TxId"
         );
         assert_ne!(
-            announced, pending.tx_id,
+            announced, pending.tx.tx_id,
             "must not be the internal TxHash key"
         );
         assert_ne!(
             announced,
-            TxId::new_with_array(pending.body.get_blake2b_256()),
+            TxId::new_with_array(pending.tx.body.get_blake2b_256()),
             "must not be the whole-tx hash"
         );
     }
@@ -738,7 +746,7 @@ mod tests {
             1,
             "acked-but-unrequested bodies must be pruned, not stranded"
         );
-        assert_eq!(pending.front().unwrap().tx_id, make_test_tx(3, 64).tx_id);
+        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(3, 64).tx.tx_id);
     }
 
     #[test]
@@ -757,7 +765,7 @@ mod tests {
         ack_and_prune(&mut announced, &mut pending, 1);
         assert_eq!(announced.len(), 1);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending.front().unwrap().tx_id, make_test_tx(2, 64).tx_id);
+        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(2, 64).tx.tx_id);
     }
 
     #[tokio::test]
@@ -766,8 +774,8 @@ mod tests {
 
         let tx1 = make_test_tx(0x01, 1500);
         let tx2 = make_test_tx(0x02, 2000);
-        let tx1_id = tx1.tx_id.clone();
-        let tx2_id = tx2.tx_id.clone();
+        let tx1_id = tx1.tx.tx_id.clone();
+        let tx2_id = tx2.tx.tx_id.clone();
 
         // Server: drive the protocol by requesting tx ids, then txs.
         let server = tokio::spawn(async move {
@@ -834,18 +842,14 @@ mod tests {
             // Pre-load txs.
             tx_sender
                 .send(PendingTx {
-                    tx_id: tx1_id,
-                    body: tx1.body.clone(),
-                    size: 1500,
+                    tx: MempoolTx::new(tx1_id, tx1.tx.body.clone(), 1500, false, 0),
                     era: ORIGIN_ERA,
                 })
                 .await
                 .unwrap();
             tx_sender
                 .send(PendingTx {
-                    tx_id: tx2_id,
-                    body: tx2.body.clone(),
-                    size: 2000,
+                    tx: MempoolTx::new(tx2_id, tx2.tx.body.clone(), 2000, false, 0),
                     era: ORIGIN_ERA,
                 })
                 .await
@@ -853,7 +857,7 @@ mod tests {
             // Close channel so client knows no more txs.
             drop(tx_sender);
 
-            run_client(&mut runner, &mut tx_receiver, None)
+            run_client(&mut runner, &mut tx_receiver, None, PeerId(0))
                 .await
                 .unwrap();
         });
@@ -904,7 +908,7 @@ mod tests {
             // Drop sender immediately — no txs to send.
             drop(_tx_sender);
 
-            run_client(&mut runner, &mut tx_receiver, None)
+            run_client(&mut runner, &mut tx_receiver, None, PeerId(0))
                 .await
                 .unwrap();
         });
