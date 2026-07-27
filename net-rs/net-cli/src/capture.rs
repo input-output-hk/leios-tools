@@ -23,6 +23,7 @@ pub async fn run(host: &str, magic: u64) -> Result<(), Box<dyn std::error::Error
         initiator_only_diffusion_mode: true,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     });
     let msg = net_core::protocols::handshake::Message::ProposeVersions(versions);
     let cbor_payload = minicbor::to_vec(&msg).unwrap();

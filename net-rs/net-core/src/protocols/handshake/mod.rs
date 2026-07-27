@@ -251,6 +251,7 @@ mod tests {
                 initiator_only_diffusion_mode: true,
                 peer_sharing: 1,
                 query: false,
+                v16_flag: None,
             });
             run_client(cs, cr, versions).await
         });
@@ -261,6 +262,7 @@ mod tests {
                 initiator_only_diffusion_mode: false,
                 peer_sharing: 1,
                 query: false,
+                v16_flag: None,
             };
             run_server(ss, sr, |client_versions| {
                 n2n::negotiate(client_versions, &server_data)
@@ -277,15 +279,16 @@ mod tests {
                 version_number,
                 params,
             } => {
-                assert_eq!(version_number, n2n::VERSION_V15);
+                assert_eq!(version_number, n2n::VERSION_V16);
                 let data = n2n::VersionData::decode(&params).unwrap();
                 assert_eq!(data.network_magic, magic);
+                assert_eq!(data.v16_flag, Some(false));
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
 
         // Server should have returned the negotiated version.
-        assert_eq!(server_result.0, n2n::VERSION_V15);
+        assert_eq!(server_result.0, n2n::VERSION_V16);
 
         ra.abort();
         rb.abort();
@@ -301,6 +304,7 @@ mod tests {
                 initiator_only_diffusion_mode: false,
                 peer_sharing: 1,
                 query: false,
+                v16_flag: None,
             });
             run_client(cs, cr, versions).await
         });
@@ -311,6 +315,7 @@ mod tests {
                 initiator_only_diffusion_mode: false,
                 peer_sharing: 1,
                 query: false,
+                v16_flag: None,
             };
             run_server(ss, sr, |client_versions| {
                 // Server expects testnet magic — mismatch!
@@ -324,7 +329,7 @@ mod tests {
         // Client should have received a refusal.
         match client_result {
             HandshakeResult::Refused(RefuseReason::Refused(version, msg)) => {
-                assert_eq!(version, n2n::VERSION_V15);
+                assert_eq!(version, n2n::VERSION_V16);
                 assert!(msg.contains("magic mismatch"), "msg: {msg}");
             }
             other => panic!("expected Refused, got {other:?}"),
