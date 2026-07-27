@@ -152,11 +152,12 @@ pub async fn run(
                 println!("  leios: {} vote(s) received from {peer_id}", votes.len());
             }
             NetworkEvent::LeiosBlockTxsReceived {
+                peer_id,
                 point,
                 transactions,
             } => {
                 println!(
-                    "  leios: EB txs received at {point} ({} txs)",
+                    "  leios: EB txs received from {peer_id} at {point} ({} txs)",
                     transactions.len()
                 );
             }

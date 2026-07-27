@@ -399,6 +399,7 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
 
     // Build shared command senders for dispatch.
     let senders = ClientProtocolSenders {
+        peer_id,
         fetch: fetch_sender,
         peer_share: peer_share_sender,
         tx_submit: tx_submit_sender,

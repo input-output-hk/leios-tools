@@ -424,7 +424,7 @@ pub(crate) fn spawn_txsubmission(
             }
         });
 
-        if let Err(e) = txsubmission::run_client(&mut runner, &mut tx_receiver, Some(req_tx)).await
+        if let Err(e) = txsubmission::run_client(&mut runner, &mut tx_receiver, Some(req_tx), peer_id).await
         {
             let _ = event_sender
                 .send((
@@ -819,6 +819,7 @@ pub(crate) async fn run_peer_task(mut config: PeerTaskConfig) {
 
     // Build shared command senders for dispatch.
     let senders = ClientProtocolSenders {
+        peer_id,
         fetch: fetch_sender,
         peer_share: peer_share_sender,
         tx_submit: tx_submit_sender,
@@ -1413,7 +1414,8 @@ mod tests {
 
         // Server should receive TransactionReceived event.
         let result = tokio::time::timeout(Duration::from_secs(5), async {
-            let (_id, event) = server_event_rx.recv().await.unwrap();
+            let (origin, event) = server_event_rx.recv().await.unwrap();
+            
             match event {
                 PeerEvent::TransactionReceived { body, era } => {
                     assert_eq!(
@@ -1423,6 +1425,7 @@ mod tests {
                         ])
                     );
                     assert_eq!(era, ts::ORIGIN_ERA);
+                    assert_eq!(origin, server_peer_id);
                 }
                 other => panic!("expected TransactionReceived, got {other:?}"),
             }

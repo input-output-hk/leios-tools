@@ -34,7 +34,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use serde::Serialize;
 use tracing::info;
-
+use crate::behaviour::tree::control::TxAnnouncePolicy;
 use crate::peer::PeerId;
 use crate::types::hex_prefix;
 
@@ -98,7 +98,7 @@ impl TxId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TxBody(Arc<[u8]>);
 
 impl TxBody {
@@ -139,7 +139,7 @@ impl TxBody {
 }
 
 /// A transaction body the mempool is holding.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MempoolTx {
     pub tx_id: TxId,
     pub body: TxBody,
@@ -150,6 +150,18 @@ pub struct MempoolTx {
 
     /// Slot of acceptance into mempool.
     pub gen_slot: u64,
+}
+
+impl MempoolTx {
+    pub fn new(tx_id: TxId, body: TxBody, size: u32, ours: bool, gen_slot: u64) -> MempoolTx {
+        MempoolTx {
+            tx_id,
+            body,
+            size,
+            ours,
+            gen_slot
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +331,7 @@ impl MempoolState {
     /// produced by the BT tick, storing the mempool-domain slice. Called once
     /// per slot by the I/O wrapper.
     pub fn apply_control(&mut self, control: &crate::behaviour::tree::control::ControlSignal) {
+        tracing::info!("Applying control: {:?}", control);
         self.control = control.clone();
     }
 
@@ -341,29 +354,7 @@ impl MempoolState {
     }
 
     // -- Validation outcomes -----------------------------------------------
-/*
-    /// Validator confirmed the body for `tx_id` — admit it.  If the
-    /// queue is at capacity, evicts the oldest tx and emits a
-    /// `TxRejected { reason: QueueFull }` for it.  No-op if the
-    /// tx_id wasn't pending validation.
-    pub fn on_tx_validated(&mut self, tx_id: TxId, size: u32) -> Vec<MempoolEffect> {
-        let Some(body) = self.pending_validation.remove(&tx_id) else {
-            return Vec::new();
-        };
-        // Arrived over the network → not locally produced.
-        self.admit_internal(tx_id, body, size, false)
-    }
 
-    /// Validator rejected `tx_id`.  Drops the pending body and emits
-    /// `TxRejected { ValidationFailed }`.
-    pub fn on_tx_validation_failed(&mut self, tx_id: TxId, reason: String) -> Vec<MempoolEffect> {
-        self.pending_validation.remove(&tx_id);
-        vec![MempoolEffect::TxRejected {
-            tx_id,
-            reason: TxRejectReason::ValidationFailed(reason),
-        }]
-    }
-*/
     /// Admit a tx that's already been validated externally — typically
     /// a locally-produced tx the wrapper has validated against its own
     /// ledger view, or a test fixture.  Bypasses the
@@ -454,21 +445,46 @@ impl MempoolState {
         self.tx_index.contains(tx_id)
     }
 
-    /// Look up a tx body by its id across both compartments — the free
+    /// Look up a tx by its id across both compartments — the free
     /// FIFO pool and the EB-pinned pool.  Linear scan over `txs`;
-    /// mempool sizes this prototype targets keep it acceptable.  Used
-    /// by the LeiosFetch BlockTxs server (via the `TxBodyResolver`
-    /// trait in the consumer's wrapper) to resolve manifest entries.
-    pub fn get_body_by_id(&self, id: &TxId) -> Option<TxBody> {
-        if let Some(body) = self
+    /// mempool sizes this prototype targets keep it acceptable.
+    fn get_record_by_id(&self, tx_id: &TxId) -> Option<MempoolTx> {
+        if let Some(record) = self
             .txs
             .iter()
-            .find(|tx| &tx.tx_id == id)
-            .map(|tx| tx.body.clone())
+            .find(|tx| &tx.tx_id == tx_id)
         {
-            return Some(body);
+            return Some(record.clone());
         }
-        self.eb_pinned.get(id).map(|tx| tx.body.clone())
+        self.eb_pinned.get(tx_id).cloned()
+    }
+
+    /// Look up a tx body by id.
+    pub fn get_body_by_id(&self, id: &TxId) -> Option<TxBody> {
+        self.get_record_by_id(id).map(|record| record.body)
+    }
+
+    /// Check current transaction WRT filtering rules.
+    /// Return true if Tx to remain, false if Tx should not be announced.
+    fn filter_transaction_announcement(&self, current_slot: u64, tx_id: &TxId) -> bool {
+        let (delay, only_ours) = if let TxAnnouncePolicy::WithholdAnnouncements {
+            withholding_slots: delay_for_slots, tx_producer_only: only_ours
+        } = &self.control.mempool.announce_filter {
+            (*delay_for_slots, *only_ours)
+        } else {
+            return true;
+        };
+
+        let Some(record) = self.get_record_by_id(tx_id) else { return false };
+        let generator_applicable = record.ours || !only_ours;
+        // If delay = 0, then no delay is applicable, no filtering
+        let delay_applicable = current_slot.saturating_sub(record.gen_slot) < delay;
+
+        info!("Filtering announcement for tx {}: ours={}, only_ours={}, gen_slot={}, current_slot={}, delay={}, generator_applicable={}, delay_applicable={}",
+            tx_id.hex_short(), record.ours, only_ours, record.gen_slot, current_slot, delay, generator_applicable, delay_applicable);
+
+        // If delay and generator are applicable -- withhold Tx from announcing
+        !(generator_applicable && delay_applicable)
     }
 
     /// Return up to `max_count` txs not yet advertised to `peer_id`,
@@ -481,16 +497,28 @@ impl MempoolState {
         &mut self,
         peer_id: PeerId,
         max_count: usize,
+        current_slot: u64,
     ) -> Vec<MempoolTx> {
         self.ensure_peer_registered(peer_id);
+        let to_send: Vec<TxId> = {
+            let unann = self
+                .peer_unannounced
+                .get(&peer_id)
+                .expect("ensure_peer_registered");
+
+            if unann.is_empty() || max_count == 0 {
+                return Vec::new();
+            }
+
+            unann.iter().filter(
+                |tx| self.filter_transaction_announcement(current_slot, tx)
+            ).take(max_count).cloned().collect()
+        };
         let unann = self
             .peer_unannounced
             .get_mut(&peer_id)
             .expect("ensure_peer_registered");
-        if unann.is_empty() || max_count == 0 {
-            return Vec::new();
-        }
-        let to_send: Vec<TxId> = unann.iter().take(max_count).cloned().collect();
+
         for id in &to_send {
             unann.remove(id);
         }
@@ -530,8 +558,14 @@ impl MempoolState {
     /// needs to send the tx body to that peer).  Used by the
     /// admit-fan-out path to announce a single just-admitted tx to
     /// every connected peer in `O(log N)` per peer.
-    pub fn mark_announced_to_peer(&mut self, peer_id: PeerId, tx_id: &TxId) -> bool {
+    pub fn mark_announced_to_peer(&mut self, peer_id: PeerId, tx_id: &TxId, current_slot: u64) -> bool {
         self.ensure_peer_registered(peer_id);
+
+        if !self.filter_transaction_announcement(current_slot, tx_id) {
+            return false;
+            // TODO: if transaction is filtered, should we announce it later, when filter dropped?
+        }
+
         let was_owed = self
             .peer_unannounced
             .get_mut(&peer_id)
@@ -694,10 +728,15 @@ impl MempoolState {
             drained.push(tx);
         }
         let manifest: Vec<TxId> = drained.iter().map(|tx| tx.tx_id.clone()).collect();
+        let mut ours_cnt = 0;
         for tx in drained {
+            ours_cnt += tx.ours as usize;
             self.eb_pinned.entry(tx.tx_id.clone()).or_insert(tx);
         }
-        info!("Inserting (locally produced) manifest {eb_key} with {} txs", manifest.len());
+        info!(
+            "Inserting (locally produced) manifest {eb_key} with {} txs ({} ours, {} non-ours)",
+            manifest.len(), ours_cnt, manifest.len()-ours_cnt
+        );
         self.eb_manifests.insert(eb_key, manifest.clone());
         let fx = self.bump_eb_slot(eb_key.slot);
         (manifest, fx)
@@ -734,21 +773,13 @@ impl MempoolState {
     /// wrapper hashes incoming bodies and matches against the manifest
     /// before calling here.  No-op if the tx is already known via
     /// `txs` or `eb_pinned`.
-    pub fn merge_eb_body(&mut self, tx_id: &TxId, body: TxBody, size: u32, slot: u64) {
-        if self.contains(tx_id) || self.eb_pinned.contains_key(tx_id) {
+    pub fn merge_eb_body(&mut self, tx: MempoolTx) {
+        if self.contains(&tx.tx_id) || self.eb_pinned.contains_key(&tx.tx_id) {
             return;
         }
         self.eb_pinned.insert(
-            tx_id.clone(),
-            MempoolTx {
-                tx_id: tx_id.clone(),
-                body,
-                size,
-                // EB bodies are fetched from peers via LeiosFetch, never
-                // locally produced.
-                ours: false,
-                gen_slot: slot,
-            },
+            tx.tx_id.clone(),
+            tx.clone()
         );
     }
 
@@ -903,6 +934,28 @@ impl MempoolState {
 mod tests {
     use super::*;
 
+    /// Validator confirmed the body for `tx_id` — admit it.  If the
+    /// queue is at capacity, evicts the oldest tx and emits a
+    /// `TxRejected { reason: QueueFull }` for it.  No-op if the
+    /// tx_id wasn't pending validation.
+    pub fn on_tx_validated(pool: &mut MempoolState, tx_id: TxId, size: u32, slot: u64) -> Vec<MempoolEffect> {
+        let Some(body) = pool.pending_validation.remove(&tx_id) else {
+            return Vec::new();
+        };
+        // Arrived over the network → not locally produced.
+        pool.admit_internal(tx_id, body, size, slot, false)
+    }
+
+    /// Validator rejected `tx_id`.  Drops the pending body and emits
+    /// `TxRejected { ValidationFailed }`.
+    pub fn on_tx_validation_failed(pool: &mut MempoolState, tx_id: TxId, reason: String) -> Vec<MempoolEffect> {
+        pool.pending_validation.remove(&tx_id);
+        vec![MempoolEffect::TxRejected {
+            tx_id,
+            reason: TxRejectReason::ValidationFailed(reason),
+        }]
+    }
+
     #[test]
     fn apply_control_stores_mempool_domain_slice() {
         use crate::behaviour::tree::control::{ControlSignal, TxFilterPolicy};
@@ -939,7 +992,7 @@ mod tests {
 
     fn admit(state: &mut MempoolState, id: u8, size: u32) -> Vec<MempoolEffect> {
         let (tx_id, body, sz) = tx(id, size);
-        state.admit_validated(tx_id, body, sz, false)
+        state.admit_validated(tx_id, body, sz, 0, false)
     }
 
     #[test]
@@ -1014,7 +1067,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         let (tx_id, body, sz) = tx(1, 100);
         let _ = s.on_tx_received(tx_id.clone(), body);
-        let fx = s.on_tx_validated(tx_id.clone(), sz);
+        let fx = on_tx_validated(&mut s, tx_id.clone(), sz, 0);
         assert!(fx.is_empty()); // no overflow → no effect
         assert_eq!(s.len(), 1);
         assert_eq!(s.total_bytes(), 100);
@@ -1025,7 +1078,7 @@ mod tests {
     fn on_tx_validated_unknown_id_is_noop() {
         let mut s = MempoolState::new(10);
         let (tx_id, _, _) = tx(99, 0);
-        let fx = s.on_tx_validated(tx_id, 100);
+        let fx = on_tx_validated(&mut s, tx_id, 100, 0);
         assert!(fx.is_empty());
         assert_eq!(s.len(), 0);
     }
@@ -1035,7 +1088,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         let (tx_id, body, _) = tx(1, 100);
         let _ = s.on_tx_received(tx_id.clone(), body);
-        let fx = s.on_tx_validation_failed(tx_id.clone(), "bad signature".into());
+        let fx = on_tx_validation_failed(&mut s, tx_id.clone(), "bad signature".into());
         assert_eq!(fx.len(), 1);
         match &fx[0] {
             MempoolEffect::TxRejected {
@@ -1157,9 +1210,9 @@ mod tests {
         admit(&mut s, 1, 100);
         admit(&mut s, 2, 100);
         let peer = pid(0);
-        let first = s.peek_unannounced_for_peer(peer, 10);
+        let first = s.peek_unannounced_for_peer(peer, 10, 0);
         assert_eq!(first.len(), 2);
-        let second = s.peek_unannounced_for_peer(peer, 10);
+        let second = s.peek_unannounced_for_peer(peer, 10, 0);
         assert!(second.is_empty());
     }
 
@@ -1167,8 +1220,8 @@ mod tests {
     fn peek_unannounced_independent_per_peer() {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
-        let to_a = s.peek_unannounced_for_peer(pid(0), 10);
-        let to_b = s.peek_unannounced_for_peer(pid(1), 10);
+        let to_a = s.peek_unannounced_for_peer(pid(0), 10, 0);
+        let to_b = s.peek_unannounced_for_peer(pid(1), 10, 0);
         assert_eq!(to_a.len(), 1);
         assert_eq!(to_b.len(), 1);
     }
@@ -1178,9 +1231,9 @@ mod tests {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
         let peer = pid(0);
-        assert_eq!(s.peek_unannounced_for_peer(peer, 10).len(), 1);
+        assert_eq!(s.peek_unannounced_for_peer(peer, 10, 0).len(), 1);
         admit(&mut s, 2, 100);
-        let next = s.peek_unannounced_for_peer(peer, 10);
+        let next = s.peek_unannounced_for_peer(peer, 10, 0);
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].tx_id, TxId::new_with_slice(&[2u8; 32]));
     }
@@ -1191,7 +1244,7 @@ mod tests {
         admit(&mut s, 1, 100);
         admit(&mut s, 2, 100);
         let peer = pid(0);
-        let _ = s.peek_unannounced_for_peer(peer, 10);
+        let _ = s.peek_unannounced_for_peer(peer, 10, 0);
         admit(&mut s, 3, 100);
         let advertised = s.peer_advertised.get(&peer).unwrap();
         assert!(!advertised.contains(&TxId::new_with_slice(&[1u8; 32])));
@@ -1204,7 +1257,7 @@ mod tests {
         admit(&mut s, 1, 100);
         admit(&mut s, 2, 100);
         let peer = pid(0);
-        let _ = s.peek_unannounced_for_peer(peer, 10);
+        let _ = s.peek_unannounced_for_peer(peer, 10, 0);
         let _ = s.drain_up_to(10_000);
         assert!(s
             .peer_advertised
@@ -1219,7 +1272,7 @@ mod tests {
         admit(&mut s, 1, 100);
         admit(&mut s, 2, 100);
         let peer = pid(0);
-        let _ = s.peek_unannounced_for_peer(peer, 10);
+        let _ = s.peek_unannounced_for_peer(peer, 10, 0);
         s.on_block_applied(&Some(EbKey::new(0, [0u8; 32])), &[TxId::new_with_slice(&[1u8; 32])]);
         let advertised = s.peer_advertised.get(&peer).unwrap();
         assert!(!advertised.contains(&TxId::new_with_slice(&[1u8; 32])));
@@ -1231,7 +1284,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
         let peer = pid(0);
-        let _ = s.peek_unannounced_for_peer(peer, 10);
+        let _ = s.peek_unannounced_for_peer(peer, 10, 0);
         assert!(s.peer_advertised.contains_key(&peer));
         s.forget_peer(peer);
         assert!(!s.peer_advertised.contains_key(&peer));
@@ -1243,7 +1296,7 @@ mod tests {
     fn admit_validated_skips_validation_dance() {
         let mut s = MempoolState::new(10);
         let (tx_id, body, sz) = tx(1, 100);
-        let fx = s.admit_validated(tx_id.clone(), body, sz, false);
+        let fx = s.admit_validated(tx_id.clone(), body, sz, 0, false);
         assert!(fx.is_empty());
         assert_eq!(s.len(), 1);
         assert!(s.contains(&tx_id));
@@ -1254,7 +1307,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
         let (tx_id, body, sz) = tx(1, 100);
-        let fx = s.admit_validated(tx_id, body, sz, false);
+        let fx = s.admit_validated(tx_id, body, sz, 0, false);
         assert!(matches!(
             fx[0],
             MempoolEffect::TxRejected {
@@ -1272,7 +1325,7 @@ mod tests {
         let (tx_id, body, sz) = tx(1, 100);
         let _ = s.on_tx_received(tx_id.clone(), body.clone());
         assert!(s.pending_validation.contains_key(&tx_id));
-        let _ = s.admit_validated(tx_id.clone(), body, sz, false);
+        let _ = s.admit_validated(tx_id.clone(), body, sz, 0, false);
         assert!(!s.pending_validation.contains_key(&tx_id));
         assert_eq!(s.len(), 1);
     }
@@ -1298,14 +1351,14 @@ mod tests {
         // Network-validated path never marks a tx as ours.
         let (net_id, net_body, _net_sz) = tx(3, 10);
         let _ = s.on_tx_received(net_id.clone(), net_body);
-        let _ = s.on_tx_validated(net_id.clone(), 10);
+        let _ = on_tx_validated(&mut s, net_id.clone(), 10, 43);
         let net = s.txs.iter().find(|t| t.tx_id == net_id).unwrap();
         assert!(!net.ours);
         assert_eq!(net.gen_slot, 43);
 
         // EB bodies merged from peers are never ours, stamped with the slot.
         let (eb_id, eb_body, eb_sz) = tx(4, 10);
-        s.merge_eb_body(&eb_id, eb_body, eb_sz);
+        s.merge_eb_body(&eb_id, eb_body, eb_sz, 43);
         let eb = s.eb_pinned.get(&eb_id).unwrap();
         assert!(!eb.ours);
         assert_eq!(eb.gen_slot, 43);
@@ -1365,13 +1418,13 @@ mod tests {
     fn get_body_by_id_resolves_from_either_compartment() {
         let mut s = MempoolState::new(10);
         let (id1, body1, sz1) = tx(1, 50);
-        s.admit_validated(id1.clone(), body1.clone(), sz1, false);
+        s.admit_validated(id1.clone(), body1.clone(), sz1, 0, false);
         s.produce_eb(eb_key(5, 0x55), 1);
         // Now id1 is in eb_pinned, not txs.
         assert_eq!(s.get_body_by_id(&id1), Some(body1));
         // A fresh free tx resolves from `txs`.
         let (id2, body2, sz2) = tx(2, 60);
-        s.admit_validated(id2.clone(), body2.clone(), sz2, false);
+        s.admit_validated(id2.clone(), body2.clone(), sz2, 0, false);
         assert_eq!(s.get_body_by_id(&id2), Some(body2));
         assert_eq!(s.get_body_by_id(&TxId::new_with_slice(&[99u8; 32])), None);
     }
@@ -1390,12 +1443,12 @@ mod tests {
         assert_eq!(s.missing_eb_indices(&eb), vec![0, 1]);
 
         // Merge the second body first (out-of-order delivery is fine).
-        s.merge_eb_body(&id_b, TxBody::new_with_vec(vec![0xB0]), 1);
+        s.merge_eb_body(&id_b, TxBody::new_with_vec(vec![0xB0]), 1, 0);
         assert_eq!(s.missing_eb_indices(&eb), vec![0]);
         assert!(s.has_tx(&id_b));
 
         // Then the first.
-        s.merge_eb_body(&id_a, TxBody::new_with_vec(vec![0xA0]), 1);
+        s.merge_eb_body(&id_a, TxBody::new_with_vec(vec![0xA0]), 1, 0);
         assert!(s.missing_eb_indices(&eb).is_empty());
     }
 
@@ -1408,8 +1461,8 @@ mod tests {
         let eb = eb_key(30, 0x33);
         s.record_eb_manifest(eb, ids.clone());
         // Only bodies for indices 1 and 3 are locally available.
-        s.merge_eb_body(&ids[1], TxBody::new_with_vec(vec![0x11]), 1);
-        s.merge_eb_body(&ids[3], TxBody::new_with_vec(vec![0x33]), 1);
+        s.merge_eb_body(&ids[1], TxBody::new_with_vec(vec![0x11]), 1, 0);
+        s.merge_eb_body(&ids[3], TxBody::new_with_vec(vec![0x33]), 1, 0);
 
         // Server gets a bitmap request for [0, 1, 2, 3, 4]; returns only the
         // bodies it has, in ascending index order.
@@ -1435,9 +1488,9 @@ mod tests {
         let mut s = MempoolState::new(10);
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(40, 0x40), vec![id.clone()]);
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1);
+        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1, 0);
         // Second call with a different (faked) body must not overwrite.
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xFF]), 1);
+        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xFF]), 1, 0);
         assert_eq!(
             s.get_body_by_id(&id),
             Some(TxBody::new_with_vec(vec![0xCC]))
@@ -1450,8 +1503,8 @@ mod tests {
         // it under eb_pinned.
         let mut s = MempoolState::new(10);
         let (id, body, sz) = tx(1, 100);
-        s.admit_validated(id.clone(), body.clone(), sz, false);
-        s.merge_eb_body(&id, body, sz);
+        s.admit_validated(id.clone(), body.clone(), sz, 0, false);
+        s.merge_eb_body(&id, body, sz, 0);
         assert_eq!(s.eb_pinned.len(), 0);
     }
 
@@ -1463,7 +1516,7 @@ mod tests {
         let evicted_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let evictions_initial = s.record_eb_manifest(old_eb, vec![evicted_id.clone()]);
         assert!(evictions_initial.is_empty(), "no evictions on first record");
-        s.merge_eb_body(&evicted_id, TxBody::new_with_vec(vec![0xAA]), 1);
+        s.merge_eb_body(&evicted_id, TxBody::new_with_vec(vec![0xAA]), 1, 0);
         assert!(s.has_tx(&evicted_id));
         assert!(s.get_eb_manifest(&old_eb).is_some());
 
@@ -1493,7 +1546,7 @@ mod tests {
         // Old EB with a pinned body.
         let old_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let _ = s.record_eb_manifest(eb_key(1, 0x01), vec![old_id.clone()]);
-        s.merge_eb_body(&old_id, TxBody::new_with_vec(vec![0xAA]), 1);
+        s.merge_eb_body(&old_id, TxBody::new_with_vec(vec![0xAA]), 1, 0);
 
         // Produce a new EB far past the retention window — the
         // producer-side path also evicts the aged closure.
@@ -1517,7 +1570,7 @@ mod tests {
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(1, 0x01), vec![id.clone()]);
         s.record_eb_manifest(eb_key(95, 0x02), vec![id.clone()]);
-        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1);
+        s.merge_eb_body(&id, TxBody::new_with_vec(vec![0xCC]), 1, 0);
         // Bump max so the slot=1 EB falls out of the window but slot=95 stays.
         s.record_eb_manifest(eb_key(99, 0x03), vec![]);
         assert!(s.get_eb_manifest(&eb_key(1, 0x01)).is_none());

@@ -11,9 +11,9 @@ use crate::mux::MuxStats;
 use crate::protocols::peersharing::PeerAddress;
 use crate::protocols::txsubmission::PendingTx;
 use crate::types::{BlockBody, Point, Tip, Vote, WrappedHeader};
-use shared_consensus::mempool::TxBody;
+use shared_consensus::mempool::{MempoolTx, TxBody};
 use std::sync::Arc;
-
+use shared_consensus::PeerId;
 // ---------------------------------------------------------------------------
 // Peer ↔ Coordinator
 // ---------------------------------------------------------------------------

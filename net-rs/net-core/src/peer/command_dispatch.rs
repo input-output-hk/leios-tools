@@ -4,6 +4,8 @@
 //! dispatch `PeerCommand`s to the same set of client protocol sub-tasks.
 //! This module provides a single implementation to avoid duplication.
 
+use shared_consensus::mempool::MempoolTx;
+use shared_consensus::PeerId;
 use tokio::sync::mpsc;
 
 use crate::protocols::txsubmission::PendingTx;
@@ -14,6 +16,7 @@ use super::types::PeerCommand;
 
 /// Channel senders for dispatching commands to client-side protocol tasks.
 pub(crate) struct ClientProtocolSenders {
+    pub peer_id: PeerId,
     pub fetch: mpsc::Sender<(Point, Point)>,
     pub peer_share: mpsc::Sender<u8>,
     pub tx_submit: mpsc::Sender<PendingTx>,

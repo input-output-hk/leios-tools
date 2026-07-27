@@ -826,6 +826,7 @@ impl Coordinator {
                     }
                 }
                 self.emit_event(NetworkEvent::LeiosBlockTxsReceived {
+                    peer_id,
                     point,
                     transactions,
                 });

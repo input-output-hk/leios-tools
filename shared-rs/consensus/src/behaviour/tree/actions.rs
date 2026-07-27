@@ -70,6 +70,13 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
             *non_voting_threshold,
             *hide_eb_tx_received,
         )),
+        ActionSpec::WithholdAnnouncements {
+            withholding_slots,
+            tx_producer_only,
+        } => Box::new(catalogue::WithholdAnnouncements::new(
+            *withholding_slots,
+            *tx_producer_only,
+        )),
         ActionSpec::DeepReorg { every_slots, depth } => {
             Box::new(catalogue::DeepReorg::new(*every_slots, *depth))
         }

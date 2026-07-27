@@ -6,9 +6,10 @@
 
 pub mod codec;
 
-use shared_consensus::mempool::{TxBody, TxId};
+use shared_consensus::mempool::{MempoolTx, TxBody, TxId};
 use std::collections::VecDeque;
 use std::time::Duration;
+use shared_consensus::PeerId;
 use tokio::sync::mpsc;
 
 use crate::protocols::{Agency, Protocol, ProtocolError, Runner};
@@ -108,9 +109,7 @@ pub struct TxIdAndSize {
 /// A pending transaction waiting to be announced and sent.
 #[derive(Debug, Clone)]
 pub struct PendingTx {
-    pub tx_id: TxId,
-    pub body: TxBody,
-    pub size: u32,
+    pub tx: MempoolTx,
     /// HardFork era index for this tx, carried end-to-end so it is echoed
     /// back on the wire exactly as the tx was received (rather than being
     /// re-stamped with a fixed constant). For txs we originate locally this
@@ -257,7 +256,7 @@ fn ack_and_prune(
         let Some(acked) = announced.pop_front() else {
             break;
         };
-        if let Some(pos) = pending_bodies.iter().position(|p| p.tx_id == acked.tx_id) {
+        if let Some(pos) = pending_bodies.iter().position(|p| p.tx.tx_id == acked.tx.tx_id) {
             pending_bodies.remove(pos);
         }
     }
@@ -276,7 +275,7 @@ fn ack_and_prune(
 /// by that id but never match it back, stranding it. A silent fallback here is
 /// how that class of bug hid; a parse failure is now surfaced, not papered over.
 fn praos_tx_id(tx: &PendingTx) -> Option<TxId> {
-    net_codec::wire_tx_id(tx.body.get_slice()).map(TxId::new_with_array)
+    net_codec::wire_tx_id(tx.tx.body.get_slice()).map(TxId::new_with_array)
 }
 
 /// Build the `MsgReplyTxIds` payload for a batch of txs, tracking exactly the
@@ -289,13 +288,18 @@ fn announce_txs(
     announced: &mut VecDeque<PendingTx>,
     pending_bodies: &mut VecDeque<PendingTx>,
 ) -> Vec<TxIdAndSize> {
+    let txs_announcement = new_txs.iter().map(
+        |x| format!("{}:{},{}", x.tx.tx_id.hex_short(), x.tx.ours, x.tx.gen_slot)
+    ).collect::<Vec<_>>();
+    tracing::info!("Announcing Txs (len={}): {:?}", txs_announcement.len(), txs_announcement);
+
     let mut reply = Vec::with_capacity(new_txs.len());
     for tx in new_txs {
         match praos_tx_id(tx) {
             Some(tx_id) => {
                 reply.push(TxIdAndSize {
                     tx_id,
-                    size: tx.size,
+                    size: tx.tx.size,
                     era: wire_era(tx.era),
                 });
                 announced.push_back(tx.clone());
@@ -303,7 +307,7 @@ fn announce_txs(
             }
             None => {
                 tracing::warn!(
-                    size = tx.size,
+                    size = tx.tx.size,
                     "dropping tx with no canonical Praos wire id (unparseable body); \
                      not announcing on TxSubmission"
                 );
@@ -322,6 +326,7 @@ pub async fn run_client(
     runner: &mut Runner<TxSubmission>,
     tx_receiver: &mut mpsc::Receiver<PendingTx>,
     request_sender: Option<mpsc::Sender<u16>>,
+    peer_id: PeerId,
 ) -> Result<(), ProtocolError> {
     // Send MsgInit to transition StInit -> StIdle.
     runner.send(&Message::MsgInit).await?;
@@ -434,7 +439,7 @@ pub async fn run_client(
                         let pending = pending_bodies.remove(pos).expect("position valid");
                         txs.push(EraTxBody {
                             era: wire_era(pending.era),
-                            body: pending.body,
+                            body: pending.tx.body,
                         });
                     }
                     // Per spec: omitted txs are treated as never announced.

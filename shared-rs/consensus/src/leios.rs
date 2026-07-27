@@ -33,7 +33,7 @@ use crate::elections::{Elections, SlotEffect};
 use crate::fetch::{
     CandidateTracker, EbFetchPolicy, EbTxsFetchPolicy, LowestRttFirst, PeerRtt, UniformRtt,
 };
-use crate::mempool::{EbKey, TxBody, TxId};
+use crate::mempool::{EbKey, MempoolTx, TxBody, TxId};
 use crate::peer::PeerId;
 use crate::pipeline::PipelineConfig;
 use crate::types::Point;
@@ -450,14 +450,14 @@ pub struct LeiosState {
 
 /// Auxiliary enum for the `tx_known` callback passed into `LeiosState::on_slot`.
 /// Gives extended info about tx status in mempool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxAvailability {
     Absent,
     /// Tx is present in mempool and pinned (i.e., specified in eb_pinned struct).
-    PresentPinned,
+    PresentPinned(MempoolTx),
     /// Tx is present in mempool but not pinned (i.e., can be evicted at any moment
     /// if mempool is full).
-    PresentUnpinned,
+    PresentUnpinned(MempoolTx),
 }
 
 impl LeiosState {
@@ -837,13 +837,31 @@ impl LeiosState {
             let mut present_pinned = 0;
             let mut present_unpinned = 0;
             let mut decline = false;
+            let mut origin_by_slots: BTreeMap<(u64, bool), u64> = BTreeMap::new();
+
             for h in tx_hashes {
-                match tx_known(h) {
-                    TxAvailability::Absent => decline = true,
-                    TxAvailability::PresentPinned => present_pinned += 1,
-                    TxAvailability::PresentUnpinned => present_unpinned += 1,
-                }
+                let tx = match tx_known(h) {
+                    TxAvailability::Absent => {
+                        decline = true;
+                        continue
+                    },
+                    TxAvailability::PresentPinned(tx) => {
+                        present_pinned += 1;
+                        tx
+                    },
+                    TxAvailability::PresentUnpinned(tx) => {
+                        present_unpinned += 1;
+                        tx
+                    },
+                };
+                origin_by_slots.entry((tx.gen_slot, tx.ours)).and_modify(|c| *c += 1).or_insert(1);
             }
+
+            tracing::info!("Voting for EB: seen slot {}", eb_slot);
+            for ((slot, ours), count) in origin_by_slots.iter() {
+                tracing::info!("{slot}:{ours} => {count}");
+            }
+
             if decline {
                 return Err(NoVoteReason::MissingTX {
                     required: tx_hashes.len(),
@@ -1111,7 +1129,7 @@ impl LeiosState {
     /// EB transactions arrived; clear the per-slot in-flight gate so
     /// subsequent offers can drive fresh fetches.  Bodies are matched
     /// by the I/O layer via [`Self::match_eb_tx_response`].
-    pub fn on_eb_txs_received(&mut self, point: &Point, count: usize) {
+    pub fn on_eb_txs_received(&mut self, point: &Point, count: usize, peer_id: PeerId) {
         if let Point::Specific { slot, .. } = point {
             let gate_key = Point::Specific {
                 slot: *slot,
@@ -1128,6 +1146,7 @@ impl LeiosState {
         self.candidates.finish_eb_txs_fetch(point);
         info!(
             node_id = %self.node_id,
+            origin = %peer_id,
             %point,
             count,
             "leios block txs received"
@@ -2428,8 +2447,8 @@ mod tests {
 
         let mut mempool = crate::mempool::MempoolState::new(4096);
         // Local mempool has txs 0 (tx_id(1)) and 2 (tx_id(3)); 1 (tx_id(2)) and 3 (tx_id(4)) are missing.
-        mempool.admit_validated(tx_id(1), TxBody::new_with_vec(vec![0u8; 16]), 16, false);
-        mempool.admit_validated(tx_id(3), TxBody::new_with_vec(vec![0u8; 16]), 16, false);
+        mempool.admit_validated(tx_id(1), TxBody::new_with_vec(vec![0u8; 16]), 16, 0, false);
+        mempool.admit_validated(tx_id(3), TxBody::new_with_vec(vec![0u8; 16]), 16, 0, false);
 
         let bitmap = state.missing_eb_tx_bitmap(&h(0xAB), &mempool);
         let indices: Vec<u32> = crate::bitmap::iter_indices(&bitmap).collect();
@@ -2443,8 +2462,8 @@ mod tests {
         state.eb_tx_hashes.insert(h(0xCD), (50, manifest));
 
         let mut mempool = crate::mempool::MempoolState::new(4096);
-        mempool.admit_validated(tx_id(5), TxBody::new_with_vec(vec![0u8; 8]), 8, false);
-        mempool.admit_validated(tx_id(6), TxBody::new_with_vec(vec![0u8; 8]), 8, false);
+        mempool.admit_validated(tx_id(5), TxBody::new_with_vec(vec![0u8; 8]), 8, 0, false);
+        mempool.admit_validated(tx_id(6), TxBody::new_with_vec(vec![0u8; 8]), 8, 0, false);
 
         let bitmap = state.missing_eb_tx_bitmap(&h(0xCD), &mempool);
         assert!(bitmap.is_empty());
