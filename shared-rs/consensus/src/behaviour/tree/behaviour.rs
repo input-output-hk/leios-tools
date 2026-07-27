@@ -62,6 +62,12 @@ pub enum BehaviourKind {
         elapsed: u32,
         child: Box<Behaviour>,
     },
+    /// Pure timing gate: `Running` for `count` ticks of active life, then
+    /// `Success`. Contributes **nothing** to the `ControlSignal` — it neither
+    /// perturbs nor forces honest. As the first child of a `Sequence` it is a
+    /// relative "wait N slots" delay (`Sequence[ Wait(100), attack ]`); inside a
+    /// `Join` it delays one branch without clobbering the others' contribution.
+    Wait { count: u32, elapsed: u32 },
     /// Immediate predicate (never `Running`).
     Condition(ConditionExpr),
     /// A leaf action (control-signal contributor).
@@ -95,6 +101,11 @@ impl BehaviourKind {
             child: Box::new(child),
         }
     }
+
+    /// Build a `Wait` timing gate with a zeroed elapsed count.
+    pub fn wait(count: u32) -> Self {
+        BehaviourKind::Wait { count, elapsed: 0 }
+    }
 }
 
 impl Behaviour {
@@ -112,6 +123,7 @@ impl Behaviour {
                 elapsed,
                 child,
             } => tick_for_ticks(*count, elapsed, child, ctx, out),
+            BehaviourKind::Wait { count, elapsed } => tick_wait(*count, elapsed),
             BehaviourKind::Condition(expr) => {
                 if expr.eval(ctx) {
                     Status::Success
@@ -152,6 +164,9 @@ impl Behaviour {
             }
             BehaviourKind::ForTicks { elapsed, child, .. } => {
                 child.halt();
+                *elapsed = 0;
+            }
+            BehaviourKind::Wait { elapsed, .. } => {
                 *elapsed = 0;
             }
             BehaviourKind::Condition(_) => {}
@@ -282,6 +297,22 @@ fn tick_for_ticks(
         // Child finished early: propagate its terminal status.
         terminal => terminal,
     }
+}
+
+/// `Wait`: a childless timing gate. `Running` for a full `count` ticks of active
+/// life, then a stable `Success`. Contributes nothing to `out` — the accumulated
+/// signal during the wait is whatever other active branches produce (in a bare
+/// `Sequence` prefix that is the honest default, because nothing else is active).
+///
+/// The contract is literal: `Wait(N)` waits **N slots**. In `Sequence[ Wait(N),
+/// X ]`, `X` first activates on the `(N+1)`-th tick — N full slots elapse first.
+fn tick_wait(count: u32, elapsed: &mut u32) -> Status {
+    if *elapsed >= count {
+        // Full budget already spent: stable "done", hand off to the next sibling.
+        return Status::Success;
+    }
+    *elapsed += 1;
+    Status::Running
 }
 
 fn halt_from(children: &mut [Behaviour], start: usize) {
@@ -594,6 +625,86 @@ mod tests {
             run(&mut node, &NativeChainState::default()).0,
             Status::Failure
         );
+    }
+
+    // ---- Wait (pure timing gate) ----
+
+    #[test]
+    fn wait_runs_for_count_ticks_then_stable_success() {
+        let mut node = Behaviour::new("w", BehaviourKind::wait(3));
+        let st = NativeChainState::default();
+        // A full 3 ticks of Running (3 slots waited), then a stable Success.
+        assert_eq!(run(&mut node, &st).0, Status::Running);
+        assert_eq!(run(&mut node, &st).0, Status::Running);
+        assert_eq!(run(&mut node, &st).0, Status::Running);
+        assert_eq!(run(&mut node, &st).0, Status::Success);
+        assert_eq!(run(&mut node, &st).0, Status::Success);
+    }
+
+    #[test]
+    fn wait_contributes_nothing() {
+        // A pure timing gate must never perturb the control signal — the slot's
+        // accumulated signal is the honest default while a bare Wait is active.
+        let mut node = Behaviour::new("w", BehaviourKind::wait(2));
+        let (s, out) = run(&mut node, &NativeChainState::default());
+        assert_eq!(s, Status::Running);
+        assert_eq!(out, ControlSignal::default());
+    }
+
+    #[test]
+    fn wait_stages_a_relative_delay_in_a_sequence() {
+        // Sequence[ Wait(2), attack ]: 2 full slots elapse before the attack (a
+        // contributing Spy) activates on the 3rd tick — a relative "wait N slots".
+        let (attack, attack_ticks, _) = Spy::new(Status::Running);
+        let mut seq = Behaviour::new(
+            "s",
+            BehaviourKind::Sequence(vec![
+                Behaviour::new("w", BehaviourKind::wait(2)),
+                action(attack),
+            ]),
+        );
+        let st = NativeChainState::default();
+        // Ticks 1..=2: still waiting — attack not ticked, no contribution.
+        for _ in 0..2 {
+            let (s, out) = run(&mut seq, &st);
+            assert_eq!(s, Status::Running);
+            assert!(!out.leios.echo_to_source);
+        }
+        assert_eq!(attack_ticks.load(Ordering::SeqCst), 0);
+        // Tick 3: wait done, sequence advances → attack active and contributing.
+        let (s3, out3) = run(&mut seq, &st);
+        assert_eq!(s3, Status::Running);
+        assert!(out3.leios.echo_to_source);
+        assert_eq!(attack_ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn wait_in_join_does_not_clobber_a_concurrent_sibling() {
+        // "Do whatever you're doing for N slots": a Wait branch delays one arm
+        // without suppressing another arm that is actively perturbing from tick 1.
+        let (attacker, _, _) = Spy::new(Status::Running);
+        let mut join = Behaviour::new(
+            "j",
+            BehaviourKind::join(vec![
+                action(attacker),
+                Behaviour::new("w", BehaviourKind::wait(5)),
+            ]),
+        );
+        let (_, out) = run(&mut join, &NativeChainState::default());
+        // The concurrent attacker's contribution survives while the other waits.
+        assert!(out.leios.echo_to_source);
+    }
+
+    #[test]
+    fn wait_resets_elapsed_on_halt() {
+        let mut node = Behaviour::new("w", BehaviourKind::wait(3));
+        run(&mut node, &NativeChainState::default());
+        node.halt();
+        if let BehaviourKind::Wait { elapsed, .. } = &node.kind {
+            assert_eq!(*elapsed, 0, "halt must reset Wait elapsed");
+        } else {
+            panic!("expected Wait");
+        }
     }
 
     // ---- Condition (immediate) ----

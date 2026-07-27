@@ -52,6 +52,22 @@ pub enum ActionSpec {
     EchoToSource,
     #[serde(rename = "cert-suppressor")]
     CertSuppressor,
+    /// Phantom Tx EB — fabricated EB of `n_txs` unfetchable phantom txs.
+    #[serde(rename = "phantom-tx-eb")]
+    PhantomTxEb {
+        #[serde(default = "default_fake_eb_txs")]
+        n_txs: u32,
+    },
+    /// Dummy Tx EB — fabricated EB of `n_txs` servable dummy txs.
+    #[serde(rename = "dummy-tx-eb")]
+    DummyTxEb {
+        #[serde(default = "default_fake_eb_txs")]
+        n_txs: u32,
+    },
+}
+
+fn default_fake_eb_txs() -> u32 {
+    8
 }
 
 fn default_lazy_reason() -> NoVoteReason {

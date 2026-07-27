@@ -108,6 +108,7 @@ pub enum RawBehaviour {
     Sequence(Vec<BehaviourId>),
     Join(Vec<BehaviourId>),
     ForTicks { count: u32, child: BehaviourId },
+    Wait { count: u32 },
     Condition(ConditionExpr),
     Honest,
     Action(ActionSpec),
@@ -219,6 +220,14 @@ impl BtConfig {
                         });
                     }
                     self.require_defined(id, child)?;
+                }
+                RawBehaviour::Wait { count } => {
+                    if *count < 1 {
+                        return Err(ConfigError::BadArity {
+                            id: id.0.clone(),
+                            msg: "Wait count must be >= 1".to_string(),
+                        });
+                    }
                 }
                 RawBehaviour::Condition(expr) => {
                     expr.validate(&self.env)
@@ -340,6 +349,7 @@ impl BtConfig {
                 let c = self.expand(child, seed, on_path, action_counter)?;
                 BehaviourKind::for_ticks(*count, c)
             }
+            RawBehaviour::Wait { count } => BehaviourKind::wait(*count),
             RawBehaviour::Condition(expr) => BehaviourKind::Condition(expr.clone()),
             RawBehaviour::Honest => BehaviourKind::Action(Box::new(HonestAction)),
             RawBehaviour::Action(spec) => {
@@ -489,6 +499,24 @@ fn parse_behaviour(id: &str, t: &toml::Table) -> Result<RawBehaviour, ConfigErro
             Ok(RawBehaviour::ForTicks {
                 count: count_i as u32,
                 child: BehaviourId(child.to_string()),
+            })
+        }
+        "Wait" => {
+            let count_i = t
+                .get("count")
+                .and_then(toml::Value::as_integer)
+                .ok_or_else(|| ConfigError::BadField {
+                    id: id.to_string(),
+                    msg: "Wait needs integer `count`".to_string(),
+                })?;
+            if !(1..=i64::from(u32::MAX)).contains(&count_i) {
+                return Err(ConfigError::BadArity {
+                    id: id.to_string(),
+                    msg: format!("Wait count {count_i} out of range 1..=u32::MAX"),
+                });
+            }
+            Ok(RawBehaviour::Wait {
+                count: count_i as u32,
             })
         }
         "Condition" => {
@@ -770,6 +798,60 @@ children = []
 "#;
         match BtConfig::compile_str(text) {
             Err(ConfigError::BadArity { id, .. }) => assert_eq!(id, "root"),
+            other => panic!("expected BadArity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wait_stages_a_sequence_delay() {
+        // `Sequence[ Wait(2), <attack> ]` compiles and yields the relative-delay
+        // shape: honest (no perturbation) for 2 ticks, then the attack.
+        let text = r#"
+[run]
+name = "staged"
+seed = 1
+root = "s"
+[behaviours.s]
+type = "Sequence"
+children = ["w", "atk"]
+[behaviours.w]
+type = "Wait"
+count = 2
+[behaviours.atk]
+type = "Action"
+spec = { kind = "cert-suppressor" }
+"#;
+        let mut tree = BtConfig::compile_str(text).unwrap();
+        let env = crate::behaviour::tree::env::DynamicEnv::new();
+        let state = crate::behaviour::tree::env::NativeChainState::default();
+        let ctx = crate::behaviour::tree::env::TickCtx {
+            env: &env,
+            state: &state,
+            seed: 0,
+            action_params: None,
+        };
+        // Wait(2): 2 full slots elapse (attack inactive), then it activates.
+        assert!(!tree.tick(&ctx).1.praos.suppress_cert);
+        assert!(!tree.tick(&ctx).1.praos.suppress_cert);
+        // Tick 3: wait done → attack active.
+        assert!(tree.tick(&ctx).1.praos.suppress_cert);
+    }
+
+    #[test]
+    fn wait_count_zero_is_rejected() {
+        let text = r#"
+[run]
+name = "x"
+seed = 1
+root = "w"
+[behaviours.w]
+type = "Wait"
+count = 0
+"#;
+        match BtConfig::compile_str(text) {
+            Err(ConfigError::BadArity { msg, .. }) => {
+                assert!(msg.contains("Wait count"), "{msg}")
+            }
             other => panic!("expected BadArity, got {other:?}"),
         }
     }

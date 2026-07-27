@@ -12,6 +12,7 @@
 //! a later phase.
 
 pub mod cert_suppressor;
+pub mod fake_eb;
 pub mod deep_reorg;
 pub mod drop_inbound;
 pub mod echo_to_source;
@@ -21,6 +22,7 @@ pub mod rb_equivocator;
 pub mod t22;
 
 pub use cert_suppressor::CertSuppressor;
+pub use fake_eb::{DummyTxEb, PhantomTxEb};
 pub use deep_reorg::DeepReorg;
 pub use drop_inbound::DropInboundPeers;
 pub use echo_to_source::EchoToSource;
