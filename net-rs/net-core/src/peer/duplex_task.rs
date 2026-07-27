@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-
+use crate::multi_peer::SyncMethodConfig;
 use crate::mux::scheduler::TrafficClass;
 use crate::mux::MuxConfig;
 use crate::protocols::peersharing::PeerAddress;
@@ -36,6 +36,7 @@ pub(crate) struct DuplexTaskConfig {
     pub network_magic: u64,
     pub keepalive_interval: Duration,
     pub sdu_timeout: Duration,
+    pub sync_method: SyncMethodConfig,
     pub chain_store: Arc<ChainStore>,
     pub peer_provider: Arc<dyn Fn(u8) -> Vec<PeerAddress> + Send + Sync>,
     pub event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
@@ -57,6 +58,7 @@ pub(crate) struct AcceptedDuplexTaskConfig {
     pub peer_id: PeerId,
     pub connection: DuplexConnection,
     pub keepalive_interval: Duration,
+    pub sync_method: SyncMethodConfig,
     pub chain_store: Arc<ChainStore>,
     pub peer_provider: Arc<dyn Fn(u8) -> Vec<PeerAddress> + Send + Sync>,
     pub event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
@@ -138,6 +140,7 @@ pub(crate) async fn run_duplex_task(config: DuplexTaskConfig) {
             peer_id: config.peer_id,
             keepalive_interval: config.keepalive_interval,
             leios_enabled: config.leios_enabled,
+            sync_method: config.sync_method,
             chain_store: config.chain_store,
             peer_provider: config.peer_provider,
             leios_store: config.leios_store,
@@ -175,6 +178,7 @@ pub(crate) async fn run_accepted_duplex_task(config: AcceptedDuplexTaskConfig) {
             peer_id: config.peer_id,
             keepalive_interval: config.keepalive_interval,
             leios_enabled: config.leios_enabled,
+            sync_method: config.sync_method,
             chain_store: config.chain_store,
             peer_provider: config.peer_provider,
             leios_store: config.leios_store,
@@ -193,6 +197,7 @@ struct DuplexProtocolParams {
     peer_id: PeerId,
     keepalive_interval: Duration,
     leios_enabled: bool,
+    sync_method: SyncMethodConfig,
     chain_store: Arc<ChainStore>,
     peer_provider: Arc<dyn Fn(u8) -> Vec<PeerAddress> + Send + Sync>,
     leios_store: Option<Arc<LeiosStore>>,
@@ -209,6 +214,7 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
         peer_id,
         keepalive_interval,
         leios_enabled,
+        sync_method,
         chain_store,
         peer_provider,
         leios_store,
@@ -240,6 +246,7 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
         cs_send,
         cs_recv,
         peer_id,
+        sync_method,
         chain_store.clone(),
         event_sender.clone(),
         cs_reintersect_receiver,

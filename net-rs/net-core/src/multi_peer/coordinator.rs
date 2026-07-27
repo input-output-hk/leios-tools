@@ -417,6 +417,7 @@ impl Coordinator {
                 network_magic: self.config.network_magic,
                 keepalive_interval: self.config.keepalive_interval,
                 sdu_timeout: self.config.sdu_timeout,
+                sync_method: self.config.sync_method.clone(),
                 chain_store: self.chain_store.clone(),
                 peer_provider: self.peer_provider.clone(),
                 event_sender: self.peer_event_sender.clone(),
@@ -439,6 +440,7 @@ impl Coordinator {
                 network_magic: self.config.network_magic,
                 keepalive_interval: self.config.keepalive_interval,
                 sdu_timeout: self.config.sdu_timeout,
+                sync_method: self.config.sync_method.clone(),
                 chain_store: self.chain_store.clone(),
                 event_sender: self.peer_event_sender.clone(),
                 command_receiver: cmd_receiver,
@@ -577,7 +579,7 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
-            PeerEvent::IntersectionFound { point } => {
+            PeerEvent::IntersectionFound { point, initial } => {
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
                     Some(peer.fragment.len())
@@ -589,7 +591,7 @@ impl Coordinator {
                 }
                 // Forward to consensus so it can store the intersection as
                 // the peer chain's anchor (guaranteed common ancestor).
-                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point });
+                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point, initial });
             }
 
             PeerEvent::HeaderAnnounced { header, tip } => {
@@ -1414,6 +1416,7 @@ impl Coordinator {
             peer_id,
             connection,
             keepalive_interval: self.config.keepalive_interval,
+            sync_method: self.config.sync_method.clone(),
             chain_store: self.chain_store.clone(),
             peer_provider: self.peer_provider.clone(),
             event_sender: self.peer_event_sender.clone(),
@@ -2885,6 +2888,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: point_100.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -2895,6 +2899,7 @@ mod tests {
                 peer_b,
                 PeerEvent::IntersectionFound {
                     point: point_101.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -2934,6 +2939,7 @@ mod tests {
                     id,
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
+                        initial: false,
                     },
                 )
                 .await;
@@ -2996,6 +3002,7 @@ mod tests {
                     id,
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
+                        initial: false,
                     },
                 )
                 .await;
@@ -3064,6 +3071,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: p100.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -3225,6 +3233,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: point.clone(),
+                    initial: false,
                 },
             )
             .await;
@@ -3286,6 +3295,7 @@ mod tests {
                 peer_a,
                 PeerEvent::IntersectionFound {
                     point: intersection.clone(),
+                    initial: false,
                 },
             )
             .await;

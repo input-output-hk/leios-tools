@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
 
 use net_core::multi_peer::types::{NetworkCommand, NetworkEvent};
-use net_core::multi_peer::{spawn_coordinator, CoordinatorConfig};
+use net_core::multi_peer::{spawn_coordinator, CoordinatorConfig, SyncMethodConfig};
 use net_core::types::{BlockBody, Point, WrappedHeader};
 
 /// Sample an exponential inter-arrival time: -ln(U) / λ
@@ -161,6 +161,7 @@ pub async fn run(
         tx_body_resolver: None,
         peer_rtt_observer: None,
         outbound_controls: None,
+        sync_method: SyncMethodConfig::default(),
     };
 
     let mut handle = spawn_coordinator(config);

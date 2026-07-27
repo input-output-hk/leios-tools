@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use net_core::multi_peer::types::{NetworkCommand, NetworkEvent};
-use net_core::multi_peer::{spawn_coordinator, CoordinatorConfig};
+use net_core::multi_peer::{spawn_coordinator, CoordinatorConfig, SyncMethodConfig};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -44,6 +44,7 @@ pub async fn run(
         tx_body_resolver: None,
         peer_rtt_observer: None,
         outbound_controls: None,
+        sync_method: SyncMethodConfig::default(),
     };
 
     let mut handle = spawn_coordinator(config);
