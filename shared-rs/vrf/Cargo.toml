@@ -1,0 +1,18 @@
+[package]
+name = "shared-vrf"
+version = "0.1.0"
+edition = "2021"
+description = "Cardano Praos draft-03 VRF (ECVRF-ED25519-SHA512-Elligator2) prover + verifier for the Leios block-production leader lottery. Thin byte-oriented wrapper over pallas_vrf."
+
+[dependencies]
+# Cardano-compatible draft-03 VRF. Pure-Rust (no C bindings), but consumed
+# as a git dependency pinned by rev — the same crate and rev Acropolis uses.
+# It is not published to crates.io and transitively pins a forked
+# curve25519-dalek (the Elligator2 sign-flip Cardano's draft-03 needs).
+# Pin-vs-vendor rationale: leios-adversarial-tools docs/block-production-plan.md.
+# Commit Cargo.lock so the resolved commits of pallas_vrf AND its dalek fork
+# stay reproducible even if the upstream branch moves or the repo disappears.
+pallas_vrf = { git = "https://github.com/txpipe/vrf", rev = "62ef4c7252ed05df98611da191e20c0dd144f025" }
+
+[dev-dependencies]
+hex = "0.4"
