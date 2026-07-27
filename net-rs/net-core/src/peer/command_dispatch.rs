@@ -4,7 +4,6 @@
 //! dispatch `PeerCommand`s to the same set of client protocol sub-tasks.
 //! This module provides a single implementation to avoid duplication.
 
-use shared_consensus::mempool::MempoolTx;
 use shared_consensus::PeerId;
 use tokio::sync::mpsc;
 
