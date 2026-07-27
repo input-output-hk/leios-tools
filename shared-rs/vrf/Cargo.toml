@@ -2,7 +2,7 @@
 name = "shared-vrf"
 version = "0.1.0"
 edition = "2021"
-description = "Cardano Praos draft-03 VRF (ECVRF-ED25519-SHA512-Elligator2) prover + verifier for the Leios block-production leader lottery. Thin byte-oriented wrapper over pallas_vrf."
+description = "Cardano Praos VRF for Leios block production: a byte-oriented draft-03 prover + verifier (over pallas_vrf), plus the `praos` leader-election glue (VRF input, leader-value derivation, and the exact stake-weighted leadership threshold)."
 
 [dependencies]
 # Cardano-compatible draft-03 VRF. Pure-Rust (no C bindings), but consumed
@@ -14,10 +14,17 @@ description = "Cardano Praos draft-03 VRF (ECVRF-ED25519-SHA512-Elligator2) prov
 # stay reproducible even if the upstream branch moves or the repo disappears.
 pallas_vrf = { git = "https://github.com/txpipe/vrf", rev = "62ef4c7252ed05df98611da191e20c0dd144f025" }
 
+# Praos leader-election glue (the `praos` module): the VRF input and
+# leader-value constructions (blake2b-256) and the exact leadership
+# threshold check. The threshold uses the same fixed-point Taylor
+# comparison as cardano-base, via `pallas-math` — pinned to the version
+# Acropolis validates the real chain with — rather than an f64
+# approximation, so the win/lose boundary matches the real node. These
+# Cardano-facing deps live here (node-only), not in `shared-consensus`
+# (which is shared with sim-rs and stays lean).
+blake2b_simd = "1"
+pallas-math = "=0.34.0"
+dashu-int = "0.4.1"
+
 [dev-dependencies]
 hex = "0.4"
-# Test-only: the Praos VRF-input and leader-value constructions (blake2b-256)
-# live above this pure primitive, but the mainnet interop KAT reconstructs
-# them to check `verify` against a real header. Keeps the crate itself
-# Cardano-agnostic.
-blake2b_simd = "1"

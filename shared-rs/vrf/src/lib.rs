@@ -25,6 +25,8 @@ use std::fmt;
 
 use pallas_vrf::vrf03::{PublicKey03, SecretKey03, VrfProof03};
 
+pub mod praos;
+
 /// Byte size of the secret seed.
 pub const SEED_SIZE: usize = 32;
 /// Byte size of the verification (public) key.
