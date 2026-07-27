@@ -87,6 +87,17 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
         ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
         ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
+        ActionSpec::AnnounceSizeLie {
+            scale_num,
+            scale_den,
+            offset,
+        } => Box::new(catalogue::AnnounceSizeLie::new(
+            *scale_num, *scale_den, *offset,
+        )),
+        ActionSpec::AnnounceDangling => Box::new(catalogue::AnnounceDangling),
+        ActionSpec::AnnounceEquivocate => Box::new(catalogue::AnnounceEquivocate),
+        ActionSpec::FakeAnnounce => Box::new(catalogue::FakeAnnounce),
+        ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
     }
 }
 

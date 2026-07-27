@@ -88,6 +88,34 @@ pub struct LeiosControl {
     pub offer_eb_size: EbSizePolicy,
     /// `false` = honest no-echo gate; `true` = reflect offers back to source.
     pub echo_to_source: bool,
+    /// Rewrite the `announced_eb` **size** baked into a produced RB header — the
+    /// announce-path counterpart of `offer_eb_size`. Applied at production (the
+    /// size lives inside the signed header, not a separate wire field), so the
+    /// `MsgLeiosBlockAnnouncement` advertises a size that disagrees with the
+    /// true EB body. Independent of `offer_eb_size`: lying on one surface but
+    /// not the other is itself a probe.
+    pub announce_eb_size: EbSizePolicy,
+    /// `true` = announce an EB (`MsgLeiosBlockAnnouncement`) but never serve its
+    /// body (suppress the `BlockOffer`/inject) — a dangling/phantom
+    /// announcement: peers try to fetch, waste the window, and the voting
+    /// deadline can lapse. Censorship/DoS via the announcement itself.
+    pub announce_dangling: bool,
+    /// `true` = emit a second `MsgLeiosBlockAnnouncement` with a different
+    /// `announced_eb` for the same election (OCIN equivocation, ≤ 2 rule).
+    pub announce_equivocate: bool,
+    /// `true` = emit a `MsgLeiosBlockAnnouncement` for a fabricated EB **without
+    /// winning the slot** — the node holds no stake and never produced the RB,
+    /// yet announces anyway (decoupled from the production lottery). Real nodes
+    /// reject the header at the VRF/KES check (only the elected leader can sign
+    /// a valid RB header); net-rs's fake validation may accept it. The sharpest
+    /// probe of the authorization gate.
+    pub fake_announce: bool,
+    /// `true` = **withhold** the EB announcement for EBs this node produces (the
+    /// `withhold-eb-block-announce` action). Normal behaviour (`false`) is to
+    /// announce every produced EB; this suppresses only the announcement — the
+    /// EB body / `MsgLeiosBlockOffer` is unaffected — censoring the fast
+    /// discovery pulse. Default `false` keeps `ControlSignal::default()` honest.
+    pub withhold_announce: bool,
 }
 
 /// Mempool-domain actuator inputs.

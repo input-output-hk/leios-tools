@@ -831,6 +831,9 @@ fn notification_to_ln_msg(n: &crate::store::leios_store::LeiosNotification) -> L
         LeiosNotification::BlockTxsOffer { point } => LnMsg::MsgLeiosBlockTxsOffer {
             point: point.clone(),
         },
+        LeiosNotification::BlockAnnouncement { header } => LnMsg::MsgLeiosBlockAnnouncement {
+            header: header.clone(),
+        },
         LeiosNotification::Votes { votes, .. } => LnMsg::MsgLeiosVotes {
             votes: votes.clone(),
         },
@@ -1024,6 +1027,16 @@ async fn next_outbound_notification(
                         eb_size,
                         ?sources,
                         "leios_notify: serving EB offer"
+                    );
+                }
+                LnMsg::MsgLeiosBlockAnnouncement { header } => {
+                    // Log the cheap parsed slot, not header.point() — the latter
+                    // recomputes a Blake2b hash of the raw CBOR every send.
+                    tracing::info!(
+                        peer = peer.0,
+                        slot = ?header.parsed.as_ref().map(|h| h.slot),
+                        ?sources,
+                        "leios_notify: serving EB announcement"
                     );
                 }
                 LnMsg::MsgLeiosBlockTxsOffer { point } => {
