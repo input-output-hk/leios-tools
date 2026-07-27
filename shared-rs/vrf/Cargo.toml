@@ -16,3 +16,8 @@ pallas_vrf = { git = "https://github.com/txpipe/vrf", rev = "62ef4c7252ed05df986
 
 [dev-dependencies]
 hex = "0.4"
+# Test-only: the Praos VRF-input and leader-value constructions (blake2b-256)
+# live above this pure primitive, but the mainnet interop KAT reconstructs
+# them to check `verify` against a real header. Keeps the crate itself
+# Cardano-agnostic.
+blake2b_simd = "1"
