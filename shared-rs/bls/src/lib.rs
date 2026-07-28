@@ -19,7 +19,9 @@
 use std::fmt;
 
 use blst::min_sig::{PublicKey, SecretKey, Signature};
-use leios_crypto_benchmarks::bls_vote::{check_pop, gen_sig, make_pop, verify_sig};
+use leios_crypto_benchmarks::bls_vote::{
+    check_pop, gen_cert_fa_pure, gen_sig, make_pop, verify_cert_fa_pure, verify_sig,
+};
 
 /// Byte size of a BLS secret key (a scalar).
 pub const SECRET_KEY_SIZE: usize = 32;
@@ -114,6 +116,47 @@ pub fn verify_vote_bytes(
 ) -> Result<bool, BlsError> {
     let pk = public_key_from_bytes(pubkey)?;
     verify_vote(&pk, eb_hash, slot, sig)
+}
+
+/// Aggregate a quorum's vote signatures into the single 48-byte G1 aggregate
+/// that is a CIP-0164 `leios_certificate`'s `aggregated_signature`. Under the
+/// testnet's StakeCentile committee every voter is persistent (no NPV), so the
+/// certificate reduces to this pure aggregate over the members' `sigma_m`
+/// (reference `bls_vote::gen_cert_fa_pure`). Errors on an empty set or a
+/// signature that does not decode.
+pub fn aggregate_votes(sigs: &[[u8; SIGNATURE_SIZE]]) -> Result<[u8; SIGNATURE_SIZE], BlsError> {
+    let parsed: Vec<Signature> = sigs
+        .iter()
+        .map(|s| {
+            Signature::from_bytes(s).map_err(|e| BlsError(format!("invalid signature: {e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&Signature> = parsed.iter().collect();
+    gen_cert_fa_pure(&refs)
+        .map(|s| s.to_bytes())
+        .map_err(|e| BlsError(format!("aggregation failed: {e:?}")))
+}
+
+/// Verify a certificate's aggregate signature against the set of signing
+/// members' verification keys, for endorser block `eb_hash` at election `slot`
+/// — the persistent-only (StakeCentile) certificate check (reference
+/// `bls_vote::verify_cert_fa_pure`). `pubkeys` must be exactly the members
+/// whose votes were aggregated. Returns `Ok(false)` for a valid-but-wrong
+/// certificate; `Err` if a key or the aggregate does not decode.
+pub fn verify_certificate(
+    pubkeys: &[[u8; PUBLIC_KEY_SIZE]],
+    eb_hash: &[u8; 32],
+    slot: u64,
+    aggregate: &[u8; SIGNATURE_SIZE],
+) -> Result<bool, BlsError> {
+    let pks: Vec<PublicKey> = pubkeys
+        .iter()
+        .map(public_key_from_bytes)
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg = Signature::from_bytes(aggregate)
+        .map_err(|e| BlsError(format!("invalid aggregate signature: {e:?}")))?;
+    Ok(verify_cert_fa_pure(&refs, &eid_bytes(slot), eb_hash, &agg))
 }
 
 /// Generate a proof of possession for a secret key: the two-signature PoP the
@@ -261,6 +304,45 @@ mod tests {
 
         let (mu1, mu2) = signer.proof_of_possession();
         assert_eq!(verify_proof_of_possession(&pk, &mu1, &mu2), Ok(true));
+    }
+
+    /// A quorum's vote signatures aggregate into a certificate that verifies
+    /// against exactly the signing members' keys — and fails for the wrong
+    /// election, a missing signer, or a tampered aggregate.
+    #[test]
+    fn certificate_aggregate_verifies_against_signer_set() {
+        let eb = [0x33u8; 32];
+        let slot = 77u64;
+        let signers: Vec<VoteSigner> = (0..4u8)
+            .map(|i| VoteSigner::generate(&[i + 20; 32]))
+            .collect();
+        let sigs: Vec<[u8; 48]> = signers.iter().map(|s| s.sign_vote(&eb, slot)).collect();
+        let pubkeys: Vec<[u8; 96]> = signers.iter().map(|s| s.public_key()).collect();
+
+        let agg = aggregate_votes(&sigs).expect("aggregate");
+        assert_eq!(verify_certificate(&pubkeys, &eb, slot, &agg), Ok(true));
+
+        // Wrong election parameters, or a missing signer's key, all fail.
+        assert_eq!(verify_certificate(&pubkeys, &eb, slot + 1, &agg), Ok(false));
+        assert_eq!(
+            verify_certificate(&pubkeys, &[0u8; 32], slot, &agg),
+            Ok(false)
+        );
+        assert_eq!(
+            verify_certificate(&pubkeys[..3], &eb, slot, &agg),
+            Ok(false),
+            "missing a signer's key"
+        );
+
+        // A tampered aggregate never verifies.
+        let mut bad = agg;
+        bad[0] ^= 0xff;
+        assert_ne!(verify_certificate(&pubkeys, &eb, slot, &bad), Ok(true));
+    }
+
+    #[test]
+    fn aggregate_rejects_empty_set() {
+        assert!(aggregate_votes(&[]).is_err());
     }
 
     /// A real registered-pool `bls.vkey` (public) loads from its cardano
