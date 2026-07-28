@@ -391,6 +391,17 @@ impl Elections {
             .unwrap_or(false)
     }
 
+    /// The EB context `(eb_hash, eb_slot)` for the election an announcing RB
+    /// started, if one exists. `eb_slot` is the announcing RB's slot (the EB
+    /// carries no separate slot). Together these reconstruct exactly what a
+    /// vote's signer signed — so a receiver can BLS-verify an inbound vote
+    /// carrying only `announcing_rb_hash`.
+    pub fn eb_context(&self, announcing_rb_hash: &[u8; 32]) -> Option<([u8; 32], u64)> {
+        self.elections
+            .get(announcing_rb_hash)
+            .map(|e| (e.eb_hash, e.announced_slot))
+    }
+
     /// True iff *any* election that announced `eb_hash` has its body
     /// validated locally. Used where only the EB hash is known (the
     /// cert-safety gate keyed off a chain-committed cert), independent
