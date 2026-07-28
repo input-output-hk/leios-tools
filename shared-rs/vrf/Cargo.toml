@@ -9,9 +9,10 @@ description = "Cardano Praos VRF for Leios block production: a byte-oriented dra
 # as a git dependency pinned by rev — the same crate and rev Acropolis uses.
 # It is not published to crates.io and transitively pins a forked
 # curve25519-dalek (the Elligator2 sign-flip Cardano's draft-03 needs).
-# Pin-vs-vendor rationale: leios-adversarial-tools docs/block-production-plan.md.
-# Commit Cargo.lock so the resolved commits of pallas_vrf AND its dalek fork
-# stay reproducible even if the upstream branch moves or the repo disappears.
+# We pin by rev (rather than vendoring) to track exactly what Acropolis
+# validates with; commit Cargo.lock so the resolved commits of pallas_vrf AND
+# its dalek fork stay reproducible even if the upstream branch moves or the
+# repo disappears.
 pallas_vrf = { git = "https://github.com/txpipe/vrf", rev = "62ef4c7252ed05df98611da191e20c0dd144f025" }
 
 # Praos leader-election glue (the `praos` module): the VRF input and

@@ -14,7 +14,7 @@
 //! cardano-base — via `pallas-math`, pinned to the version Acropolis
 //! validates the real chain with — rather than the f64 approximation in
 //! `shared_consensus::lottery`, so the win/lose boundary matches a real
-//! validator exactly. See the block-production plan, item 5.
+//! validator exactly.
 
 use blake2b_simd::Params as Blake2b;
 use dashu_int::UBig;
@@ -53,7 +53,7 @@ pub fn mk_vrf_input(slot: u64, epoch_nonce: &[u8; 32]) -> [u8; 32] {
 /// `pallas-primitives::derive_tagged_vrf_output`, inlined (four spec-fixed
 /// lines) rather than pulling `pallas-primitives`. The result is the 32-byte
 /// certified natural fed to [`is_slot_leader`].
-pub fn leader_value(vrf_output: &[u8]) -> [u8; 32] {
+pub fn leader_value(vrf_output: &crate::Output) -> [u8; 32] {
     blake2b256(&[&[LEADER_TAG], vrf_output])
 }
 
@@ -67,7 +67,8 @@ pub fn leader_value(vrf_output: &[u8]) -> [u8; 32] {
 /// `1/q < exp(−σ·ln(1−f))` with `q = 1 − p`, evaluated with the
 /// fixed-point Taylor comparison `exp_cmp` (identical parameters to
 /// Acropolis `validate_vrf_leader_value`, so the boundary matches the real
-/// node). Returns `false` for zero stake or zero total stake.
+/// node). Returns `false` (fail-closed) for zero stake, zero total stake, or
+/// an out-of-range active-slot coefficient (`f` must satisfy `0 < f < 1`).
 pub fn is_slot_leader(
     leader_value: &[u8; 32],
     stake: u64,
@@ -76,6 +77,13 @@ pub fn is_slot_leader(
     f_den: u64,
 ) -> bool {
     if stake == 0 || total_stake == 0 {
+        return false;
+    }
+    // Guard against an invalid active-slot coefficient. `f == 0` (f_num == 0)
+    // would make ln(1 - f) == 0 and the exp_cmp below spuriously report a
+    // leader; `f >= 1` (f_num >= f_den) makes ln(1 - f) undefined; `f_den == 0`
+    // divides by zero. A valid Praos `f` is strictly between 0 and 1.
+    if f_den == 0 || f_num == 0 || f_num >= f_den {
         return false;
     }
     // certNat and certNatMax = 2^(len*8) = 2^256 for the 32-byte Praos value.
@@ -174,5 +182,18 @@ mod tests {
         let lv = leader_value(&out);
         assert!(!is_slot_leader(&lv, 0, TOTAL_STAKE, 1, 20));
         assert!(!is_slot_leader(&lv, POOL_STAKE, 0, 1, 20));
+    }
+
+    #[test]
+    fn invalid_f_is_not_a_leader() {
+        // An out-of-range active-slot coefficient must fail closed rather than
+        // panic (f_den == 0) or produce undefined math (f == 0 spuriously
+        // reports a leader; f >= 1 makes ln(1 - f) undefined).
+        let out: [u8; 64] = arr(OUTPUT);
+        let lv = leader_value(&out);
+        assert!(!is_slot_leader(&lv, POOL_STAKE, TOTAL_STAKE, 1, 0)); // f_den == 0
+        assert!(!is_slot_leader(&lv, POOL_STAKE, TOTAL_STAKE, 0, 20)); // f == 0
+        assert!(!is_slot_leader(&lv, POOL_STAKE, TOTAL_STAKE, 20, 20)); // f == 1
+        assert!(!is_slot_leader(&lv, POOL_STAKE, TOTAL_STAKE, 21, 20)); // f > 1
     }
 }

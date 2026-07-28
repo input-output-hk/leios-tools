@@ -14,12 +14,10 @@
 //! - 80-byte proof,
 //! - 64-byte VRF output.
 //!
-//! For Praos leader election the VRF input (`alpha`) is the epoch nonce
-//! concatenated with the slot (and the domain-separation tag); this crate
-//! is agnostic to how `alpha` is built and just evaluates over the bytes.
-//!
-//! Dependency choice (git-pin vs vendor) is recorded in the block-production
-//! plan under "VRF dependency — pin vs vendor".
+//! For Praos leader election the VRF input (`alpha`) is a Blake2b-256 hash of
+//! the slot and the epoch nonce (see [`praos::mk_vrf_input`] for the exact
+//! Babbage+ construction). This crate is agnostic to how `alpha` is built and
+//! just evaluates over the bytes.
 
 use std::fmt;
 
