@@ -63,37 +63,55 @@ fn strip_cbor_bstr(cbor: &[u8], len: usize) -> Result<&[u8], BlsError> {
 
 /// Load a secret key from a cardano `bls.skey` `cborHex` payload (a CBOR byte
 /// string of the 32-byte scalar).
-pub fn secret_key_from_cardano(cbor: &[u8]) -> Result<SecretKey, BlsError> {
+///
+/// Internal: the public entry point is [`VoteSigner::from_cardano`], which keeps
+/// the `blst` secret-key type out of the caller's hands.
+pub(crate) fn secret_key_from_cardano(cbor: &[u8]) -> Result<SecretKey, BlsError> {
     let raw = strip_cbor_bstr(cbor, SECRET_KEY_SIZE)?;
     SecretKey::from_bytes(raw).map_err(|e| BlsError(format!("invalid bls secret key: {e:?}")))
 }
 
 /// Load a verification key from a cardano `bls.vkey` `cborHex` payload (a CBOR
 /// byte string of the 96-byte compressed G2 point).
-pub fn public_key_from_cardano(cbor: &[u8]) -> Result<PublicKey, BlsError> {
+///
+/// Internal: the public, byte-oriented entry point is
+/// [`public_key_bytes_from_cardano`].
+pub(crate) fn public_key_from_cardano(cbor: &[u8]) -> Result<PublicKey, BlsError> {
     let raw = strip_cbor_bstr(cbor, PUBLIC_KEY_SIZE)?;
     PublicKey::from_bytes(raw).map_err(|e| BlsError(format!("invalid bls public key: {e:?}")))
 }
 
+/// Load a verification key from a cardano `bls.vkey` `cborHex` payload, as the
+/// raw 96-byte compressed G2 encoding. Validates that the payload decodes to a
+/// valid point; returns its canonical compressed bytes — the `bls_key` a node
+/// registers and later checks votes against.
+pub fn public_key_bytes_from_cardano(cbor: &[u8]) -> Result<[u8; PUBLIC_KEY_SIZE], BlsError> {
+    Ok(public_key_from_cardano(cbor)?.to_bytes())
+}
+
 /// Load a verification key from its raw 96-byte compressed encoding.
-pub fn public_key_from_bytes(bytes: &[u8; PUBLIC_KEY_SIZE]) -> Result<PublicKey, BlsError> {
+pub(crate) fn public_key_from_bytes(bytes: &[u8; PUBLIC_KEY_SIZE]) -> Result<PublicKey, BlsError> {
     PublicKey::from_bytes(bytes).map_err(|e| BlsError(format!("invalid bls public key: {e:?}")))
 }
 
 /// Derive the verification key (compressed G2) for a secret key.
-pub fn public_key_of(sk: &SecretKey) -> [u8; PUBLIC_KEY_SIZE] {
+pub(crate) fn public_key_of(sk: &SecretKey) -> [u8; PUBLIC_KEY_SIZE] {
     sk.sk_to_pk().to_bytes()
 }
 
 /// Sign a Leios vote: the endorser-block hash `eb_hash` under `DST = b"Leios"`
 /// augmented by the election id (`slot`). Returns the 48-byte G1 signature —
 /// the `vote_signature` on the wire (reference `bls_vote::gen_sig`).
-pub fn sign_vote(sk: &SecretKey, eb_hash: &[u8; 32], slot: u64) -> [u8; SIGNATURE_SIZE] {
+///
+/// Internal: the public entry point is [`VoteSigner::sign_vote`].
+pub(crate) fn sign_vote(sk: &SecretKey, eb_hash: &[u8; 32], slot: u64) -> [u8; SIGNATURE_SIZE] {
     gen_sig(sk, &eid_bytes(slot), eb_hash).to_bytes()
 }
 
 /// Verify a single Leios vote signature against a voter's verification key.
-pub fn verify_vote(
+///
+/// Internal: the public, byte-oriented entry point is [`verify_vote_bytes`].
+pub(crate) fn verify_vote(
     pk: &PublicKey,
     eb_hash: &[u8; 32],
     slot: u64,
@@ -162,13 +180,20 @@ pub fn verify_certificate(
 /// Generate a proof of possession for a secret key: the two-signature PoP the
 /// Leios registration uses (reference `bls_vote::make_pop`). Returns
 /// `(mu1, mu2)` as 48-byte G1 signatures.
-pub fn make_proof_of_possession(sk: &SecretKey) -> ([u8; SIGNATURE_SIZE], [u8; SIGNATURE_SIZE]) {
+///
+/// Internal: the public entry point is [`VoteSigner::proof_of_possession`].
+pub(crate) fn make_proof_of_possession(
+    sk: &SecretKey,
+) -> ([u8; SIGNATURE_SIZE], [u8; SIGNATURE_SIZE]) {
     let (mu1, mu2) = make_pop(sk);
     (mu1.to_bytes(), mu2.to_bytes())
 }
 
 /// Verify a proof of possession against a verification key.
-pub fn verify_proof_of_possession(
+///
+/// Internal: the public, byte-oriented entry point is
+/// [`verify_proof_of_possession_bytes`].
+pub(crate) fn verify_proof_of_possession(
     pk: &PublicKey,
     mu1: &[u8; SIGNATURE_SIZE],
     mu2: &[u8; SIGNATURE_SIZE],
@@ -176,6 +201,19 @@ pub fn verify_proof_of_possession(
     let s1 = Signature::from_bytes(mu1).map_err(|e| BlsError(format!("invalid pop mu1: {e:?}")))?;
     let s2 = Signature::from_bytes(mu2).map_err(|e| BlsError(format!("invalid pop mu2: {e:?}")))?;
     Ok(check_pop(pk, &s1, &s2))
+}
+
+/// Verify a proof of possession from a voter's raw 96-byte verification key —
+/// the byte-oriented form a node uses to check a registering pool's PoP against
+/// its `bls_key`. Returns `Ok(false)` for a valid-but-wrong PoP, `Err` if the
+/// key or either signature does not decode.
+pub fn verify_proof_of_possession_bytes(
+    pubkey: &[u8; PUBLIC_KEY_SIZE],
+    mu1: &[u8; SIGNATURE_SIZE],
+    mu2: &[u8; SIGNATURE_SIZE],
+) -> Result<bool, BlsError> {
+    let pk = public_key_from_bytes(pubkey)?;
+    verify_proof_of_possession(&pk, mu1, mu2)
 }
 
 /// A node's BLS vote signing key — an opaque owner of the secret scalar that
@@ -356,5 +394,25 @@ mod tests {
         );
         let pk = public_key_from_cardano(&vkey_cbor).expect("load vkey");
         assert_eq!(&pk.to_bytes()[..], &vkey_cbor[2..]);
+        // The public byte-oriented loader yields the same canonical 96 bytes.
+        let pk_bytes = public_key_bytes_from_cardano(&vkey_cbor).expect("load vkey bytes");
+        assert_eq!(&pk_bytes[..], &vkey_cbor[2..]);
+    }
+
+    /// The byte-oriented PoP verify (raw 96-byte key) agrees with signing, and
+    /// rejects a different key — the public surface a node uses at registration.
+    #[test]
+    fn proof_of_possession_bytes_round_trip() {
+        let signer = VoteSigner::generate(&[6u8; 32]);
+        let (mu1, mu2) = signer.proof_of_possession();
+        assert_eq!(
+            verify_proof_of_possession_bytes(&signer.public_key(), &mu1, &mu2),
+            Ok(true)
+        );
+        let other = VoteSigner::generate(&[7u8; 32]);
+        assert_eq!(
+            verify_proof_of_possession_bytes(&other.public_key(), &mu1, &mu2),
+            Ok(false)
+        );
     }
 }

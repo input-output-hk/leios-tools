@@ -13,8 +13,12 @@ description = "Cardano Leios BLS votes + certificates: a byte-oriented wrapper o
 # Cargo.lock so blst and the transitive tree stay reproducible.
 leios_crypto_benchmarks = { git = "https://github.com/input-output-hk/ouroboros-leios", rev = "a68e83f779592f54c5e9543d43c5dd90dde851d0" }
 # The curve library itself, for the min-sig key/signature types the reference's
-# vote functions take. Same version the reference pins, so no duplicate build.
-blst = "0.3.13"
+# vote functions take. Pinned exactly (like the sibling wrappers pin their core
+# primitive: `pallas-math`, `kes-summed-ed25519`) so a path-dep consumer — whose
+# own Cargo.lock, not this workspace's, governs resolution — can't silently pull
+# a different blst patch and change the produced bytes/ABI. `=0.3.17` satisfies
+# the reference's `^0.3.13`, so the two still unify to one blst build.
+blst = "=0.3.17"
 
 [dev-dependencies]
 hex = "0.4"
