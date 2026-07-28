@@ -753,12 +753,16 @@ fn parse_behaviour(id: &str, t: &toml::Table) -> Result<RawBehaviour, ConfigErro
                 })?
                 .clone();
             // Kept as raw `(kind, params)`; the domain action binder builds the
-            // concrete leaf. An absent/mistyped `kind` is left for the binder to
-            // report (consensus [`parse`] deserialises eagerly to catch it).
+            // concrete leaf from them. `kind` itself is structural, so an absent
+            // or non-string one is rejected here rather than reaching a binder as
+            // an empty kind (which every binder would have to re-validate).
             let kind = params
                 .get("kind")
                 .and_then(toml::Value::as_str)
-                .unwrap_or_default()
+                .ok_or_else(|| ConfigError::BadField {
+                    id: id.to_string(),
+                    msg: "Action `spec` must have a string `kind`".to_string(),
+                })?
                 .to_string();
             Ok(RawBehaviour::Action { kind, params })
         }
@@ -793,7 +797,9 @@ fn children(id: &str, t: &toml::Table) -> Result<Vec<BehaviourId>, ConfigError> 
 mod tests {
     use super::*;
     use crate::behaviour::tree::control::{EbSizePolicy, OutboundControl, VotePolicy};
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState, TickCtx};
+    use crate::behaviour::tree::env::{
+        DynamicEnv, NativeChainState, ParamOverrides, TickCtx, TreeContext,
+    };
     use crate::behaviour::tree::Status;
     use crate::behaviour::RbProductionStrategy;
     use crate::leios::NoVoteReason;
@@ -1254,6 +1260,204 @@ spec = { kind = "lazy-voter" }
             let rb = tick_at(&mut b, slot);
             assert_eq!(ra.0, rb.0, "status diverged at slot {slot}");
             assert_eq!(ra.1, rb.1, "control signal diverged at slot {slot}");
+        }
+    }
+
+    // ---- Generic entrypoints: a non-consensus instantiation ----
+    //
+    // A minimal second instantiation proves `parse_generic` + `compile_with`
+    // are usable without any consensus type: `Effect` is a counter, the
+    // context view carries one number the condition compares against, and the
+    // binders understand a single leaf kind and a single condition form.
+
+    /// The toy instantiation's per-tick view: one readable number.
+    #[derive(Debug)]
+    struct ToyView(u64);
+
+    impl ParamOverrides for ToyView {
+        fn action_overrides(&self, _behaviour_id: &str) -> Vec<(String, toml::Value)> {
+            Vec::new()
+        }
+    }
+
+    /// The toy instantiation marker.
+    #[derive(Debug)]
+    enum ToyCtx {}
+
+    impl TreeContext for ToyCtx {
+        type View<'a> = ToyView;
+    }
+
+    /// Leaf that bumps the effect counter while active.
+    #[derive(Debug)]
+    struct Bump(u64);
+
+    impl LeafAction<ToyCtx, u64> for Bump {
+        fn contribute(&mut self, _ctx: &ToyView, out: &mut u64) -> Status {
+            *out += self.0;
+            Status::Running
+        }
+    }
+
+    /// Condition `value >= n`.
+    #[derive(Debug)]
+    struct AtLeast(u64);
+
+    impl Condition<ToyCtx> for AtLeast {
+        fn eval(&self, ctx: &ToyView) -> bool {
+            ctx.0 >= self.0
+        }
+    }
+
+    fn toy_action(
+        kind: &str,
+        params: &toml::Table,
+        _seed: u64,
+    ) -> Result<Box<dyn LeafAction<ToyCtx, u64>>, ConfigError> {
+        match kind {
+            "bump" => {
+                let by = params
+                    .get("by")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(1);
+                Ok(Box::new(Bump(by as u64)))
+            }
+            other => Err(ConfigError::ActionSpec {
+                id: String::new(), // left blank: `attach_id` fills the behaviour id
+                msg: format!("unknown toy kind {other:?}"),
+            }),
+        }
+    }
+
+    fn toy_condition(src: &str) -> Result<Box<dyn Condition<ToyCtx>>, ConfigError> {
+        // Only `value >= <int>` is understood.
+        match src
+            .strip_prefix("value >= ")
+            .and_then(|n| n.trim().parse().ok())
+        {
+            Some(n) => Ok(Box::new(AtLeast(n))),
+            None => Err(ConfigError::Condition {
+                id: String::new(), // left blank: `attach_id` fills the behaviour id
+                msg: format!("unsupported toy condition {src:?}"),
+            }),
+        }
+    }
+
+    const TOY: &str = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Selector"
+children = ["gate", "work"]
+[behaviours.gate]
+type = "Condition"
+expression = "value >= 10"
+[behaviours.work]
+type = "Action"
+spec = { kind = "bump", by = 3 }
+"#;
+
+    #[test]
+    fn compile_with_builds_a_non_consensus_instantiation() {
+        let cfg = BtConfig::parse_generic(TOY).unwrap();
+        let mut tree = cfg.compile_with(toy_action, toy_condition).unwrap();
+
+        // Gate false (value < 10) → the selector falls through to the leaf,
+        // which bumps the effect by its `by` param.
+        let (status, out) = tree.tick(&ToyView(0));
+        assert_eq!(status, Status::Running);
+        assert_eq!(out, 3);
+
+        // Gate true → the condition succeeds and the leaf never contributes.
+        let (status, out) = tree.tick(&ToyView(10));
+        assert_eq!(status, Status::Success);
+        assert_eq!(out, 0);
+    }
+
+    #[test]
+    fn compile_with_tags_binder_errors_with_the_behaviour_id() {
+        // An action kind the toy binder doesn't know: the binder returns a
+        // blank-id error and `attach_id` fills in the offending behaviour.
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Action"
+spec = { kind = "nope" }
+"#;
+        let cfg = BtConfig::parse_generic(text).unwrap();
+        let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
+        match err {
+            ConfigError::ActionSpec { id, msg } => {
+                assert_eq!(id, "root", "binder error must carry the behaviour id");
+                assert!(msg.contains("nope"), "msg should name the kind: {msg}");
+            }
+            other => panic!("expected ActionSpec, got {other:?}"),
+        }
+
+        // Same for a condition the toy binder can't parse.
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Condition"
+expression = "cardano.current_slot >= 1"
+"#;
+        let cfg = BtConfig::parse_generic(text).unwrap();
+        let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
+        match err {
+            ConfigError::Condition { id, .. } => assert_eq!(id, "root"),
+            other => panic!("expected Condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_generic_is_structural_where_consensus_parse_is_eager() {
+        // A leaf kind that means nothing to consensus: `parse_generic` accepts
+        // it (structure is fine; the binder decides), while the consensus
+        // `parse` rejects it eagerly.
+        assert!(BtConfig::parse_generic(TOY).is_ok());
+        assert!(BtConfig::parse(TOY).is_err());
+
+        // Structural validation still applies to both: an undefined child is a
+        // hard error regardless of instantiation.
+        let missing_child = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Sequence"
+children = ["ghost"]
+"#;
+        let cfg = BtConfig::parse_generic(missing_child).unwrap();
+        assert!(cfg.validate_structure().is_err());
+        assert!(cfg.compile_with(toy_action, toy_condition).is_err());
+    }
+
+    #[test]
+    fn action_spec_without_a_string_kind_is_a_structural_error() {
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Action"
+spec = { by = 3 }
+"#;
+        match BtConfig::parse_generic(text) {
+            Err(ConfigError::BadField { id, msg }) => {
+                assert_eq!(id, "root");
+                assert!(msg.contains("kind"), "msg should mention `kind`: {msg}");
+            }
+            other => panic!("expected BadField for the missing kind, got {other:?}"),
         }
     }
 }

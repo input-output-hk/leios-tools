@@ -34,8 +34,15 @@ GAT — `type View<'a>` — because the per-tick context borrows), and
 instantiation can reuse the whole engine and TOML grammar with its own
 `C`/`E` and its own leaves/conditions, without touching the consensus one.
 
-Not yet generic: the `config.rs` TOML compiler still builds only the
-consensus instantiation.
+The TOML compiler is generic too: `BtConfig::compile_with(action_binder,
+condition_binder)` compiles the same grammar into any `BehaviourTree<C, E>` —
+the caller supplies how a leaf `kind` and a condition string become its own
+leaves/conditions. `compile()` is the consensus binding of that entry.
+
+What remains consensus-specific: the eager `parse` (which type-checks `[env]`
+values and validates `cardano.*` refs up front) and the consensus leaf/condition
+vocabularies. Other instantiations use `parse_generic` (structural validation
+only) and validate their own refs in their binder.
 
 ## Hook taxonomy
 

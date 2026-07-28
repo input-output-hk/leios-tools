@@ -18,11 +18,13 @@
 //! number    := DIGITS ("." DIGITS)?       (float when a fraction is present)
 //! ```
 //!
-//! Conditions are parsed and type-validated at load time; a referenced-but-
-//! undefined `env.X`, an unknown `cardano.X`, or a type mismatch is a hard
-//! load-time error. Membership (`.contains`) is string containment over the
-//! string-typed values (collection chain fields arrive when a condition needs
-//! them).
+//! Conditions are always parsed at load time (a syntax error is a hard load-time
+//! error). Reference *type-validation* is per instantiation: in the consensus
+//! instantiation a referenced-but-undefined `env.X`, an unknown `cardano.X`, or a
+//! type mismatch is also a hard load-time error; another instantiation validates
+//! its own refs in its condition binder instead. Membership (`.contains`) is
+//! string containment over the string-typed values (collection chain fields
+//! arrive when a condition needs them).
 //!
 //! The value refs a condition resolves are context-dependent: the consensus
 //! instantiation resolves `env.*`/`cardano.*` (and returns `None` for the
