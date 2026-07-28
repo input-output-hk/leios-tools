@@ -111,6 +111,38 @@ impl KesSigner {
         Self { buf, vkey }
     }
 
+    /// Import a serialized KES key: the [`SK_SIZE`]-byte owned-buffer form
+    /// (secret material + 4-byte big-endian period trailer). Errors if it does
+    /// not decode as a Sum6 key. The verification key is recovered from the
+    /// key material, so the imported signer knows its own `hot_vkey`.
+    pub fn from_bytes(buf: &[u8; SK_SIZE]) -> Result<Self, KesError> {
+        // `from_bytes` borrows and (on drop) zeroizes its buffer, so decode a
+        // scratch copy to read the vkey and keep our own owned copy.
+        let mut scratch = *buf;
+        let vkey = {
+            let sk = Sum6Kes::from_bytes(&mut scratch).map_err(|_| KesError)?;
+            vkey_bytes(&sk.to_pk())
+        };
+        Ok(Self { buf: *buf, vkey })
+    }
+
+    /// Import a cardano-node `kes.skey` payload — the 608-byte raw Sum6 secret
+    /// key with **no** period trailer — as a key at KES period `period`.
+    /// cardano-cli `node key-gen-KES` writes the key at period 0; this appends
+    /// the 4-byte big-endian period trailer the upstream crate stores after
+    /// the key material (the documented ±4 conversion). Errors if `raw` is not
+    /// 608 bytes or does not decode.
+    pub fn from_cardano_skey(raw: &[u8], period: u32) -> Result<Self, KesError> {
+        const RAW_SIZE: usize = SK_SIZE - 4;
+        if raw.len() != RAW_SIZE {
+            return Err(KesError);
+        }
+        let mut buf = [0u8; SK_SIZE];
+        buf[..RAW_SIZE].copy_from_slice(raw);
+        buf[RAW_SIZE..].copy_from_slice(&period.to_be_bytes());
+        Self::from_bytes(&buf)
+    }
+
     /// The current KES period (`0..=63`), read from the key's period trailer.
     pub fn period(&self) -> u32 {
         let mut p = [0u8; 4];
@@ -225,6 +257,35 @@ mod tests {
         assert_eq!(a.vkey(), b.vkey());
         assert_eq!(a.as_bytes(), b.as_bytes());
         assert_eq!(a.period(), 0);
+    }
+
+    /// A generated key survives a serialize → `from_bytes` round-trip: same
+    /// vkey, same bytes, still signs verifiably.
+    #[test]
+    fn from_bytes_round_trips() {
+        let signer = KesSigner::generate(&[13u8; SEED_SIZE]);
+        let buf: &[u8; SK_SIZE] = signer.as_bytes().try_into().unwrap();
+        let reloaded = KesSigner::from_bytes(buf).expect("re-import");
+        assert_eq!(reloaded.vkey(), signer.vkey());
+        assert_eq!(reloaded.as_bytes(), signer.as_bytes());
+        let msg = b"reload";
+        assert!(verify(0, &reloaded.vkey(), msg, &reloaded.sign(msg)).is_ok());
+    }
+
+    /// A cardano-style 608-byte raw key (no period trailer) imports with the
+    /// vkey recovered; a wrong length is rejected.
+    #[test]
+    fn from_cardano_skey_appends_period() {
+        let signer = KesSigner::generate(&[17u8; SEED_SIZE]);
+        let raw = &signer.as_bytes()[..SK_SIZE - 4];
+        let imported = KesSigner::from_cardano_skey(raw, 0).expect("import raw");
+        assert_eq!(
+            imported.vkey(),
+            signer.vkey(),
+            "vkey recovered from raw key"
+        );
+        assert_eq!(imported.period(), 0);
+        assert!(KesSigner::from_cardano_skey(&raw[..600], 0).is_err());
     }
 
     /// Sign at period 0 → verify at period 0 round-trips; the same signature

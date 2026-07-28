@@ -150,4 +150,32 @@ mod tests {
         let b = ColdKey::from_seed(&[7u8; 32]);
         assert_eq!(a.vkey(), b.vkey());
     }
+
+    fn h<const N: usize>(s: &str) -> [u8; N] {
+        let mut out = [0u8; N];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
+    }
+
+    /// Cross-implementation KAT: a real operational certificate issued by
+    /// cardano-cli for the registered Leios-testnet "Red Team" stake pool
+    /// (`opcert.cert` / `cold.vkey`, all public). Our `verify_ocert` must
+    /// accept its cold-key signature — proving our `OCertSignable` byte layout
+    /// matches cardano-node's. Fields decoded from the op-cert 4-tuple
+    /// `[hot_vkey, counter=0, kes_period=8, sigma]`.
+    #[test]
+    fn real_testnet_opcert_verifies() {
+        let hot: [u8; 32] = h("6279829ec28b4e1beb2585f9325a98ef39adeb22dd81f7c1df5bd04195db5cf8");
+        let cold: [u8; 32] = h("21a6246cfc5b2e26c9dddb5be30e0f98e2ddebf0858ad80ba62246d75bf1d12a");
+        let sigma: [u8; 64] = h(
+            "9931caf5b87ca3b137e4f52dc1901cd78101d45f6b773d9b0d829036f4f925fd\
+             facf4ee5341beb70e691962abb6669030751d97016a50018bebf92cf03359a06",
+        );
+        assert!(verify_ocert(&cold, &hot, 0, 8, &sigma).is_ok());
+        // Tampering any field breaks it.
+        assert!(verify_ocert(&cold, &hot, 1, 8, &sigma).is_err());
+        assert!(verify_ocert(&cold, &hot, 0, 9, &sigma).is_err());
+    }
 }
