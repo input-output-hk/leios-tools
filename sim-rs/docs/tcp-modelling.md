@@ -6,6 +6,11 @@ single enum — `ConnectionKind` in `sim-core/src/network/connection.rs` — and
 selected from configuration by `ConnectionKind::from_config`
 (`connection.rs:761`).
 
+> **Path convention.** Unless otherwise noted, source paths below (`sim-core/…`,
+> `parameters/…`, bare `connection.rs`/`config.rs`/`tcp.rs`) are relative to the
+> `sim-rs/` directory that contains this doc. The exception is `shared-rs/…`,
+> which lives at the repository root, alongside `sim-rs/`.
+
 ```rust
 pub enum ConnectionKind<TProtocol, TMessage> {
     /// Latency + fair-bandwidth-sharing model.
@@ -18,9 +23,9 @@ pub enum ConnectionKind<TProtocol, TMessage> {
 The analytic "envelope" model is not a third enum variant: it attaches on top of
 `Simple` (`ConnectionKind::from_config` → `Connection::with_envelope`).
 
-`use-tcp` (the congestion-window model) and `tcp-envelope` are **mutually
-exclusive** — if `use-tcp` is on, any configured envelope is ignored
-(`debug_assert!` at `connection.rs:768`).
+`tcp-congestion-control` (the congestion-window model; internal bool `use_tcp`)
+and `tcp-envelope` are **mutually exclusive** — if `tcp-congestion-control` is
+on, any configured envelope is ignored (`debug_assert!` at `connection.rs:768`).
 
 ---
 
@@ -35,7 +40,8 @@ exclusive** — if `use-tcp` is on, any configured envelope is ignored
 - If a link has **no** `bandwidth-bytes-per-second`, it is **latency-only**
   (instant serialisation) — `Connection::send`, `connection.rs:164`.
 - No congestion window or slow-start of its own.
-- This is the fallback whenever `use-tcp` is false and no envelope is attached.
+- This is the fallback whenever `tcp-congestion-control` is false and no
+  envelope is attached.
 
 ### 2. TCP congestion-window model
 
@@ -108,11 +114,12 @@ The envelope model is off unless you explicitly add a `tcp-envelope` block
 loss component is inert until you raise `loss-prob-per-segment` above its `0.0`
 default.
 
-> **No example configs exercise these knobs.** The only real occurrence in the
-> repo is the `true` in `config.default.yaml`. No config under `parameters/`,
-> `test_data/`, or `sim-cli/configs/` sets a `tcp-envelope` block or flips the
-> flag — envelope usage lives only in unit tests
-> (`connection.rs`, `config.rs` `tcp_envelope_tests`).
+> **No example configs exercise these knobs.** The only real occurrences are
+> the `true` in the two shipped defaults — `sim-rs/parameters/config.default.yaml`
+> and the byte-identical copy at the repo root, `data/simulation/config.default.yaml`.
+> No config under `parameters/`, `test_data/`, or `sim-cli/configs/` sets a
+> `tcp-envelope` block or flips the flag — envelope usage lives only in unit
+> tests (`connection.rs`, `config.rs` `tcp_envelope_tests`).
 
 ---
 
