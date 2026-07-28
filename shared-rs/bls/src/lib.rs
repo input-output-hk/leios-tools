@@ -102,6 +102,20 @@ pub fn verify_vote(
     Ok(verify_sig(pk, &eid_bytes(slot), eb_hash, &s))
 }
 
+/// Verify a single Leios vote from a voter's raw 96-byte verification key —
+/// the byte-oriented form a node uses to check inbound votes against the
+/// committee's registered `bls_key`s. Returns `Ok(false)` for a valid-but-
+/// wrong signature, `Err` if the key or signature does not decode.
+pub fn verify_vote_bytes(
+    pubkey: &[u8; PUBLIC_KEY_SIZE],
+    eb_hash: &[u8; 32],
+    slot: u64,
+    sig: &[u8; SIGNATURE_SIZE],
+) -> Result<bool, BlsError> {
+    let pk = public_key_from_bytes(pubkey)?;
+    verify_vote(&pk, eb_hash, slot, sig)
+}
+
 /// Generate a proof of possession for a secret key: the two-signature PoP the
 /// Leios registration uses (reference `bls_vote::make_pop`). Returns
 /// `(mu1, mu2)` as 48-byte G1 signatures.
@@ -119,6 +133,61 @@ pub fn verify_proof_of_possession(
     let s1 = Signature::from_bytes(mu1).map_err(|e| BlsError(format!("invalid pop mu1: {e:?}")))?;
     let s2 = Signature::from_bytes(mu2).map_err(|e| BlsError(format!("invalid pop mu2: {e:?}")))?;
     Ok(check_pop(pk, &s1, &s2))
+}
+
+/// A node's BLS vote signing key — an opaque owner of the secret scalar that
+/// signs Leios votes and proofs of possession, keeping `blst` out of the
+/// caller's types. Loaded from a cardano `bls.skey` envelope.
+pub struct VoteSigner {
+    sk: SecretKey,
+}
+
+impl VoteSigner {
+    /// Load from a cardano `bls.skey` `cborHex` payload.
+    pub fn from_cardano(cbor: &[u8]) -> Result<Self, BlsError> {
+        Ok(Self {
+            sk: secret_key_from_cardano(cbor)?,
+        })
+    }
+
+    /// Deterministically generate a signer from 32 bytes of input key material
+    /// (RFC-9380 `KeyGen`). For dev/test identities; real nodes load a
+    /// registered `bls.skey` via [`from_cardano`](Self::from_cardano).
+    pub fn generate(ikm: &[u8; 32]) -> Self {
+        Self {
+            sk: SecretKey::key_gen(ikm, &[]).expect("32-byte ikm yields a valid key"),
+        }
+    }
+
+    /// The 96-byte compressed G2 verification key (the pool's `bls.vkey`).
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_SIZE] {
+        public_key_of(&self.sk)
+    }
+
+    /// Sign a vote for endorser block `eb_hash` at election `slot`.
+    pub fn sign_vote(&self, eb_hash: &[u8; 32], slot: u64) -> [u8; SIGNATURE_SIZE] {
+        sign_vote(&self.sk, eb_hash, slot)
+    }
+
+    /// Generate this key's proof of possession `(mu1, mu2)`.
+    pub fn proof_of_possession(&self) -> ([u8; SIGNATURE_SIZE], [u8; SIGNATURE_SIZE]) {
+        make_proof_of_possession(&self.sk)
+    }
+}
+
+impl fmt::Debug for VoteSigner {
+    /// Redacts the secret; shows only the public key prefix.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pk = self.public_key();
+        f.debug_struct("VoteSigner")
+            .field("public_key", &hex_prefix(&pk))
+            .finish_non_exhaustive()
+    }
+}
+
+/// First 4 bytes of a key as hex, for redacted `Debug`.
+fn hex_prefix(b: &[u8]) -> String {
+    b.iter().take(4).map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -173,6 +242,25 @@ mod tests {
 
         let other = PublicKey::from_bytes(&public_key_of(&test_key([5u8; 32]))).unwrap();
         assert_eq!(verify_proof_of_possession(&other, &mu1, &mu2), Ok(false));
+    }
+
+    /// `VoteSigner` loaded from a cardano `bls.skey` envelope signs a vote
+    /// that verifies against its own derived public key.
+    #[test]
+    fn vote_signer_from_cardano_signs_verifiable_vote() {
+        // A cardano bls.skey envelope payload: CBOR bstr (0x5820) of a scalar.
+        let scalar = test_key([8u8; 32]).to_bytes();
+        let mut cbor = vec![0x58, 0x20];
+        cbor.extend_from_slice(&scalar);
+        let signer = VoteSigner::from_cardano(&cbor).expect("load signer");
+
+        let pk = PublicKey::from_bytes(&signer.public_key()).unwrap();
+        let eb = [0x7Eu8; 32];
+        let sig = signer.sign_vote(&eb, 99);
+        assert_eq!(verify_vote(&pk, &eb, 99, &sig), Ok(true));
+
+        let (mu1, mu2) = signer.proof_of_possession();
+        assert_eq!(verify_proof_of_possession(&pk, &mu1, &mu2), Ok(true));
     }
 
     /// A real registered-pool `bls.vkey` (public) loads from its cardano
