@@ -643,6 +643,24 @@ mod tests {
     }
 
     #[test]
+    fn eb_context_reconstructs_signed_pair_for_announced_rb() {
+        // A receiver BLS-verifies an inbound vote that carries only the
+        // announcing RB hash; `eb_context` must return exactly what the signer
+        // signed — the EB hash (NOT the RB key) and the announcing RB's slot.
+        let mut e = test_elections();
+        e.on_slot(10);
+        // Distinct RB key (h(1)) and EB hash (h(2)) so a regression that returns
+        // the RB hash in place of the EB hash is caught.
+        e.announce_from_rb(h(1), 10, h(2));
+        assert_eq!(e.eb_context(&h(1)), Some((h(2), 10)));
+        // An unknown / never-announced hash has no context.
+        assert_eq!(e.eb_context(&h(9)), None);
+        // Once the election is pruned, its context is gone.
+        e.prune_below_slot(20);
+        assert_eq!(e.eb_context(&h(1)), None);
+    }
+
+    #[test]
     fn effects_are_in_btreemap_order() {
         let mut e = test_elections();
         e.on_slot(10);
