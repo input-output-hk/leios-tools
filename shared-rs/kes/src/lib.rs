@@ -116,6 +116,15 @@ impl KesSigner {
     /// not decode as a Sum6 key. The verification key is recovered from the
     /// key material, so the imported signer knows its own `hot_vkey`.
     pub fn from_bytes(buf: &[u8; SK_SIZE]) -> Result<Self, KesError> {
+        // Reject an out-of-range period trailer up front: Sum6 has periods
+        // `0..=MAX_PERIOD`, so a larger trailer is not a valid key and would
+        // make `period()`/`sign()` ill-defined. (Also covers the trailer this
+        // wrapper appends in `from_cardano_skey`.)
+        let mut p = [0u8; 4];
+        p.copy_from_slice(&buf[SK_SIZE - 4..]);
+        if u32::from_be_bytes(p) > MAX_PERIOD {
+            return Err(KesError);
+        }
         // `from_bytes` borrows and (on drop) zeroizes its buffer, so decode a
         // scratch copy to read the vkey and keep our own owned copy.
         let mut scratch = *buf;
@@ -226,6 +235,12 @@ impl fmt::Debug for KesSigner {
 /// period. A fresh op-cert whose start period equals the current period signs
 /// (and verifies) at `t = 0`.
 pub fn verify(period: u32, vkey: &Vkey, msg: &[u8], sig: &Sig) -> Result<(), KesError> {
+    // Sum6 only spans periods `0..=MAX_PERIOD`; a larger relative period means
+    // an expired op-cert, which must fail rather than depend on upstream
+    // behavior for an out-of-range period.
+    if period > MAX_PERIOD {
+        return Err(KesError);
+    }
     let pk = PublicKey::from_bytes(vkey).map_err(|_| KesError)?;
     let s = Sum6KesSig::from_bytes(sig).map_err(|_| KesError)?;
     s.verify(period, &pk, msg).map_err(|_| KesError)
@@ -329,6 +344,23 @@ mod tests {
         // Evolving right up to the final period is fine.
         assert!(signer.evolve_to(MAX_PERIOD).is_ok());
         assert_eq!(signer.period(), MAX_PERIOD);
+    }
+
+    /// An out-of-range period trailer is rejected on import, and `verify`
+    /// rejects an out-of-range relative period rather than trusting upstream.
+    #[test]
+    fn out_of_range_period_is_rejected() {
+        let signer = KesSigner::generate(&[23u8; SEED_SIZE]);
+        let mut buf: [u8; SK_SIZE] = signer.as_bytes().try_into().unwrap();
+        // A valid key round-trips; bump the trailer past MAX_PERIOD and it must
+        // no longer import.
+        assert!(KesSigner::from_bytes(&buf).is_ok());
+        buf[SK_SIZE - 4..].copy_from_slice(&(MAX_PERIOD + 1).to_be_bytes());
+        assert!(KesSigner::from_bytes(&buf).is_err());
+
+        let msg = b"anything";
+        let sig = signer.sign(msg);
+        assert_eq!(verify(MAX_PERIOD + 1, &signer.vkey(), msg, &sig), Err(KesError));
     }
 
     /// A tampered signature does not verify.

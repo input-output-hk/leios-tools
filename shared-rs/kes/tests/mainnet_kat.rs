@@ -65,7 +65,10 @@ fn mainnet_header_ocert_and_kes_verify() {
     // (2) The real Sum6 KES body signature verifies at the relative period
     // t = current_kes_period − ocert_kes_period.
     let current_kes_period = ocert::kes_period(slot, MAINNET_SLOTS_PER_KES_PERIOD);
-    let t = u32::try_from(current_kes_period - ocert_kes_period).expect("t within u32");
+    let relative = current_kes_period
+        .checked_sub(ocert_kes_period)
+        .expect("current KES period must be >= op-cert start period");
+    let t = u32::try_from(relative).expect("t within u32");
     verify(t, &hot_vkey, header_body, &body_sig)
         .expect("real mainnet KES body signature must verify");
 }

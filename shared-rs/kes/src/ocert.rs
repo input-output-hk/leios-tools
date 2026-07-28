@@ -41,7 +41,14 @@ pub type ColdSig = [u8; COLD_SIG_SIZE];
 
 /// The KES period a slot falls in: `slot / slots_per_kes_period`
 /// (`slotsPerKESPeriod` from the Shelley genesis; 129 600 on mainnet).
+///
+/// Panics if `slots_per_kes_period` is 0 — that is never a valid genesis
+/// value, and the explicit message beats an opaque divide-by-zero.
 pub fn kes_period(slot: u64, slots_per_kes_period: u64) -> u64 {
+    assert!(
+        slots_per_kes_period != 0,
+        "slots_per_kes_period must be non-zero (from the Shelley genesis)"
+    );
     slot / slots_per_kes_period
 }
 
