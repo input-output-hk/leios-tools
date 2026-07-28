@@ -24,7 +24,7 @@ use crate::fetch::{BlockFetchPolicy, LowestRttFirst, PeerRtt, UniformRtt};
 use crate::mempool::EbKey;
 use crate::peer::PeerId;
 use crate::peer_chain::{PeerChain, PeerChainEntry};
-use crate::types::Point;
+use crate::types::{short_hash, Point};
 
 /// How long an in-flight fetch entry remains "active" before being
 /// considered stale and eligible for retry.  The coordinator may
@@ -191,16 +191,25 @@ pub struct CachedBlock {
 // Selection result types
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+pub enum OriginKind {
+    Genesis,
+    ChainOrigin,
+}
+
 /// Result of a hybrid ancestor walk that uses `chain_tree` first and
 /// falls back to `block_cache` when chain_tree is missing a link.
 #[derive(Debug, Clone)]
 pub struct HybridWalk {
     /// Hashes from start_hash (index 0) back to the terminating block.
     pub chain: Vec<[u8; 32]>,
-    /// True if the walk terminated at a block with `prev_hash = None`
-    /// (i.e. genesis child); false if it terminated at a missing parent
-    /// or the start block was unknown.
-    pub reached_origin: bool,
+
+    /// Non-none value, if the walk terminated at chain origin:
+    /// * Genesis for Point::Origin
+    /// * ChainStart for an arbitrary block specified by the sync method (an artificial
+    ///   history start that intentionally prevents backtracking earlier for performance
+    ///   optimization purposes).
+    pub reached_origin: Option<OriginKind>,
 }
 
 /// Result of a single pass of the Haskell-aligned chain selection.
@@ -834,12 +843,18 @@ impl PraosState {
     }
 
     /// Store the ChainSync intersection as the peer chain's anchor.
-    pub fn record_peer_intersection(&mut self, peer_id: PeerId, point: Point) {
+    pub fn record_peer_intersection(&mut self, peer_id: PeerId, point: Point, initial: bool) {
         let cap = self.peer_chain_cap();
         self.peer_chains
             .entry(peer_id)
             .or_insert_with(|| PeerChain::new(cap))
-            .set_anchor(point);
+            .set_anchor(point.clone());
+
+        if initial {
+            if let (Some(hash), Some(slot)) = (point.get_hash(), point.get_slot()) {
+                self.chain_tree.insert_chain_start(hash, point, slot);
+            }
+        }
     }
 
     /// Truncate a peer's candidate chain on a rollback.
@@ -1526,6 +1541,11 @@ impl PraosState {
         // Bridge a chain_tree gap between best_tip and adopted, if any.
         if let Some(best) = self.chain_tree.best_tip_hash() {
             if let Err(Some(gap_point)) = self.try_switch_to(best) {
+                let tip = self.chain_tree.best_tip().unwrap();
+                tracing::info!("Bridging gap between {gap_point}..{}/{}; adopted tip hash {:?}",
+                    tip.0, tip.1, self.adopted_tip_hash
+                );
+
                 // Only bridge when we have a real lower-bound block: a
                 // range anchored at Origin is rejected (and reset) by a
                 // standard Cardano server, so we cannot bridge a gap
@@ -1542,6 +1562,8 @@ impl PraosState {
                     _ => 0,
                 };
                 if let Some(from) = from {
+                    tracing::info!("Bridging gap from {from}...");
+
                     // Rate-limit the bridge: skip if we recently bridged from
                     // this same adopted tip.  An advancing best_tip changes
                     // `gap_point` every tick and defeats the in-flight dedup,
@@ -1693,29 +1715,42 @@ impl PraosState {
     /// Walk backward from `start_hash` following `prev_hash` links,
     /// using `chain_tree` first and falling back to `block_cache` when
     /// a block is cached but not yet in chain_tree.
+    /// `self.origin_hash` is used, when we know that blocks before this hash (previous blocks)
+    /// are not available -- intended usage is syncing from the middle of chain
+    /// (sync_method = Tip or hash)
     pub fn walk_ancestors_hybrid(&self, start_hash: [u8; 32]) -> HybridWalk {
         let mut chain = vec![start_hash];
         let mut current = start_hash;
         let reached_origin;
         loop {
-            let parent_opt = if self.chain_tree.block_number(&current).is_some() {
+            let parent_opt = if self.chain_tree.is_chain_origin(&current) {
+                reached_origin = Some(OriginKind::ChainOrigin);
+                break;
+            } else if self.chain_tree.block_number(&current).is_some() {
                 self.chain_tree.prev_hash(&current)
             } else if let Some(cached) = self.block_cache.get(&current) {
                 cached.prev_hash
             } else {
-                reached_origin = false;
+                reached_origin = None;
                 break;
             };
+
             match parent_opt {
                 None => {
-                    reached_origin = true;
+                    reached_origin = Some(OriginKind::Genesis);
                     break;
                 }
                 Some(parent) => {
+                    if self.chain_tree.is_chain_origin(&parent) {
+                        reached_origin = Some(OriginKind::ChainOrigin);
+                        chain.push(parent);
+                        break;
+                    }
+
                     let in_tree = self.chain_tree.block_number(&parent).is_some();
                     let in_cache = self.block_cache.contains_key(&parent);
                     if !in_tree && !in_cache {
-                        reached_origin = false;
+                        reached_origin = None;
                         break;
                     }
                     chain.push(parent);
@@ -1762,7 +1797,7 @@ impl PraosState {
 
     /// One pass of Haskell-aligned chain selection.  Pure: does not
     /// mutate state.  Tests call this directly to assert classification.
-    pub fn select_chain_once(&self, skip: &HashSet<PeerId>) -> SelectionDecision {
+    pub fn select_chain_once_impl(&self, skip: &HashSet<PeerId>) -> SelectionDecision {
         let (adopted_hash, adopted_bn) = match self.adopted_tip_hash {
             Some(h) => (h, self.chain_tree.block_number(&h).unwrap_or(0)),
             None => ([0u8; 32], 0),
@@ -1887,7 +1922,7 @@ impl PraosState {
         let ancestor = match ancestor {
             Some(a) => a,
             None => {
-                let hex_tail = |h: &[u8; 32]| format!("{:02x}{:02x}", h[30], h[31]);
+                let hex_tail = short_hash; // |h: &[u8; 32]| format!("{:02x}{:02x}", h[30], h[31]);
                 let hex_tail_opt = |h: &Option<[u8; 32]>| {
                     h.as_ref().map(hex_tail).unwrap_or_else(|| "<none>".into())
                 };
@@ -1958,7 +1993,7 @@ impl PraosState {
                     };
                 }
                 let reaches_ancestor = if ancestor == [0u8; 32] {
-                    walk_result.reached_origin
+                    walk_result.reached_origin.is_some()
                 } else {
                     walk.contains(&ancestor)
                 };
@@ -1993,7 +2028,13 @@ impl PraosState {
         }
     }
 
-    /// Try to switch to a specific block as chain tip.  Walks back
+    pub fn select_chain_once(&self, skip: &HashSet<PeerId>) -> SelectionDecision {
+        let decision = self.select_chain_once_impl(skip);
+        info!("select_chain_once: {decision:?}");
+        decision
+    }
+
+        /// Try to switch to a specific block as chain tip.  Walks back
     /// through chain_tree from `tip_hash` to `adopted_tip` and returns
     /// the contiguous prefix of cached blocks as a replay sequence.
     #[allow(clippy::type_complexity)]
@@ -2634,7 +2675,7 @@ mod tests {
     fn record_peer_intersection_sets_anchor() {
         let mut s = fresh();
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(50, 1));
+        s.record_peer_intersection(pid, pt(50, 1), false);
         let chain = s.peer_chains.get(&pid).expect("peer chain present");
         assert!(chain.anchor().is_some());
     }
@@ -3726,7 +3767,7 @@ mod tests {
 
         let walk = s.walk_ancestors_hybrid(h(3));
         assert_eq!(walk.chain, vec![h(3), h(2), h(1)]);
-        assert!(walk.reached_origin);
+        assert!(walk.reached_origin.is_some());
     }
 
     #[test]
@@ -3748,7 +3789,7 @@ mod tests {
         );
         let walk = s.walk_ancestors_hybrid(h(2));
         assert_eq!(walk.chain, vec![h(2), h(1)]);
-        assert!(walk.reached_origin);
+        assert!(walk.reached_origin.is_some());
     }
 
     #[test]
@@ -3756,7 +3797,7 @@ mod tests {
         let s = fresh();
         let walk = s.walk_ancestors_hybrid(h(99));
         assert_eq!(walk.chain, vec![h(99)]);
-        assert!(!walk.reached_origin);
+        assert!(walk.reached_origin.is_none());
     }
 
     // -- Periodic + retry paths ------------------------------------------
@@ -3852,7 +3893,7 @@ mod tests {
         install_validated_block(&mut s, 105, 5, 5, Some(4));
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(105, 5)); // anchor = block 5
+        s.record_peer_intersection(pid, pt(105, 5), false); // anchor = block 5
                                                      // Peer fragment: divergent blocks 11, 12 (prev not in our ancestry).
         s.record_peer_tip(pid, pt(111, 11), 11, 11, h(11), 111, Some(h(99)));
         s.record_peer_tip(pid, pt(112, 12), 12, 12, h(12), 112, Some(h(11)));
@@ -3884,7 +3925,7 @@ mod tests {
         install_validated_block(&mut s, 150, 50, 50, Some(49)); // depth 150 > k
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(150, 50));
+        s.record_peer_intersection(pid, pt(150, 50), false);
         s.record_peer_tip(pid, pt(301, 201), 201, 201, h(201), 301, Some(h(99)));
 
         assert!(

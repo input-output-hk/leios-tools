@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use shared_consensus::PeerId;
 
 use crate::protocols::leios_fetch::bitmap;
-use crate::types::{Point, Vote};
+use crate::types::{Point, Vote, WrappedHeader};
 use shared_consensus::mempool::{TxBody, TxId};
 
 /// Resolves a transaction body by its 32-byte hash. The Leios store calls
@@ -37,6 +37,14 @@ pub enum LeiosNotification {
     BlockOffer { point: Point, eb_size: u32 },
     /// An EB's transactions are available for download.
     BlockTxsOffer { point: Point },
+    /// CIP-0164 EB **announcement** — the fast discovery pulse. Carries the
+    /// RB `header` whose `announced_eb = (hash, size)` field commits to an EB,
+    /// diffused ahead of (and independent from) the EB-body `BlockOffer`.
+    /// Distinct from `BlockOffer`: this advertises that an EB *exists* (by the
+    /// header's commitment), not that its body is available to fetch. Not
+    /// deduplicated — the producer decides how many to enqueue (one honestly,
+    /// two for an OCIN equivocation), so `offer_point` returns `None` for it.
+    BlockAnnouncement { header: WrappedHeader },
     /// Votes delivered inline (no offer/fetch round-trip).
     /// `retention_slot` is the tip slot when the votes were injected;
     /// wire votes carry no slot, so this is what ages the notification
@@ -255,6 +263,30 @@ impl LeiosStore {
             source,
             LeiosNotification::BlockOffer { point, eb_size },
             was_new,
+        );
+        self.bump_version(&mut inner);
+    }
+
+    /// Enqueue a CIP-0164 EB **announcement** (`MsgLeiosBlockAnnouncement`) for
+    /// diffusion. `header` is the RB header whose `announced_eb` commits to an
+    /// EB — the fast discovery pulse, distinct from and ahead of the EB-body
+    /// `BlockOffer` that `inject_block` generates.
+    ///
+    /// `source` is the peer that delivered the header (`None` for locally
+    /// produced RBs); the no-echo gate in `serve_leios_notify` uses it to avoid
+    /// re-announcing back to the origin. Announcements are **not** deduplicated,
+    /// so calling this twice for one election (with distinct headers) diffuses
+    /// both — the mechanism an OCIN-equivocation adversary relies on.
+    pub fn announce_block(&self, header: WrappedHeader, source: Option<PeerId>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(Point::Specific { slot, .. }) = header.point() {
+            inner.max_slot = inner.max_slot.max(slot);
+        }
+        Self::push_notification(
+            &mut inner,
+            source,
+            LeiosNotification::BlockAnnouncement { header },
+            true,
         );
         self.bump_version(&mut inner);
     }
@@ -671,7 +703,8 @@ fn offer_point(n: &LeiosNotification) -> Option<&Point> {
     match n {
         LeiosNotification::BlockOffer { point, .. }
         | LeiosNotification::BlockTxsOffer { point } => Some(point),
-        LeiosNotification::Votes { .. } => None,
+        // Announcements and votes are never offer-deduplicated.
+        LeiosNotification::BlockAnnouncement { .. } | LeiosNotification::Votes { .. } => None,
     }
 }
 
@@ -701,6 +734,14 @@ fn notification_evictable(n: &LeiosNotification, cutoff: u64) -> bool {
             Point::Origin => true,
         },
         LeiosNotification::Votes { retention_slot, .. } => *retention_slot < cutoff,
+        // Age out by the announcing header's own slot. An unparseable header
+        // (point() == None) can't be aged by slot, so treat it as evictable —
+        // otherwise a peer could crowd the notifications queue with
+        // syntactically-decodable but unparseable headers that never prune.
+        LeiosNotification::BlockAnnouncement { header } => match header.point() {
+            Some(Point::Specific { slot, .. }) => slot < cutoff,
+            _ => true,
+        },
     }
 }
 
@@ -714,6 +755,8 @@ fn notification_heap_bytes(n: &LeiosNotification) -> usize {
     match n {
         LeiosNotification::BlockOffer { .. } | LeiosNotification::BlockTxsOffer { .. } => 0,
         LeiosNotification::Votes { votes, .. } => votes.len() * std::mem::size_of::<Vote>(),
+        // The raw header CBOR is the announcement's heap payload.
+        LeiosNotification::BlockAnnouncement { header } => header.raw.len(),
     }
 }
 
@@ -1622,5 +1665,31 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), sub.changed()).await;
         assert!(result.is_ok());
         assert!(*sub.borrow() > 0);
+    }
+
+    #[test]
+    fn announce_block_enqueues_announcement_and_is_not_deduped() {
+        let (store, _rx) = LeiosStore::new(100);
+        // Opaque headers (parsed = None) suffice here: we exercise only the
+        // enqueue + read path, not header parsing.
+        store.announce_block(WrappedHeader::opaque(vec![0xA1, 0xA1]), None);
+        // A second, distinct announcement must NOT be deduplicated — this is the
+        // OCIN-equivocation mechanism (two announcements, one election).
+        store.announce_block(WrappedHeader::opaque(vec![0xB2, 0xB2]), None);
+
+        let mut idx = 0;
+        let announced: Vec<Vec<u8>> = store
+            .notifications_after(&mut idx)
+            .iter()
+            .filter_map(|e| match &e.notification {
+                LeiosNotification::BlockAnnouncement { header } => Some(header.raw.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            announced,
+            vec![vec![0xA1, 0xA1], vec![0xB2, 0xB2]],
+            "both distinct announcements diffuse; none deduplicated"
+        );
     }
 }

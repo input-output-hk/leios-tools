@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use crate::mempool::EbKey;
+use crate::types;
 use crate::types::Point;
 
 /// A block entry in a chain tree snapshot, for UI display.
@@ -74,14 +75,21 @@ pub fn is_better_tip(
     }
 }
 
-fn short_hash(h: &[u8; 32]) -> String {
-    format!("{:02x}{:02x}", h[30], h[31])
+#[derive(Debug, Clone)]
+enum ChainNodeStatus {
+    Normal,
+
+    /// Starts a chain: we know that there are nodes before this one, but they're
+    /// inaccessible for us and it's not a problem.
+    ChainStart,
 }
 
 /// A node in the chain tree, representing one block header.
 #[derive(Debug, Clone)]
 struct ChainNode {
     point: Point,
+    status: ChainNodeStatus,
+
     block_number: u64,
     #[allow(dead_code)] // stored for future use (e.g., slot-based tiebreaking)
     slot: u64,
@@ -131,6 +139,35 @@ impl ChainTree {
         }
     }
 
+    pub fn insert_chain_start(
+        &mut self,
+        hash: [u8; 32],
+        point: Point,
+        slot: u64
+    ) -> bool {
+        if self.nodes.contains_key(&hash) {
+            return false;
+        }
+
+        self.nodes.insert(
+            hash,
+            ChainNode {
+                point: point.clone(),
+                slot,
+                status: ChainNodeStatus::ChainStart,
+
+                prev_hash: None,
+                tx_count: 0,
+                announced_eb_hash: None,
+                cached_eb_tx_count: None,
+                block_number: 0,
+                certified_eb: false,
+            },
+        );
+
+        true
+    }
+
     /// Insert a block. Returns true if this block becomes the new best tip.
     ///
     /// Accepts any block — does NOT check that `prev_hash` exists in the
@@ -162,6 +199,7 @@ impl ChainTree {
                 point: point.clone(),
                 block_number,
                 slot,
+                status: ChainNodeStatus::Normal,
                 prev_hash,
                 tx_count,
                 announced_eb_hash,
@@ -211,6 +249,12 @@ impl ChainTree {
     /// Look up the prev_hash for a given hash.
     pub fn prev_hash(&self, hash: &[u8; 32]) -> Option<[u8; 32]> {
         self.nodes.get(hash).and_then(|n| n.prev_hash)
+    }
+
+    pub fn is_chain_origin(&self, hash: &[u8; 32]) -> bool {
+        self.nodes.get(hash).is_some_and(
+            |n| matches!(n.status, ChainNodeStatus::ChainStart)
+        )
     }
 
     /// Look up the EB hash announced by the RB at `hash`, if any.  Drives
@@ -451,8 +495,8 @@ impl ChainTree {
                     .or_else(|| node.announced_eb_hash.as_ref().and_then(&eb_manifest_count));
                 Some(ChainTreeEntry {
                     block_number: node.block_number,
-                    hash: short_hash(h),
-                    prev_hash: node.prev_hash.as_ref().map(short_hash),
+                    hash: types::short_hash(h),
+                    prev_hash: node.prev_hash.as_ref().map(types::short_hash),
                     tx_count: node.tx_count,
                     announced_eb: node.announced_eb_hash.is_some(),
                     certified_eb: node.certified_eb,

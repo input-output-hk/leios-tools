@@ -24,9 +24,10 @@ pub mod types;
 pub use coordinator::spawn_coordinator;
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
+use shared_consensus::Point;
 use tokio::sync::mpsc;
 pub use types::{NetworkCommand, NetworkEvent};
 
@@ -41,6 +42,28 @@ use crate::store::leios_store::{LeiosStore, TxBodyResolver};
 /// `shared_consensus::fetch::PeerRttCache` so the consensus state machines'
 /// fetch policies can rank candidates by real measured latency.
 pub type PeerRttObserver = Arc<dyn Fn(PeerId, Option<Duration>) + Send + Sync>;
+
+#[derive(Clone, Debug, Default)]
+pub enum SyncMethodConfig {
+    None,
+    #[default]
+    Genesis,
+    Tip { delay_for_blocks: u32 },
+    Point(Point),
+}
+
+impl Display for SyncMethodConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncMethodConfig::None => write!(f, "None"),
+            SyncMethodConfig::Genesis => write!(f, "Genesis"),
+            SyncMethodConfig::Tip { delay_for_blocks } => {
+                write!(f, "Tip (delay={})", delay_for_blocks)
+            }
+            SyncMethodConfig::Point(point) => write!(f, "Point {}", point),
+        }
+    }
+}
 
 /// Configuration for the coordinator.
 #[derive(Clone)]
@@ -103,6 +126,8 @@ pub struct CoordinatorConfig {
     /// target, or rewriting offer fields. `None` = honest; artefacts sent
     /// as-is.
     pub outbound_controls: Option<crate::peer::server_handlers::OutboundControls>,
+
+    pub sync_method: SyncMethodConfig,
 }
 
 impl Default for CoordinatorConfig {
@@ -127,6 +152,7 @@ impl Default for CoordinatorConfig {
             tx_body_resolver: None,
             peer_rtt_observer: None,
             outbound_controls: None,
+            sync_method: SyncMethodConfig::default(),
         }
     }
 }

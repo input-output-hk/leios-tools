@@ -35,7 +35,7 @@ pub enum PeerEvent {
     },
 
     /// ChainSync: intersection found during `find_intersection`.
-    IntersectionFound { point: Point },
+    IntersectionFound { point: Point, initial: bool },
 
     /// ChainSync: peer announced a new header (from `MsgRollForward`).
     HeaderAnnounced { header: WrappedHeader, tip: Tip },
