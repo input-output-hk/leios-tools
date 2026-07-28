@@ -125,14 +125,15 @@ pub fn version_table(data: &VersionData) -> VersionTable {
 
 /// Build a version table proposing exactly `versions` with the given
 /// parameters. Each entry is encoded in the form required by its version
-/// (v16+ carries the trailing `v16_flag`, defaulting to `false` when the
-/// caller left it unset; v14/v15 use the 4-element form). Unknown version
-/// numbers are encoded in the 4-element form.
+/// (v16 carries the trailing `v16_flag`, defaulting to `false` when the
+/// caller left it unset; v14/v15 use the 4-element form). Any other version
+/// number (including unknown future versions) is encoded in the 4-element
+/// form, since only v16's 5-element shape is currently defined.
 pub fn version_table_for(data: &VersionData, versions: &[u64]) -> VersionTable {
     let mut table = BTreeMap::new();
     for &v in versions {
         let entry = VersionData {
-            v16_flag: if v >= VERSION_V16 {
+            v16_flag: if v == VERSION_V16 {
                 Some(data.v16_flag.unwrap_or(false))
             } else {
                 None
@@ -201,7 +202,7 @@ pub fn negotiate(
             || server_data.initiator_only_diffusion_mode,
         peer_sharing: client_data.peer_sharing,
         query: client_data.query,
-        v16_flag: if best_version >= VERSION_V16 {
+        v16_flag: if best_version == VERSION_V16 {
             Some(client_data.v16_flag.unwrap_or(false))
         } else {
             None
