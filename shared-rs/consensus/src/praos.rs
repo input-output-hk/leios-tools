@@ -843,7 +843,29 @@ impl PraosState {
     }
 
     /// Store the ChainSync intersection as the peer chain's anchor.
-    pub fn record_peer_intersection(&mut self, peer_id: PeerId, point: Point, initial: bool) {
+    /// Record a peer's ChainSync intersection as its candidate-chain anchor.
+    ///
+    /// `block_no` is the anchor's height when the intersection is at the peer's
+    /// reported tip (sync-at-tip), else `None`. On the *initial* intersection we
+    /// insert the anchor as a `ChainStart` root and — for sync-at-tip, when we
+    /// know its height and have no adopted chain yet — adopt it directly. That
+    /// makes a cold-start producer sit at the real tip immediately: forward
+    /// blocks extend the anchor in one step, and any peer that intersects us at
+    /// genesis (a shorter chain) is simply not selected. Without this, the
+    /// bodyless anchor can't be extended (`try_switch_to` wants its body), so
+    /// the node back-fills from genesis until the `k`-bounded anchor-trust
+    /// fallback rescues it — during which a forged block gets a stale height.
+    ///
+    /// `FakeLedger` is stateless, so adopting a body-less anchor needs no ledger
+    /// seed; `execute_switch_internal`'s later `ValidatorRollback` to it is a
+    /// harmless head update.
+    pub fn record_peer_intersection(
+        &mut self,
+        peer_id: PeerId,
+        point: Point,
+        initial: bool,
+        block_no: Option<u64>,
+    ) {
         let cap = self.peer_chain_cap();
         self.peer_chains
             .entry(peer_id)
@@ -852,7 +874,13 @@ impl PraosState {
 
         if initial {
             if let (Some(hash), Some(slot)) = (point.get_hash(), point.get_slot()) {
-                self.chain_tree.insert_chain_start(hash, point, slot);
+                self.chain_tree
+                    .insert_chain_start(hash, point, slot, block_no.unwrap_or(0));
+                // Sync-at-tip cold start: adopt the tip anchor as a trusted
+                // root so we forge on the real tip from boot.
+                if block_no.is_some() && self.adopted_tip_hash.is_none() {
+                    self.adopted_tip_hash = Some(hash);
+                }
             }
         }
     }
@@ -2675,9 +2703,39 @@ mod tests {
     fn record_peer_intersection_sets_anchor() {
         let mut s = fresh();
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(50, 1), false);
+        s.record_peer_intersection(pid, pt(50, 1), false, None);
         let chain = s.peer_chains.get(&pid).expect("peer chain present");
         assert!(chain.anchor().is_some());
+    }
+
+    #[test]
+    fn initial_intersection_at_tip_adopts_anchor() {
+        // Sync-at-tip cold start: an initial intersection carrying the tip
+        // height adopts the anchor directly, so a fresh producer sits at the
+        // real tip (no genesis back-fill) and forges the next block number.
+        let mut s = fresh();
+        let pid = PeerId(7);
+        s.record_peer_intersection(pid, pt(2000, 9), true, Some(84_000));
+        assert_eq!(s.adopted_tip_hash, Some(h(9)), "anchor adopted as tip");
+        assert_eq!(
+            s.chain_tree.block_number(&h(9)),
+            Some(84_000),
+            "anchor height set from the intersection tip"
+        );
+        assert_eq!(s.tip_hash(), Some(h(9)));
+        assert_eq!(s.next_block_number(), 84_001, "forge extends the real tip");
+    }
+
+    #[test]
+    fn initial_intersection_without_height_does_not_adopt() {
+        // A non-tip initial intersection (no known height) still inserts the
+        // anchor but does NOT adopt it — the node falls back to the k-bounded
+        // anchor-trust path, exactly as before sync-at-tip adoption existed.
+        let mut s = fresh();
+        let pid = PeerId(7);
+        s.record_peer_intersection(pid, pt(2000, 9), true, None);
+        assert_eq!(s.adopted_tip_hash, None, "no adoption without a height");
+        assert!(s.chain_tree.is_chain_origin(&h(9)), "anchor still inserted");
     }
 
     #[test]
@@ -3893,7 +3951,7 @@ mod tests {
         install_validated_block(&mut s, 105, 5, 5, Some(4));
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(105, 5), false); // anchor = block 5
+        s.record_peer_intersection(pid, pt(105, 5), false, None); // anchor = block 5
                                                      // Peer fragment: divergent blocks 11, 12 (prev not in our ancestry).
         s.record_peer_tip(pid, pt(111, 11), 11, 11, h(11), 111, Some(h(99)));
         s.record_peer_tip(pid, pt(112, 12), 12, 12, h(12), 112, Some(h(11)));
@@ -3925,7 +3983,7 @@ mod tests {
         install_validated_block(&mut s, 150, 50, 50, Some(49)); // depth 150 > k
 
         let pid = PeerId(7);
-        s.record_peer_intersection(pid, pt(150, 50), false);
+        s.record_peer_intersection(pid, pt(150, 50), false, None);
         s.record_peer_tip(pid, pt(301, 201), 201, 201, h(201), 301, Some(h(99)));
 
         assert!(

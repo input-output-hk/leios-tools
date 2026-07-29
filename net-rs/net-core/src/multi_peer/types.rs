@@ -41,7 +41,14 @@ pub enum NetworkEvent {
     /// as the peer chain's anchor (guaranteed common ancestor).
     /// If the `initial` flag is set, consensus treats this point as the ultimate lower bound for
     /// block backtracking; nothing earlier is available.
-    IntersectionFound { peer_id: PeerId, point: Point, initial: bool },
+    /// `block_no` is the intersection point's height when it is the peer's
+    /// reported tip (sync-at-tip), else `None`.
+    IntersectionFound {
+        peer_id: PeerId,
+        point: Point,
+        initial: bool,
+        block_no: Option<u64>,
+    },
 
     /// A peer rolled its chain back to a point. Emitted for every peer
     /// rollback, not just those affecting the local best tip.

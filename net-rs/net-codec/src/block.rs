@@ -151,25 +151,51 @@ impl LeiosBlockInfo {
             return Err(DecodeError::message("Byron block"));
         }
 
-        // era_block: [header, tx_bodies, tx_witnesses, aux_data, ?eb_certificate]
         let block_len = match inner.array()? {
             Some(n) => n,
             None => return Err(DecodeError::message("indefinite block array")),
         };
 
-        if block_len <= BLOCK_BASE_FIELDS {
-            return Err(DecodeError::message("no Leios extension fields"));
-        }
+        // Extract the opaque leios_certificate bytes, era-aware.
+        let (cert_start, cert_end) = if era >= LEIOS_ERA {
+            // Era-8 Leios: block = [header, block_body]; block_body =
+            //   [invalid_transactions/nil, transactions, leios_certificate/nil,
+            //    peras_certificate/nil]
+            // The certificate is block_body[2]; nil means no cert.
+            if block_len < 2 {
+                return Err(DecodeError::message("era-8 block missing block_body"));
+            }
+            inner.skip()?; // field 0: header
+            let bb_len = match inner.array()? {
+                Some(n) => n,
+                None => return Err(DecodeError::message("indefinite block_body")),
+            };
+            if bb_len < 3 {
+                return Err(DecodeError::message("block_body missing leios_certificate slot"));
+            }
+            inner.skip()?; // [0] invalid_transactions
+            inner.skip()?; // [1] transactions
+            if inner.datatype()? == minicbor::data::Type::Null {
+                return Err(DecodeError::message("no leios certificate"));
+            }
+            let start = inner.position();
+            inner.skip()?; // [2] leios_certificate
+            (start, inner.position())
+        } else {
+            // Era-7 (flat Conway) backward-compat: block =
+            //   [header, tx_bodies, tx_witnesses, aux_data, invalid_transactions,
+            //    ?eb_certificate]
+            if block_len <= BLOCK_BASE_FIELDS {
+                return Err(DecodeError::message("no Leios extension fields"));
+            }
+            for _ in 0..BLOCK_BASE_FIELDS {
+                inner.skip()?;
+            }
+            let start = inner.position();
+            inner.skip()?; // the trailing eb_certificate
+            (start, inner.position())
+        };
 
-        // Skip base fields 0-3
-        for _ in 0..BLOCK_BASE_FIELDS {
-            inner.skip()?;
-        }
-
-        // Field 4: eb_certificate — extract as opaque bytes
-        let cert_start = inner.position();
-        inner.skip()?;
-        let cert_end = inner.position();
         let cert_bytes = inner_bytes
             .get(cert_start..cert_end)
             .ok_or_else(|| DecodeError::message("failed to extract certificate bytes"))?;
@@ -841,6 +867,41 @@ mod tests {
         let raw = build_test_block(7, Some(&[0x01]));
         let body = BlockBody::opaque(raw);
         assert!(body.leios.is_none());
+    }
+
+    /// Build an era-8 Leios block `#6.24([8, [header, block_body]])` with a
+    /// dummy (skippable) header. `cert` is the raw leios_certificate CBOR for
+    /// `block_body[2]`, or None for a nil cert slot.
+    fn build_era8_block(cert: Option<&[u8]>) -> Vec<u8> {
+        let body = crate::encode_block_body(&[], cert);
+        let dummy_header_inner = [0x80u8]; // empty array — parse skips field 0
+        crate::wrap_block(&dummy_header_inner, &body, crate::DIJKSTRA_BLOCK_ERA)
+    }
+
+    #[test]
+    fn parse_era8_block_extracts_cert_at_block_body_index_2() {
+        // On-chain 2-tuple cert [signers, sig48].
+        let mut cert = Vec::new();
+        let _ = Encoder::new(&mut cert)
+            .array(2)
+            .and_then(|e| e.bytes(&[0x63, 0xff, 0xff]))
+            .and_then(|e| e.bytes(&[0x11u8; 48]));
+        let block = build_era8_block(Some(&cert));
+        let info = LeiosBlockInfo::parse(&block).expect("era-8 block with cert parses");
+        assert_eq!(
+            info.eb_certificate.expect("cert present"),
+            cert,
+            "the leios_certificate at block_body[2] is extracted verbatim"
+        );
+    }
+
+    #[test]
+    fn parse_era8_block_nil_cert_returns_none() {
+        let block = build_era8_block(None);
+        assert!(
+            LeiosBlockInfo::parse(&block).is_none(),
+            "a nil block_body[2] means no certificate"
+        );
     }
 
     /// Build a block with a real parseable Shelley+ header for point() testing.
