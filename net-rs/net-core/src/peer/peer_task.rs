@@ -190,7 +190,14 @@ async fn do_intersection_with_candidates(
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
     initial: bool,
 ) -> Result<(), String> {
-    let candidate_summary: Vec<String> = candidates.iter().map(|p| format!("{p}")).collect();
+    // Only format the candidate list when INFO is actually enabled — this runs
+    // on every intersection (initial sync + retries), and the log below is the
+    // sole consumer.
+    let candidate_summary: Vec<String> = if tracing::enabled!(tracing::Level::INFO) {
+        candidates.iter().map(|p| format!("{p}")).collect()
+    } else {
+        Vec::new()
+    };
     match chainsync::find_intersection(runner, candidates).await {
         Ok(Some((point, tip))) => {
             tracing::info!(
