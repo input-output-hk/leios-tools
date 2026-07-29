@@ -1,0 +1,24 @@
+[package]
+name = "shared-bls"
+version = "0.1.0"
+edition = "2021"
+description = "Cardano Leios BLS votes + certificates: a byte-oriented wrapper over IOG's leios_crypto_benchmarks (BLS12-381 minimal-signature-size — signatures in G1 (48 B), public keys in G2 (96 B), over blst), for signing/verifying votes and the CIP-0164 leios_certificate."
+
+[dependencies]
+# IOG's Leios crypto reference — the same construction (DST b"Leios", slot as
+# the blst augmentation, EB-hash message, custom PoP, bitfield aggregation) and
+# the same curve library (blst C) the Haskell cardano-node uses, so our votes
+# and certificates are byte-compatible with the real node. Git-pinned by rev
+# (not published to crates.io), mirroring the pallas_vrf decision. Commit
+# Cargo.lock so blst and the transitive tree stay reproducible.
+leios_crypto_benchmarks = { git = "https://github.com/input-output-hk/ouroboros-leios", rev = "a68e83f779592f54c5e9543d43c5dd90dde851d0" }
+# The curve library itself, for the min-sig key/signature types the reference's
+# vote functions take. Pinned exactly (like the sibling wrappers pin their core
+# primitive: `pallas-math`, `kes-summed-ed25519`) so a path-dep consumer — whose
+# own Cargo.lock, not this workspace's, governs resolution — can't silently pull
+# a different blst patch and change the produced bytes/ABI. `=0.3.17` satisfies
+# the reference's `^0.3.13`, so the two still unify to one blst build.
+blst = "=0.3.17"
+
+[dev-dependencies]
+hex = "0.4"
