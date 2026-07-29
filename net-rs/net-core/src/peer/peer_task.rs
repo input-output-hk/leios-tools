@@ -991,6 +991,7 @@ mod tests {
                     initiator_only_diffusion_mode: false,
                     peer_sharing: 1,
                     query: false,
+                    v16_flag: None,
                 };
                 crate::protocols::handshake::n2n::negotiate(client_versions, &server_data)
             },
@@ -1152,6 +1153,7 @@ mod tests {
             initiator_only_diffusion_mode: true,
             peer_sharing: 1,
             query: false,
+            v16_flag: None,
         });
         let hs_result = handshake::run_client(
             crate::mux::CodecSend::new(hs_send),
@@ -1464,9 +1466,7 @@ mod tests {
         // (`praos_tx_id`); an unparseable body would now be dropped, not sent.
         let tx = PendingTx {
             tx_id: TxId::new_with_array([0x44; 32]),
-            body: TxBody::new_with_vec(vec![
-                0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6,
-            ]),
+            body: TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
             size: 9,
             era: ts::ORIGIN_ERA,
         };
