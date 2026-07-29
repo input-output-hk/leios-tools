@@ -36,6 +36,19 @@ impl LeafAction for AnnounceFlood {
         out.leios.announce_slot_offset = self.slot_offset;
         Status::Running
     }
+
+    /// Live-retune the flood count / slot offset without rebuilding the tree.
+    fn set_param(&mut self, field: &str, value: &toml::Value) {
+        let Some(v) = value.as_integer() else {
+            return;
+        };
+        match field {
+            // Stored raw; `contribute` clamps to >= 1 at actuation.
+            "count" => self.count = v.clamp(0, u32::MAX as i64) as u32,
+            "slot_offset" => self.slot_offset = v,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -72,5 +85,20 @@ mod tests {
         assert_eq!(out2.leios.announce_flood_count, 1);
         // Honest default floods nothing.
         assert_eq!(ControlSignal::default().leios.announce_flood_count, 0);
+    }
+
+    #[test]
+    fn set_param_retunes_count_and_offset() {
+        let mut a = AnnounceFlood {
+            count: 100,
+            slot_offset: 0,
+        };
+        a.set_param("count", &toml::Value::Integer(500));
+        a.set_param("slot_offset", &toml::Value::Integer(40));
+        assert_eq!(a.count, 500);
+        assert_eq!(a.slot_offset, 40);
+        // Negative count clamps to 0 (contribute then lifts to >= 1).
+        a.set_param("count", &toml::Value::Integer(-5));
+        assert_eq!(a.count, 0);
     }
 }

@@ -30,6 +30,15 @@ impl LeafAction for AnnounceSlotSkew {
         out.leios.announce_slot_offset = self.slot_offset;
         Status::Running
     }
+
+    /// Live-retune the slot offset without rebuilding the tree.
+    fn set_param(&mut self, field: &str, value: &toml::Value) {
+        if field == "slot_offset" {
+            if let Some(v) = value.as_integer() {
+                self.slot_offset = v;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -55,5 +64,15 @@ mod tests {
         // Honest default never fabricates or skews.
         assert!(!ControlSignal::default().leios.fake_announce);
         assert_eq!(ControlSignal::default().leios.announce_slot_offset, 0);
+    }
+
+    #[test]
+    fn set_param_retunes_slot_offset() {
+        let mut a = AnnounceSlotSkew { slot_offset: 40 };
+        a.set_param("slot_offset", &toml::Value::Integer(-100));
+        assert_eq!(a.slot_offset, -100);
+        // Unknown field is ignored.
+        a.set_param("nope", &toml::Value::Integer(7));
+        assert_eq!(a.slot_offset, -100);
     }
 }
