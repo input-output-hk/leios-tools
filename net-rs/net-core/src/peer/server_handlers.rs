@@ -125,6 +125,12 @@ pub async fn serve_chainsync(
                         let rollback_target = store.servable_rollback_target();
                         let tip = store.tip();
                         read_point = Some(rollback_target.clone());
+                        tracing::debug!(
+                            peer = peer.0,
+                            target = %rollback_target,
+                            tip_block_no = tip.block_no,
+                            "chainsync: serving MsgRollBackward to downstream (cursor gone)"
+                        );
                         let _ = runner
                             .send(&CsMsg::MsgRollBackward {
                                 point: rollback_target,
@@ -162,6 +168,12 @@ pub async fn serve_chainsync(
                                     let rollback_target = store.servable_rollback_target();
                                     let tip = store.tip();
                                     read_point = Some(rollback_target.clone());
+                                    tracing::debug!(
+                                        peer = peer.0,
+                                        target = %rollback_target,
+                                        tip_block_no = tip.block_no,
+                                        "chainsync: serving MsgRollBackward to downstream (cursor gone, awaited)"
+                                    );
                                     let _ = runner
                                         .send(&CsMsg::MsgRollBackward {
                                             point: rollback_target,
@@ -213,6 +225,12 @@ async fn send_roll_forward(
     peer: PeerId,
     controls: Option<&OutboundControls>,
 ) {
+    tracing::debug!(
+        peer = peer.0,
+        block = %block_point,
+        tip_block_no = tip.block_no,
+        "chainsync: serving MsgRollForward to downstream"
+    );
     let Some(controls) = controls else {
         let _ = runner.send(&CsMsg::MsgRollForward { header, tip }).await;
         return;
