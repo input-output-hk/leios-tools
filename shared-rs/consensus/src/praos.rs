@@ -24,7 +24,7 @@ use crate::fetch::{BlockFetchPolicy, LowestRttFirst, PeerRtt, UniformRtt};
 use crate::mempool::EbKey;
 use crate::peer::PeerId;
 use crate::peer_chain::{PeerChain, PeerChainEntry};
-use crate::types::{hex_prefix, short_hash, Point};
+use crate::types::{short_hash, Point};
 
 /// How long an in-flight fetch entry remains "active" before being
 /// considered stale and eligible for retry.  The coordinator may
