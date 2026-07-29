@@ -1,0 +1,26 @@
+[package]
+name = "shared-kes"
+version = "0.1.0"
+edition = "2021"
+description = "Cardano Sum6 KES (Key Evolving Signatures) for Leios block production: a byte-oriented keygen/evolve/sign/verify wrapper over kes-summed-ed25519, plus the operational-certificate glue (the 48-byte OCertSignable and the Ed25519 cold-key issuer)."
+
+[dependencies]
+# Cardano-compatible Sum6 KES. Same MMM sum-composition construction as
+# cardano-base's `Cardano.Crypto.KES`, over Ed25519. It ships test vectors
+# generated from Cardano's own code (its `summed_kes_interoperability` suite),
+# so its on-wire verification-key and signature bytes are byte-compatible with
+# a real node — the only KES bytes a validator ever sees. Published on
+# crates.io (unlike pallas_vrf), so a plain version pin suffices; the resolved
+# rev is frozen in Cargo.lock. Adopt-vs-vendor rationale:
+# leios-adversarial-tools docs/block-production-plan.md.
+kes-summed-ed25519 = "=0.2.1"
+
+# The operational certificate's cold key is a plain Ed25519 DSIGN key; its
+# verification key is the header `issuer_vkey`. Same major as the ed25519-dalek
+# the KES crate pulls in, so no duplicate-crate split.
+ed25519-dalek = "2"
+
+[dev-dependencies]
+hex = "0.4"
+# Decodes the real mainnet header fixture in the cross-implementation KAT.
+minicbor = { version = "0.25", features = ["std"] }
