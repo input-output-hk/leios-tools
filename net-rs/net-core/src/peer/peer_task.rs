@@ -190,14 +190,40 @@ async fn do_intersection_with_candidates(
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
     initial: bool,
 ) -> Result<(), String> {
+    let candidate_summary: Vec<String> = candidates.iter().map(|p| format!("{p}")).collect();
     match chainsync::find_intersection(runner, candidates).await {
-        Ok(Some((point, _tip))) => {
+        Ok(Some((point, tip))) => {
+            tracing::info!(
+                %peer_id, initial,
+                candidates = ?candidate_summary,
+                intersect = %point,
+                tip = %tip,
+                "chainsync: intersection resolved"
+            );
+            // Sync-at-tip: when we intersect exactly at the peer's reported
+            // tip, hand consensus the tip height so it can adopt the anchor at
+            // its true block number. Otherwise the height is unknown here.
+            let block_no = (point == tip.point).then_some(tip.block_no);
             let _ = event_sender
-                .send((peer_id, PeerEvent::IntersectionFound { point, initial }))
+                .send((
+                    peer_id,
+                    PeerEvent::IntersectionFound {
+                        point,
+                        initial,
+                        block_no,
+                    },
+                ))
                 .await;
             Ok(())
         }
-        Ok(None) => Ok(()), // no intersection, continue from origin
+        Ok(None) => {
+            tracing::info!(
+                %peer_id, initial,
+                candidates = ?candidate_summary,
+                "chainsync: NO intersection found — continuing from origin"
+            );
+            Ok(())
+        } // no intersection, continue from origin
         Err(e) => Err(format!("chainsync intersection: {e}")),
     }
 }

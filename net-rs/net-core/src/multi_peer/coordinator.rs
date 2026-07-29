@@ -579,7 +579,7 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
-            PeerEvent::IntersectionFound { point, initial } => {
+            PeerEvent::IntersectionFound { point, initial, block_no } => {
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
                     Some(peer.fragment.len())
@@ -591,7 +591,7 @@ impl Coordinator {
                 }
                 // Forward to consensus so it can store the intersection as
                 // the peer chain's anchor (guaranteed common ancestor).
-                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point, initial });
+                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point, initial, block_no });
             }
 
             PeerEvent::HeaderAnnounced { header, tip } => {
@@ -2973,6 +2973,7 @@ mod tests {
                 PeerEvent::IntersectionFound {
                     point: point_100.clone(),
                     initial: false,
+                    block_no: None,
                 },
             )
             .await;
@@ -2984,6 +2985,7 @@ mod tests {
                 PeerEvent::IntersectionFound {
                     point: point_101.clone(),
                     initial: false,
+                    block_no: None,
                 },
             )
             .await;
@@ -3024,6 +3026,7 @@ mod tests {
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
                         initial: false,
+                        block_no: None,
                     },
                 )
                 .await;
@@ -3087,6 +3090,7 @@ mod tests {
                     PeerEvent::IntersectionFound {
                         point: point.clone(),
                         initial: false,
+                        block_no: None,
                     },
                 )
                 .await;
@@ -3156,6 +3160,7 @@ mod tests {
                 PeerEvent::IntersectionFound {
                     point: p100.clone(),
                     initial: false,
+                    block_no: None,
                 },
             )
             .await;
@@ -3318,6 +3323,7 @@ mod tests {
                 PeerEvent::IntersectionFound {
                     point: point.clone(),
                     initial: false,
+                    block_no: None,
                 },
             )
             .await;
@@ -3380,6 +3386,7 @@ mod tests {
                 PeerEvent::IntersectionFound {
                     point: intersection.clone(),
                     initial: false,
+                    block_no: None,
                 },
             )
             .await;
