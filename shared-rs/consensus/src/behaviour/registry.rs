@@ -79,12 +79,30 @@ pub enum ActionSpec {
     AnnounceEquivocate,
     #[serde(rename = "fake-eb-announce")]
     FakeAnnounce,
+    /// Fabricate an announcement with a skewed header slot (future / far past).
+    #[serde(rename = "announce-slot-skew")]
+    AnnounceSlotSkew {
+        #[serde(default)]
+        slot_offset: i64,
+    },
+    /// Flood the network with `count` fabricated announcements per tick.
+    #[serde(rename = "announce-flood")]
+    AnnounceFlood {
+        #[serde(default = "default_flood_count")]
+        count: u32,
+        #[serde(default)]
+        slot_offset: i64,
+    },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
 }
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_flood_count() -> u32 {
+    100
 }
 
 fn default_lazy_reason() -> NoVoteReason {
