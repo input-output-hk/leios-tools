@@ -474,7 +474,14 @@ impl MempoolState {
             return true;
         };
 
-        let Some(record) = self.get_record_by_id(tx_id) else { return false };
+        let Some(record) = self.get_record_by_id(tx_id) else {
+            tracing::error!("filter_transaction_announcement: transaction {} not found in mempool",
+                tx_id.hex_short()
+            );
+
+            // If tx is absent in mempool, there is no way to provide it anyway
+            return false;
+        };
         let generator_applicable = record.ours || !only_ours;
         // If delay = 0, then no delay is applicable, no filtering
         let delay_applicable = current_slot.saturating_sub(record.slot) < delay;
@@ -567,6 +574,7 @@ impl MempoolState {
             .get_mut(&peer_id)
             .expect("ensure_peer_registered")
             .remove(tx_id);
+
         if was_owed {
             self.peer_advertised
                 .entry(peer_id)
