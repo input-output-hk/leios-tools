@@ -17,10 +17,15 @@
 
 mod block;
 mod eb;
+mod encode;
 mod header;
 
 pub use block::{BlockBody, LeiosBlockInfo};
 pub use eb::{decode_overflow_eb, encode_overflow_eb};
+pub use encode::{
+    encode_block_body, encode_header_inner, wrap_block, wrap_header, HeaderBody, OperationalCert,
+    DIJKSTRA_BLOCK_ERA, DIJKSTRA_HEADER_ERA,
+};
 pub use header::{HeaderInfo, WrappedHeader};
 
 /// Blake2b-256 of arbitrary bytes — matches the EB-key derivation used across

@@ -190,14 +190,47 @@ async fn do_intersection_with_candidates(
     event_sender: &mpsc::Sender<(PeerId, PeerEvent)>,
     initial: bool,
 ) -> Result<(), String> {
+    // Only format the candidate list when INFO is actually enabled — this runs
+    // on every intersection (initial sync + retries), and the log below is the
+    // sole consumer.
+    let candidate_summary: Vec<String> = if tracing::enabled!(tracing::Level::INFO) {
+        candidates.iter().map(|p| format!("{p}")).collect()
+    } else {
+        Vec::new()
+    };
     match chainsync::find_intersection(runner, candidates).await {
-        Ok(Some((point, _tip))) => {
+        Ok(Some((point, tip))) => {
+            tracing::info!(
+                %peer_id, initial,
+                candidates = ?candidate_summary,
+                intersect = %point,
+                tip = %tip,
+                "chainsync: intersection resolved"
+            );
+            // Sync-at-tip: when we intersect exactly at the peer's reported
+            // tip, hand consensus the tip height so it can adopt the anchor at
+            // its true block number. Otherwise the height is unknown here.
+            let block_no = (point == tip.point).then_some(tip.block_no);
             let _ = event_sender
-                .send((peer_id, PeerEvent::IntersectionFound { point, initial }))
+                .send((
+                    peer_id,
+                    PeerEvent::IntersectionFound {
+                        point,
+                        initial,
+                        block_no,
+                    },
+                ))
                 .await;
             Ok(())
         }
-        Ok(None) => Ok(()), // no intersection, continue from origin
+        Ok(None) => {
+            tracing::info!(
+                %peer_id, initial,
+                candidates = ?candidate_summary,
+                "chainsync: NO intersection found — continuing from origin"
+            );
+            Ok(())
+        } // no intersection, continue from origin
         Err(e) => Err(format!("chainsync intersection: {e}")),
     }
 }
@@ -992,6 +1025,7 @@ mod tests {
                     initiator_only_diffusion_mode: false,
                     peer_sharing: 1,
                     query: false,
+                    v16_flag: None,
                 };
                 crate::protocols::handshake::n2n::negotiate(client_versions, &server_data)
             },
@@ -1153,6 +1187,7 @@ mod tests {
             initiator_only_diffusion_mode: true,
             peer_sharing: 1,
             query: false,
+            v16_flag: None,
         });
         let hs_result = handshake::run_client(
             crate::mux::CodecSend::new(hs_send),
@@ -1466,9 +1501,7 @@ mod tests {
         let tx = PendingTx {
             tx: MempoolTx::new(
                 TxId::new_with_array([0x44; 32]),
-                TxBody::new_with_vec(vec![
-                    0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6,
-                ]),
+                TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
                 9,
                 false,
                 0,

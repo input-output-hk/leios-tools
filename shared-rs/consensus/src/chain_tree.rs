@@ -139,11 +139,20 @@ impl ChainTree {
         }
     }
 
+    /// Insert a sync-at-tip anchor as a bodyless `ChainStart` root.
+    ///
+    /// `block_number` is the anchor's real height when known (the ChainSync
+    /// intersection reported it via its `tip`, i.e. sync-at-tip), or `0` when
+    /// unknown (a non-tip intersection). A known height lets a cold-start node
+    /// adopt the anchor immediately and report the true tip height; with `0`
+    /// the node falls back to the `k`-bounded anchor-trust path. Updates
+    /// `best_tip` so selection sees the anchor's height.
     pub fn insert_chain_start(
         &mut self,
         hash: [u8; 32],
         point: Point,
-        slot: u64
+        slot: u64,
+        block_number: u64,
     ) -> bool {
         if self.nodes.contains_key(&hash) {
             return false;
@@ -160,10 +169,21 @@ impl ChainTree {
                 tx_count: 0,
                 announced_eb_hash: None,
                 cached_eb_tx_count: None,
-                block_number: 0,
+                block_number,
                 certified_eb: false,
             },
         );
+
+        let is_new_best = match &self.best_tip {
+            None => true,
+            Some((_, best_bn)) => {
+                let best_hash = self.best_tip_hash().unwrap_or([0xFF; 32]);
+                is_better_tip(block_number, &hash, *best_bn, &best_hash)
+            }
+        };
+        if is_new_best {
+            self.best_tip = Some((point, block_number));
+        }
 
         true
     }

@@ -53,6 +53,7 @@ pub async fn run(
         initiator_only_diffusion_mode: true,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     });
 
     let hs_result =

@@ -11,8 +11,11 @@ use shared_consensus::praos::{LeiosCertSummary, ParsedBodyInfo};
 
 use crate::{Point, MAX_BLOCK_SIZE};
 
-/// Number of base fields in a Shelley+ block array (before Leios extensions).
-const BLOCK_BASE_FIELDS: u64 = 4;
+/// Number of base fields in a Conway+ block array (before Leios extensions):
+/// `[header, tx_bodies, tx_witnesses, aux_data, invalid_transactions]`.
+/// Confirmed against live musashi blocks (every base body decodes as `array(5)`
+/// with no certificate); the `leios_certificate` is the 6th element.
+const BLOCK_BASE_FIELDS: u64 = 5;
 
 /// First era tag whose block wraps the transaction list one level deeper.
 /// Pre-Leios eras (Conway = 6, Dijkstra = 7) encode `tx_bodies` directly as
@@ -107,8 +110,9 @@ fn count_leios_tx_list(d: &mut Decoder) -> Result<u32, DecodeError> {
 ///
 /// The EB certificate is extracted from real blocks received via BlockFetch.
 /// The Shelley+ block structure is:
-///   `#6.24(bytes .cbor [era_tag, [header, tx_bodies, tx_witnesses, aux_data, ?eb_certificate]])`
-/// Base field count = 4; a 5th element is the EB certificate.
+///   `#6.24(bytes .cbor [era_tag, [header, tx_bodies, tx_witnesses, aux_data,
+///                                 invalid_transactions, ?eb_certificate]])`
+/// Base field count = 5; a 6th element is the EB certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LeiosBlockInfo {
     /// Opaque EB certificate bytes, if present in this block.
@@ -147,25 +151,51 @@ impl LeiosBlockInfo {
             return Err(DecodeError::message("Byron block"));
         }
 
-        // era_block: [header, tx_bodies, tx_witnesses, aux_data, ?eb_certificate]
         let block_len = match inner.array()? {
             Some(n) => n,
             None => return Err(DecodeError::message("indefinite block array")),
         };
 
-        if block_len <= BLOCK_BASE_FIELDS {
-            return Err(DecodeError::message("no Leios extension fields"));
-        }
+        // Extract the opaque leios_certificate bytes, era-aware.
+        let (cert_start, cert_end) = if era >= LEIOS_ERA {
+            // Era-8 Leios: block = [header, block_body]; block_body =
+            //   [invalid_transactions/nil, transactions, leios_certificate/nil,
+            //    peras_certificate/nil]
+            // The certificate is block_body[2]; nil means no cert.
+            if block_len < 2 {
+                return Err(DecodeError::message("era-8 block missing block_body"));
+            }
+            inner.skip()?; // field 0: header
+            let bb_len = match inner.array()? {
+                Some(n) => n,
+                None => return Err(DecodeError::message("indefinite block_body")),
+            };
+            if bb_len < 3 {
+                return Err(DecodeError::message("block_body missing leios_certificate slot"));
+            }
+            inner.skip()?; // [0] invalid_transactions
+            inner.skip()?; // [1] transactions
+            if inner.datatype()? == minicbor::data::Type::Null {
+                return Err(DecodeError::message("no leios certificate"));
+            }
+            let start = inner.position();
+            inner.skip()?; // [2] leios_certificate
+            (start, inner.position())
+        } else {
+            // Era-7 (flat Conway) backward-compat: block =
+            //   [header, tx_bodies, tx_witnesses, aux_data, invalid_transactions,
+            //    ?eb_certificate]
+            if block_len <= BLOCK_BASE_FIELDS {
+                return Err(DecodeError::message("no Leios extension fields"));
+            }
+            for _ in 0..BLOCK_BASE_FIELDS {
+                inner.skip()?;
+            }
+            let start = inner.position();
+            inner.skip()?; // the trailing eb_certificate
+            (start, inner.position())
+        };
 
-        // Skip base fields 0-3
-        for _ in 0..BLOCK_BASE_FIELDS {
-            inner.skip()?;
-        }
-
-        // Field 4: eb_certificate — extract as opaque bytes
-        let cert_start = inner.position();
-        inner.skip()?;
-        let cert_end = inner.position();
         let cert_bytes = inner_bytes
             .get(cert_start..cert_end)
             .ok_or_else(|| DecodeError::message("failed to extract certificate bytes"))?;
@@ -653,6 +683,7 @@ mod tests {
         }
         be.array(0).unwrap(); // empty tx_witnesses
         be.null().unwrap(); // null auxiliary_data
+        be.array(0).unwrap(); // invalid_transactions (Conway base field 5)
         if let Some(cert) = eb_certificate {
             be.bytes(cert).unwrap();
         }
@@ -670,6 +701,38 @@ mod tests {
         oe.tag(minicbor::data::Tag::new(24)).unwrap();
         oe.bytes(&inner_buf).unwrap();
 
+        outer_buf
+    }
+
+    /// Like `build_test_block_with_tx_count`, but appends `trailing` as
+    /// already-encoded CBOR for the 6th block field (rather than
+    /// bstr-wrapping it). Used to embed a bare `leios_certificate` array,
+    /// which `praos_inspect` decodes in place.
+    fn build_test_block_with_raw_trailing(era: u8, tx_count: u64, trailing: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut block_buf = Vec::new();
+        let mut be = Encoder::new(&mut block_buf);
+        be.array(BLOCK_BASE_FIELDS + 1).unwrap();
+        be.bytes(&[0x80]).unwrap(); // dummy header
+        be.array(tx_count).unwrap(); // tx_bodies
+        for _ in 0..tx_count {
+            be.null().unwrap();
+        }
+        be.array(0).unwrap(); // tx_witnesses
+        be.null().unwrap(); // auxiliary_data
+        be.array(0).unwrap(); // invalid_transactions (Conway base field 5)
+        be.writer_mut().write_all(trailing).unwrap(); // raw 6th field
+
+        let mut inner_buf = Vec::new();
+        let mut ie = Encoder::new(&mut inner_buf);
+        ie.array(2).unwrap();
+        ie.u32(era as u32).unwrap();
+        ie.writer_mut().write_all(&block_buf).unwrap();
+
+        let mut outer_buf = Vec::new();
+        let mut oe = Encoder::new(&mut outer_buf);
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner_buf).unwrap();
         outer_buf
     }
 
@@ -806,6 +869,41 @@ mod tests {
         assert!(body.leios.is_none());
     }
 
+    /// Build an era-8 Leios block `#6.24([8, [header, block_body]])` with a
+    /// dummy (skippable) header. `cert` is the raw leios_certificate CBOR for
+    /// `block_body[2]`, or None for a nil cert slot.
+    fn build_era8_block(cert: Option<&[u8]>) -> Vec<u8> {
+        let body = crate::encode_block_body(&[], cert);
+        let dummy_header_inner = [0x80u8]; // empty array — parse skips field 0
+        crate::wrap_block(&dummy_header_inner, &body, crate::DIJKSTRA_BLOCK_ERA)
+    }
+
+    #[test]
+    fn parse_era8_block_extracts_cert_at_block_body_index_2() {
+        // On-chain 2-tuple cert [signers, sig48].
+        let mut cert = Vec::new();
+        let _ = Encoder::new(&mut cert)
+            .array(2)
+            .and_then(|e| e.bytes(&[0x63, 0xff, 0xff]))
+            .and_then(|e| e.bytes(&[0x11u8; 48]));
+        let block = build_era8_block(Some(&cert));
+        let info = LeiosBlockInfo::parse(&block).expect("era-8 block with cert parses");
+        assert_eq!(
+            info.eb_certificate.expect("cert present"),
+            cert,
+            "the leios_certificate at block_body[2] is extracted verbatim"
+        );
+    }
+
+    #[test]
+    fn parse_era8_block_nil_cert_returns_none() {
+        let block = build_era8_block(None);
+        assert!(
+            LeiosBlockInfo::parse(&block).is_none(),
+            "a nil block_body[2] means no certificate"
+        );
+    }
+
     /// Build a block with a real parseable Shelley+ header for point() testing.
     fn build_block_with_header(era: u8, slot: u64) -> Vec<u8> {
         use std::io::Write as _;
@@ -921,9 +1019,8 @@ mod tests {
         let body = BlockBody::new(raw);
         let info = body.praos_inspect();
         assert_eq!(info.tx_count, 0);
-        // build_test_block_with_tx_count emits the legacy 4-field base
-        // (no `invalid_transactions`); good enough as a control case.
-        assert_eq!(info.field_count, 4);
+        // Conway base: [header, tx_bodies, tx_witnesses, aux, invalid_transactions].
+        assert_eq!(info.field_count, 5);
         assert!(info.eb_certificate.is_none());
     }
 
@@ -936,16 +1033,31 @@ mod tests {
 
     #[test]
     fn praos_inspect_with_eb_certificate_blob() {
-        // The fixture's 4-field base + cert blob lands in the
-        // `base_remaining` skip path (no trailing-optional read), so the
-        // parser never tries to decode the cert.  Result: tx_count + 5
-        // fields visible, eb_certificate stays None.
-        let raw = build_test_block_with_tx_count(7, 3, Some(&[0xCA, 0xFE]));
+        // Conway base (5 fields) + a real CIP-0164 `leios_certificate`
+        // array(4) in the trailing slot → 6 fields. `praos_inspect`
+        // descends into the cert slot (unlike `LeiosBlockInfo::parse`,
+        // which keeps it opaque), so the fixture must be a bare array
+        // `[slot, eb_hash, signers, sig]`, matching the on-wire shape.
+        let eb_slot = 4242u64;
+        let eb_hash = [0x11u8; 32];
+        let signers = [0x0Fu8; 2];
+        let agg_sig = [0x22u8; 48];
+        let mut cert = Vec::new();
+        let mut ce = Encoder::new(&mut cert);
+        ce.array(4).unwrap();
+        ce.u64(eb_slot).unwrap();
+        ce.bytes(&eb_hash).unwrap();
+        ce.bytes(&signers).unwrap();
+        ce.bytes(&agg_sig).unwrap();
+
+        let raw = build_test_block_with_raw_trailing(7, 3, &cert);
         let body = BlockBody::new(raw);
         let info = body.praos_inspect();
         assert_eq!(info.tx_count, 3);
-        assert_eq!(info.field_count, 5);
-        assert!(info.eb_certificate.is_none());
+        assert_eq!(info.field_count, 6);
+        let summary = info.eb_certificate.expect("cert decoded");
+        assert_eq!(summary.eb_slot, eb_slot);
+        assert_eq!(summary.eb_hash, eb_hash);
     }
 
     #[test]

@@ -31,6 +31,30 @@ enum Command {
         /// Network magic number
         #[arg(long, default_value_t = n2n::MAINNET_MAGIC)]
         magic: u64,
+
+        /// Send a query handshake: ask the peer for its full version table
+        /// and print it, without committing to a version.
+        #[arg(long)]
+        query: bool,
+
+        /// Advertise initiator-only diffusion (default: duplex /
+        /// initiator-and-responder). Some nodes refuse initiator-only peers.
+        #[arg(long)]
+        initiator_only: bool,
+
+        /// PeerSharing flag to advertise (0 or 1).
+        #[arg(long, default_value_t = 1)]
+        peer_sharing: u8,
+
+        /// Comma-separated versions to propose (e.g. "14,15,16"). Defaults to
+        /// all supported versions.
+        #[arg(long, value_delimiter = ',')]
+        propose: Vec<u64>,
+
+        /// Override a version's raw params with hex, as "N=HEX" (repeatable).
+        /// Bypasses the encoder to probe non-standard version-data encodings.
+        #[arg(long = "raw-version", value_name = "N=HEX")]
+        raw_version: Vec<String>,
     },
 
     /// Capture raw handshake bytes from a node for test vectors
@@ -236,7 +260,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Handshake { host, magic } => handshake::run(&host, magic).await,
+        Command::Handshake {
+            host,
+            magic,
+            query,
+            initiator_only,
+            peer_sharing,
+            propose,
+            raw_version,
+        } => {
+            handshake::run(
+                &host,
+                handshake::Options {
+                    magic,
+                    query,
+                    initiator_only,
+                    peer_sharing,
+                    propose,
+                    raw_version,
+                },
+            )
+            .await
+        }
         Command::Capture { host, magic } => capture::run(&host, magic).await,
         Command::ChainSync { host, magic, count } => chainsync::run(&host, magic, count).await,
         Command::BlockFetch {

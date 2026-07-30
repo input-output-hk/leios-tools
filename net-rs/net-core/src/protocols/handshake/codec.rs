@@ -366,8 +366,17 @@ mod tests {
             initiator_only_diffusion_mode: false,
             peer_sharing: 0,
             query: false,
+            v16_flag: None,
         };
-        let versions = super::super::n2n::version_table(&data);
+        // The captured payload predates v16; propose only v14/v15 so the
+        // byte-exact comparison against the live capture still holds.
+        let versions = super::super::n2n::version_table_for(
+            &data,
+            &[
+                super::super::n2n::VERSION_V14,
+                super::super::n2n::VERSION_V15,
+            ],
+        );
         let msg = Message::ProposeVersions(versions);
         let encoded = minicbor::to_vec(&msg).unwrap();
         assert_eq!(

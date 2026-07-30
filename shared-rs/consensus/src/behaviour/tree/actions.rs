@@ -104,6 +104,13 @@ pub fn build_action(spec: &ActionSpec, seed: u64) -> Box<dyn LeafAction> {
         ActionSpec::AnnounceDangling => Box::new(catalogue::AnnounceDangling),
         ActionSpec::AnnounceEquivocate => Box::new(catalogue::AnnounceEquivocate),
         ActionSpec::FakeAnnounce => Box::new(catalogue::FakeAnnounce),
+        ActionSpec::AnnounceSlotSkew { slot_offset } => Box::new(catalogue::AnnounceSlotSkew {
+            slot_offset: *slot_offset,
+        }),
+        ActionSpec::AnnounceFlood { count, slot_offset } => Box::new(catalogue::AnnounceFlood {
+            count: *count,
+            slot_offset: *slot_offset,
+        }),
         ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
     }
 }

@@ -103,6 +103,7 @@ pub async fn connect_and_handshake_with_config(
         initiator_only_diffusion_mode: true,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     });
 
     let hs_result =
@@ -208,6 +209,7 @@ pub async fn handshake_accepted(
         initiator_only_diffusion_mode: false,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     };
     let hs_result = handshake::run_server(
         CodecSend::new(hs_send),
@@ -282,6 +284,7 @@ pub async fn handshake_accepted_duplex(
         initiator_only_diffusion_mode: false,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     };
     let hs_result = handshake::run_server(
         CodecSend::new(hs_send),
@@ -360,6 +363,7 @@ pub async fn connect_duplex(
         initiator_only_diffusion_mode: false,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     });
 
     let hs_result =
@@ -442,6 +446,7 @@ pub async fn accept_duplex(
         initiator_only_diffusion_mode: false,
         peer_sharing: 1,
         query: false,
+        v16_flag: None,
     };
     let hs_result = handshake::run_server(
         CodecSend::new(hs_send),

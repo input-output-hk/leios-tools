@@ -391,6 +391,17 @@ impl Elections {
             .unwrap_or(false)
     }
 
+    /// The EB context `(eb_hash, eb_slot)` for the election an announcing RB
+    /// started, if one exists. `eb_slot` is the announcing RB's slot (the EB
+    /// carries no separate slot). Together these reconstruct exactly what a
+    /// vote's signer signed — so a receiver can BLS-verify an inbound vote
+    /// carrying only `announcing_rb_hash`.
+    pub fn eb_context(&self, announcing_rb_hash: &[u8; 32]) -> Option<([u8; 32], u64)> {
+        self.elections
+            .get(announcing_rb_hash)
+            .map(|e| (e.eb_hash, e.announced_slot))
+    }
+
     /// True iff *any* election that announced `eb_hash` has its body
     /// validated locally. Used where only the EB hash is known (the
     /// cert-safety gate keyed off a chain-committed cert), independent
@@ -629,6 +640,24 @@ mod tests {
             }
             _ => panic!("expected Expired"),
         }
+    }
+
+    #[test]
+    fn eb_context_reconstructs_signed_pair_for_announced_rb() {
+        // A receiver BLS-verifies an inbound vote that carries only the
+        // announcing RB hash; `eb_context` must return exactly what the signer
+        // signed — the EB hash (NOT the RB key) and the announcing RB's slot.
+        let mut e = test_elections();
+        e.on_slot(10);
+        // Distinct RB key (h(1)) and EB hash (h(2)) so a regression that returns
+        // the RB hash in place of the EB hash is caught.
+        e.announce_from_rb(h(1), 10, h(2));
+        assert_eq!(e.eb_context(&h(1)), Some((h(2), 10)));
+        // An unknown / never-announced hash has no context.
+        assert_eq!(e.eb_context(&h(9)), None);
+        // Once the election is pruned, its context is gone.
+        e.prune_below_slot(20);
+        assert_eq!(e.eb_context(&h(1)), None);
     }
 
     #[test]

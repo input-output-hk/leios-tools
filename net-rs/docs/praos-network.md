@@ -275,6 +275,17 @@ The version data record for N2N contains:
 | diffusionMode | Bool | `True` = initiator-only, `False` = initiator-and-responder |
 | peerSharing | 0 or 1 | 1 = will run PeerSharing mini-protocol |
 | query | Bool | `True` = send all versions & terminate |
+| v16Flag | Bool | **v16 only** — a fifth element appended to the array. Semantics not yet pinned down in this spec; observed as `False` on the Leios dev testnet. |
+
+Versions 11–15 encode `nodeToNodeVersionData` as a **4-element** CBOR array
+(`[networkMagic, diffusionMode, peerSharing, query]`); version 16 encodes a
+**5-element** array that appends `v16Flag`. Our codec models this as an optional
+trailing boolean (`VersionData::v16_flag`): `None` selects the 4-element form so
+v14/v15 params round-trip byte-for-byte, `Some(_)` selects the 5-element v16
+form. `net-cli handshake --query <host>` prints a peer's full version table
+(useful for fingerprinting: standard nodes answer the query and advertise up to
+v16, whereas some non-standard implementations reset the connection on a query
+and top out at v15).
 
 ### 5.5 Version Negotiation Algorithm (Server)
 

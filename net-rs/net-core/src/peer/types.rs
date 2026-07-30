@@ -35,7 +35,14 @@ pub enum PeerEvent {
     },
 
     /// ChainSync: intersection found during `find_intersection`.
-    IntersectionFound { point: Point, initial: bool },
+    /// `block_no` is the intersection point's height when it is the peer's
+    /// reported tip (sync-at-tip), else `None`. Lets consensus adopt the tip
+    /// anchor at cold start with its true height.
+    IntersectionFound {
+        point: Point,
+        initial: bool,
+        block_no: Option<u64>,
+    },
 
     /// ChainSync: peer announced a new header (from `MsgRollForward`).
     HeaderAnnounced { header: WrappedHeader, tip: Tip },

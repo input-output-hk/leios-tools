@@ -1424,6 +1424,13 @@ impl LeiosState {
         self.elections.eb_certifiable_slot(eb_hash)
     }
 
+    /// The EB context `(eb_hash, eb_slot)` a vote's `announcing_rb_hash` refers
+    /// to, if an election exists for it — what the vote's signer BLS-signed.
+    /// Lets a receiver verify inbound votes that carry only the RB hash.
+    pub fn eb_context(&self, announcing_rb_hash: &[u8; 32]) -> Option<([u8; 32], u64)> {
+        self.elections.eb_context(announcing_rb_hash)
+    }
+
     /// Snapshot every internal collection's size.  Used both by
     /// [`Self::log_state_sizes`] and by per-slot telemetry adapters.
     pub fn state_sizes(&self) -> LeiosStateSizes {

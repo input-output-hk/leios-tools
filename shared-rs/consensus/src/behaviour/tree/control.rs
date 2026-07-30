@@ -116,6 +116,18 @@ pub struct LeiosControl {
     /// EB body / `MsgLeiosBlockOffer` is unaffected — censoring the fast
     /// discovery pulse. Default `false` keeps `ControlSignal::default()` honest.
     pub withhold_announce: bool,
+    /// Signed slot offset applied to a **fabricated** announcement's header slot
+    /// (`> 0` future, `< 0` far past) — the `announce-slot-skew` action. Probes
+    /// the not-from-future / far-past / age ≤ L timing checks the Haskell
+    /// diffusion PR does not yet enforce. Only meaningful with `fake_announce`;
+    /// default `0` (no skew).
+    pub announce_slot_offset: i64,
+    /// Number of **fabricated** announcements to emit per tick when
+    /// `fake_announce` — the `announce-flood` action. `0`/`1` = a single
+    /// fabrication (honest-shaped); `> 1` = flood / junk-message DoS, exploiting
+    /// the absent junk-detection + ≤ 2-per-election server discipline. Default
+    /// `0` keeps `ControlSignal::default()` honest.
+    pub announce_flood_count: u32,
 }
 
 /// Mempool-domain actuator inputs.
