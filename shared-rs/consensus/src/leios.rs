@@ -716,7 +716,6 @@ impl LeiosState {
                     }
                 }
                 SlotEffect::Expired {
-                    rb_hash,
                     eb_slot,
                     had_quorum,
                     voted_weight,
@@ -724,9 +723,6 @@ impl LeiosState {
                     expected_weight,
                     ..
                 } => {
-                    let point = Point::Specific {slot: eb_slot, hash: rb_hash};
-                    info!("leios_store: elections expired for {point}");
-                    self.postponed_eb_tx_requests.remove(&point);
                     fx.push(LeiosEffect::EmitTelemetry(
                         LeiosTelemetryEvent::ElectionExpired {
                             eb_slot,
