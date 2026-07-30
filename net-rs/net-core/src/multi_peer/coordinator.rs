@@ -3677,7 +3677,7 @@ mod tests {
         let mut got = None;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            if let Some(stored) = leios_store.get_block_txs(4, &eb_hash, &bitmap) {
+            if let Some(stored) = leios_store.get_block_txs(4, &eb_hash, &bitmap, PeerId(10)) {
                 if !stored.is_empty() {
                     got = Some(stored);
                     break;
@@ -3741,7 +3741,7 @@ mod tests {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(5)).await;
             let bitmap = crate::protocols::leios_fetch::bitmap::select_all(txs.len() as u32);
-            if let Some(stored) = leios_store.get_block_txs(7, &hash, &bitmap) {
+            if let Some(stored) = leios_store.get_block_txs(7, &hash, &bitmap, PeerId(14)) {
                 got = Some(stored);
                 break;
             }
@@ -3810,7 +3810,7 @@ mod tests {
         // Bodies are merged at the right positions.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1, 2]);
         let got = leios_store
-            .get_block_txs(12, &eb_hash, &bitmap)
+            .get_block_txs(12, &eb_hash, &bitmap, PeerId(41))
             .expect("store should know about EB");
         // Index 1 is missing (we never fetched it); union returns just
         // 0 and 2 in ascending order.
@@ -3876,7 +3876,7 @@ mod tests {
         ));
         // Store has nothing — no manifest, no inject.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0]);
-        assert!(leios_store.get_block_txs(14, &eb_hash, &bitmap).is_none());
+        assert!(leios_store.get_block_txs(14, &eb_hash, &bitmap, PeerId(1770)).is_none());
     }
 
     /// When a peer's command channel fills (peer task not draining), the
