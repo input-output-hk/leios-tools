@@ -39,10 +39,17 @@ condition_binder)` compiles the same grammar into any `BehaviourTree<C, E>` —
 the caller supplies how a leaf `kind` and a condition string become its own
 leaves/conditions. `compile()` is the consensus binding of that entry.
 
-What remains consensus-specific: the eager `parse` (which type-checks `[env]`
-values and validates `cardano.*` refs up front) and the consensus leaf/condition
-vocabularies. Other instantiations use `parse_generic` (structural validation
-only) and validate their own refs in their binder.
+There is exactly **one** grammar and one parser. `BtConfig::parse` is
+vocabulary-agnostic: it enforces the domain-neutral structure (root, children,
+cycles, arity) and keeps `Action`/`Condition` leaves as raw source. Every
+instantiation calls it.
+
+What is consensus-specific is *validation*, not parsing: `validate` checks the
+consensus leaf vocabulary (each `Action` `spec` deserialises into a known
+`ActionSpec`; each condition parses and type-checks against `env.*`/`cardano.*`),
+and `compile` runs it for you. Another instantiation validates its own vocabulary
+in its binders instead — an unknown leaf kind or an unresolvable reference is
+rejected there, with the offending behaviour id attached.
 
 ## Hook taxonomy
 

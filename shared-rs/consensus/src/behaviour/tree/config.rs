@@ -143,45 +143,20 @@ pub struct BtConfig {
 }
 
 impl BtConfig {
-    /// Parse a self-contained config from TOML text for the **consensus**
-    /// instantiation. Rejects a non-empty `includes`, and eagerly checks that
-    /// every `Action` spec deserialises into a known [`ActionSpec`] and every
-    /// `Condition` expression parses, so those load-time errors surface at parse
-    /// (as before the generic-compiler refactor). Does not yet check
-    /// references/cycles — call [`validate`](Self::validate) or
-    /// [`compile`](Self::compile).
+    /// Parse a self-contained config from TOML text.
+    ///
+    /// There is exactly **one** grammar and one parser: `Action`/`Condition`
+    /// leaves are kept as raw source (the leaf `kind` + `spec` table, and the
+    /// expression text), so a single parsed config can be bound to any tree
+    /// instantiation via [`compile_with`](Self::compile_with). Rejects a
+    /// non-empty `includes` and enforces the domain-neutral structure.
+    ///
+    /// Parsing deliberately does **not** check the leaf *vocabulary* — whether
+    /// `kind` names a known action, or a condition's references resolve — because
+    /// that vocabulary differs per instantiation. Those checks belong to the
+    /// domain: see [`validate`](Self::validate) for the consensus ones, which
+    /// [`compile`](Self::compile) runs for you.
     pub fn parse(text: &str) -> Result<BtConfig, ConfigError> {
-        let cfg = BtConfig::parse_generic(text)?;
-        // Consensus-eager binding checks (behaviour-preserving: these errors
-        // fired at parse time before actions/conditions were stored raw).
-        for (id, raw) in &cfg.behaviours {
-            match raw {
-                RawBehaviour::Action { params, .. } => {
-                    let _spec: ActionSpec = toml::Value::Table(params.clone()).try_into().map_err(
-                        |e: toml::de::Error| ConfigError::ActionSpec {
-                            id: id.0.clone(),
-                            msg: e.to_string(),
-                        },
-                    )?;
-                }
-                RawBehaviour::Condition(src) => {
-                    ConditionExpr::parse(src).map_err(|m| ConfigError::Condition {
-                        id: id.0.clone(),
-                        msg: m,
-                    })?;
-                }
-                _ => {}
-            }
-        }
-        Ok(cfg)
-    }
-
-    /// Parse a self-contained config **structurally**, keeping `Action`/
-    /// `Condition` leaves as raw source. Domain-neutral: it does not bind or
-    /// validate the leaf vocabulary, so a second instantiation (e.g. a cluster
-    /// manoeuvre) reuses the exact grammar and then binds its own actions and
-    /// conditions via [`compile_with`](Self::compile_with).
-    pub fn parse_generic(text: &str) -> Result<BtConfig, ConfigError> {
         let root: toml::Table =
             toml::from_str(text).map_err(|e| ConfigError::Toml(e.to_string()))?;
 
@@ -236,24 +211,41 @@ impl BtConfig {
         })
     }
 
-    /// Enforce every validation rule (spec FR-013): one `[run]`; root defined;
-    /// children resolve; no cycles; arity; consensus condition refs resolve and
-    /// type-check. The structural rules are domain-neutral
-    /// ([`validate_structure`](Self::validate_structure)); the condition typing
-    /// is consensus-specific (`env.*`/`cardano.*`).
+    /// Enforce every validation rule (spec FR-013) for the **consensus**
+    /// instantiation: the domain-neutral structure
+    /// ([`validate_structure`](Self::validate_structure)) plus the consensus leaf
+    /// vocabulary — every `Action` `spec` deserialises into a known
+    /// [`ActionSpec`], and every `Condition` expression parses and type-checks
+    /// against `env.*`/`cardano.*`.
+    ///
+    /// This is the consensus counterpart to another instantiation's binder
+    /// checks: [`parse`](Self::parse) is vocabulary-agnostic, so all
+    /// consensus-specific rejection happens here (and in
+    /// [`compile`](Self::compile), which calls this first).
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_structure()?;
         for (id, raw) in &self.behaviours {
-            if let RawBehaviour::Condition(src) = raw {
-                let expr = ConditionExpr::parse(src).map_err(|m| ConfigError::Condition {
-                    id: id.0.clone(),
-                    msg: m,
-                })?;
-                expr.validate(&self.env)
-                    .map_err(|m| ConfigError::Condition {
+            match raw {
+                RawBehaviour::Action { params, .. } => {
+                    let _spec: ActionSpec = toml::Value::Table(params.clone()).try_into().map_err(
+                        |e: toml::de::Error| ConfigError::ActionSpec {
+                            id: id.0.clone(),
+                            msg: e.to_string(),
+                        },
+                    )?;
+                }
+                RawBehaviour::Condition(src) => {
+                    let expr = ConditionExpr::parse(src).map_err(|m| ConfigError::Condition {
                         id: id.0.clone(),
                         msg: m,
                     })?;
+                    expr.validate(&self.env)
+                        .map_err(|m| ConfigError::Condition {
+                            id: id.0.clone(),
+                            msg: m,
+                        })?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1129,8 +1121,15 @@ root = "a"
 type = "Action"
 spec = { kind = "not-a-real-action" }
 "#;
+        // An unknown action kind is a consensus *vocabulary* error, so it is
+        // raised by `validate`/`compile` rather than by the shared parser.
+        let cfg = BtConfig::parse(text).expect("structurally valid");
         assert!(matches!(
-            BtConfig::parse(text),
+            cfg.validate(),
+            Err(ConfigError::ActionSpec { .. })
+        ));
+        assert!(matches!(
+            BtConfig::compile_str(text),
             Err(ConfigError::ActionSpec { .. })
         ));
     }
@@ -1265,7 +1264,7 @@ spec = { kind = "lazy-voter" }
 
     // ---- Generic entrypoints: a non-consensus instantiation ----
     //
-    // A minimal second instantiation proves `parse_generic` + `compile_with`
+    // A minimal second instantiation proves `parse` + `compile_with`
     // are usable without any consensus type: `Effect` is a counter, the
     // context view carries one number the condition compares against, and the
     // binders understand a single leaf kind and a single condition form.
@@ -1361,7 +1360,7 @@ spec = { kind = "bump", by = 3 }
 
     #[test]
     fn compile_with_builds_a_non_consensus_instantiation() {
-        let cfg = BtConfig::parse_generic(TOY).unwrap();
+        let cfg = BtConfig::parse(TOY).unwrap();
         let mut tree = cfg.compile_with(toy_action, toy_condition).unwrap();
 
         // Gate false (value < 10) → the selector falls through to the leaf,
@@ -1389,7 +1388,7 @@ root = "root"
 type = "Action"
 spec = { kind = "nope" }
 "#;
-        let cfg = BtConfig::parse_generic(text).unwrap();
+        let cfg = BtConfig::parse(text).unwrap();
         let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
         match err {
             ConfigError::ActionSpec { id, msg } => {
@@ -1409,7 +1408,7 @@ root = "root"
 type = "Condition"
 expression = "cardano.current_slot >= 1"
 "#;
-        let cfg = BtConfig::parse_generic(text).unwrap();
+        let cfg = BtConfig::parse(text).unwrap();
         let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
         match err {
             ConfigError::Condition { id, .. } => assert_eq!(id, "root"),
@@ -1418,15 +1417,28 @@ expression = "cardano.current_slot >= 1"
     }
 
     #[test]
-    fn parse_generic_is_structural_where_consensus_parse_is_eager() {
-        // A leaf kind that means nothing to consensus: `parse_generic` accepts
-        // it (structure is fine; the binder decides), while the consensus
-        // `parse` rejects it eagerly.
-        assert!(BtConfig::parse_generic(TOY).is_ok());
-        assert!(BtConfig::parse(TOY).is_err());
+    fn parse_is_vocabulary_agnostic_and_domains_reject_in_their_own_layer() {
+        // `TOY` uses a leaf kind and a condition form that mean nothing to
+        // consensus. The single shared parser accepts it — the structure is
+        // fine, and the vocabulary is the domain's business.
+        let cfg = BtConfig::parse(TOY).expect("one grammar: parse is vocabulary-agnostic");
 
-        // Structural validation still applies to both: an undefined child is a
-        // hard error regardless of instantiation.
+        // The toy domain binds it happily...
+        assert!(cfg.compile_with(toy_action, toy_condition).is_ok());
+
+        // ...while consensus rejects the same config in ITS layer: `validate`
+        // (and therefore `compile`), not `parse`. Which vocabulary error comes
+        // first depends on behaviour-id ordering, so assert the layer, not the
+        // variant — `TOY` is invalid to consensus in both its action and its
+        // condition.
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Condition { .. } | ConfigError::ActionSpec { .. })
+        ));
+        assert!(cfg.compile().is_err());
+
+        // Structural validation still applies to every domain: an undefined
+        // child is a hard error regardless of instantiation.
         let missing_child = r#"
 [run]
 name = "toy"
@@ -1436,7 +1448,7 @@ root = "root"
 type = "Sequence"
 children = ["ghost"]
 "#;
-        let cfg = BtConfig::parse_generic(missing_child).unwrap();
+        let cfg = BtConfig::parse(missing_child).unwrap();
         assert!(cfg.validate_structure().is_err());
         assert!(cfg.compile_with(toy_action, toy_condition).is_err());
     }
@@ -1452,7 +1464,7 @@ root = "root"
 type = "Action"
 spec = { by = 3 }
 "#;
-        match BtConfig::parse_generic(text) {
+        match BtConfig::parse(text) {
             Err(ConfigError::BadField { id, msg }) => {
                 assert_eq!(id, "root");
                 assert!(msg.contains("kind"), "msg should mention `kind`: {msg}");
