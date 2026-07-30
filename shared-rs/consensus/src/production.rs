@@ -152,7 +152,7 @@ mod tests {
             body: TxBody::new_with_vec(vec![0u8; size as usize]),
             size,
             ours: false,
-            gen_slot: 0,
+            slot: 0,
         }
     }
 

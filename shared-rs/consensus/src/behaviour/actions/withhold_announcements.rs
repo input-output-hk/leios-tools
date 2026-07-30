@@ -32,7 +32,6 @@ impl LeafAction for WithholdAnnouncements {
             withholding_slots: self.withholding_slots,
             tx_producer_only: self.tx_producer_only,
         };
-        tracing::info!("Contributing: {:?}", out.mempool.announce_filter);
         Status::Running
     }
 

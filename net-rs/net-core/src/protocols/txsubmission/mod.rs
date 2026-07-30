@@ -289,7 +289,7 @@ fn announce_txs(
     pending_bodies: &mut VecDeque<PendingTx>,
 ) -> Vec<TxIdAndSize> {
     let txs_announcement = new_txs.iter().map(
-        |x| format!("{}:{},{}", x.tx.tx_id.hex_short(), x.tx.ours, x.tx.gen_slot)
+        |x| format!("{}:{},{}", x.tx.tx_id.hex_short(), x.tx.ours, x.tx.slot)
     ).collect::<Vec<_>>();
     tracing::info!("Announcing Txs (len={}): {:?}", txs_announcement.len(), txs_announcement);
 
@@ -326,7 +326,7 @@ pub async fn run_client(
     runner: &mut Runner<TxSubmission>,
     tx_receiver: &mut mpsc::Receiver<PendingTx>,
     request_sender: Option<mpsc::Sender<u16>>,
-    peer_id: PeerId,
+    _peer_id: PeerId,
 ) -> Result<(), ProtocolError> {
     // Send MsgInit to transition StInit -> StIdle.
     runner.send(&Message::MsgInit).await?;

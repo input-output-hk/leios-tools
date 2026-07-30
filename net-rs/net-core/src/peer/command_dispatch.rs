@@ -15,7 +15,8 @@ use super::types::PeerCommand;
 
 /// Channel senders for dispatching commands to client-side protocol tasks.
 pub(crate) struct ClientProtocolSenders {
-    pub peer_id: PeerId,
+    #[allow(dead_code)]
+    pub peer_id: PeerId, // Needed for debug info
     pub fetch: mpsc::Sender<(Point, Point)>,
     pub peer_share: mpsc::Sender<u8>,
     pub tx_submit: mpsc::Sender<PendingTx>,

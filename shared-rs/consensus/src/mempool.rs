@@ -149,17 +149,17 @@ pub struct MempoolTx {
     pub ours: bool,
 
     /// Slot of acceptance into mempool.
-    pub gen_slot: u64,
+    pub slot: u64,
 }
 
 impl MempoolTx {
-    pub fn new(tx_id: TxId, body: TxBody, size: u32, ours: bool, gen_slot: u64) -> MempoolTx {
+    pub fn new(tx_id: TxId, body: TxBody, size: u32, ours: bool, slot: u64) -> MempoolTx {
         MempoolTx {
             tx_id,
             body,
             size,
             ours,
-            gen_slot
+            slot
         }
     }
 }
@@ -331,7 +331,6 @@ impl MempoolState {
     /// produced by the BT tick, storing the mempool-domain slice. Called once
     /// per slot by the I/O wrapper.
     pub fn apply_control(&mut self, control: &crate::behaviour::tree::control::ControlSignal) {
-        tracing::info!("Applying control: {:?}", control);
         self.control = control.clone();
     }
 
@@ -478,10 +477,7 @@ impl MempoolState {
         let Some(record) = self.get_record_by_id(tx_id) else { return false };
         let generator_applicable = record.ours || !only_ours;
         // If delay = 0, then no delay is applicable, no filtering
-        let delay_applicable = current_slot.saturating_sub(record.gen_slot) < delay;
-
-        info!("Filtering announcement for tx {}: ours={}, only_ours={}, gen_slot={}, current_slot={}, delay={}, generator_applicable={}, delay_applicable={}",
-            tx_id.hex_short(), record.ours, only_ours, record.gen_slot, current_slot, delay, generator_applicable, delay_applicable);
+        let delay_applicable = current_slot.saturating_sub(record.slot) < delay;
 
         // If delay and generator are applicable -- withhold Tx from announcing
         !(generator_applicable && delay_applicable)
@@ -905,7 +901,7 @@ impl MempoolState {
             body,
             size,
             ours,
-            gen_slot: slot,
+            slot: slot,
         });
         fx
     }
@@ -1339,14 +1335,14 @@ mod tests {
         let _ = s.admit_validated(own_id.clone(), own_body, own_sz, 42, true);
         let own = s.txs.iter().find(|t| t.tx_id == own_id).unwrap();
         assert!(own.ours);
-        assert_eq!(own.gen_slot, 42);
+        assert_eq!(own.slot, 42);
 
         // Peer-sent tx admitted after validation: ours = false.
         let (peer_id, peer_body, peer_sz) = tx(2, 10);
         let _ = s.admit_validated(peer_id.clone(), peer_body, peer_sz, 42, false);
         let peer = s.txs.iter().find(|t| t.tx_id == peer_id).unwrap();
         assert!(!peer.ours);
-        assert_eq!(peer.gen_slot, 42);
+        assert_eq!(peer.slot, 42);
 
         // Network-validated path never marks a tx as ours.
         let (net_id, net_body, _net_sz) = tx(3, 10);
@@ -1354,14 +1350,14 @@ mod tests {
         let _ = on_tx_validated(&mut s, net_id.clone(), 10, 43);
         let net = s.txs.iter().find(|t| t.tx_id == net_id).unwrap();
         assert!(!net.ours);
-        assert_eq!(net.gen_slot, 43);
+        assert_eq!(net.slot, 43);
 
         // EB bodies merged from peers are never ours, stamped with the slot.
         let (eb_id, eb_body, eb_sz) = tx(4, 10);
         s.merge_eb_body(MempoolTx::new(eb_id.clone(), eb_body, eb_sz, false, 43));
         let eb = s.eb_pinned.get(&eb_id).unwrap();
         assert!(!eb.ours);
-        assert_eq!(eb.gen_slot, 43);
+        assert_eq!(eb.slot, 43);
     }
 
     // -- EB body management ------------------------------------------------
