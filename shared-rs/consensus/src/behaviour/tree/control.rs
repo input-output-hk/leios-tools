@@ -135,6 +135,13 @@ pub struct LeiosControl {
 pub struct MempoolControl {
     /// EB/tx processing filter.
     pub tx_filter: TxFilterPolicy,
+    /// `tx-flood` action: drive the local tx generator at this rate (txs/sec;
+    /// `0` = honest, no override). The net-node actuator applies it to the tx
+    /// generator so the node injects far faster than the network drains,
+    /// overflowing the mempool (evict-oldest) to displace honest txs. Integer
+    /// to keep the control signal `Eq`; fractional precision is irrelevant for
+    /// a flood.
+    pub tx_flood_rate: u32,
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.

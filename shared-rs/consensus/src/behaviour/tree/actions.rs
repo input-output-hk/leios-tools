@@ -112,6 +112,7 @@ pub fn build_action(
             slot_offset: *slot_offset,
         }),
         ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
+        ActionSpec::TxFlood { rate } => Box::new(catalogue::TxFlood { rate: *rate }),
     }
 }
 
