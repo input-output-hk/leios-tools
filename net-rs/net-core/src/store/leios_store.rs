@@ -18,6 +18,8 @@ use shared_consensus::PeerId;
 use crate::protocols::leios_fetch::bitmap;
 use crate::types::{Point, Vote, WrappedHeader};
 use shared_consensus::mempool::{TxBody, TxId};
+use shared_consensus::types::hex_prefix;
+use tracing::info;
 
 /// Resolves a transaction body by its 32-byte hash. The Leios store calls
 /// this when a peer asks for an EB's txs and only the manifest is cached
@@ -323,6 +325,7 @@ impl LeiosStore {
         for (idx, body) in indexed {
             entry.entry(idx).or_insert(body);
         }
+        info!("leios_store: injecting block_txs {point}: txs {}, from {source:?}", entry.len());
         inner.max_slot = inner.max_slot.max(slot);
         Self::push_notification(
             &mut inner,
@@ -342,6 +345,8 @@ impl LeiosStore {
             .enumerate()
             .map(|(i, b)| (i as u32, b))
             .collect();
+
+        info!("leios_store: injecting full block_txs {point}: txs {}, from {source:?}", indexed.len());
         self.inject_block_txs(point, indexed, source);
     }
 
@@ -432,6 +437,7 @@ impl LeiosStore {
         slot: u64,
         hash: &[u8; 32],
         bitmap: &BTreeMap<u16, u64>,
+        peer_id: PeerId,
     ) -> Option<Vec<TxBody>> {
         let key = BlockKey { slot, hash: *hash };
         let (block_txs, manifest) = {
@@ -454,6 +460,7 @@ impl LeiosStore {
                 resolver?.resolve_body(h)
             })
             .collect();
+        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.map(|x| x.len()).unwrap_or_default());
         Some(selected)
     }
 
@@ -666,6 +673,7 @@ impl LeiosStore {
             for key in to_remove {
                 inner.blocks.remove(&key);
                 inner.block_txs.remove(&key);
+                info!("leios_store: removing old block_txs {}/{}", key.slot, hex_prefix(&key.hash));
             }
         }
     }

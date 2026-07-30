@@ -18,7 +18,7 @@
 //! wire-format vote body and sends it.  Same principle as `praos`:
 //! this crate is format-agnostic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Not;
 use std::time::{Duration, Instant};
 
@@ -36,7 +36,7 @@ use crate::fetch::{
 use crate::mempool::{EbKey, TxBody, TxId};
 use crate::peer::PeerId;
 use crate::pipeline::PipelineConfig;
-use crate::types::Point;
+use crate::types::{hex_prefix, Point};
 use crate::types::Vote;
 
 /// How long an in-flight fetch entry remains "active" before being
@@ -413,6 +413,14 @@ pub struct LeiosState {
     /// emitted; used at response time to verify which manifest indices
     /// were actually fulfilled.
     pub pending_eb_tx_fetches: BTreeMap<[u8; 32], (u64, BTreeMap<u16, u64>)>,
+
+    /// If txs were not fully retrieved from leios nodes, EB Point is written
+    /// so the retrieval attempt can be repeated next slot.
+    /// Inserted when `retry_eb_tx_fetch` ran out of peers.
+    /// Removed either when all txs are fetched, or when corresponding EB becomes
+    /// outdated.
+    pub postponed_eb_tx_requests: HashSet<Point>,
+
     /// EB hashes the local node holds a chain-committed cert for whose
     /// body it has not validated locally.  Producer-side EB-safety
     /// gate: while non-empty, the next self-produced RB must emit an
@@ -500,6 +508,7 @@ impl LeiosState {
             eb_tx_hashes: BTreeMap::new(),
             validated_eb_bodies: BTreeMap::new(),
             pending_eb_tx_fetches: BTreeMap::new(),
+            postponed_eb_tx_requests: HashSet::new(),
             endorsed_unvalidated_ebs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             chain_tip_ctx: ChainTipContext::default(),
@@ -629,7 +638,7 @@ impl LeiosState {
                         continue;
                     }
                     let honest_vote =
-                        self.decide_vote(&rb_hash, &eb_hash, eb_slot, eb_seen_slot, tx_known);
+                        self.decide_vote(&rb_hash, &eb_hash, eb_slot, eb_seen_slot, slot, tx_known);
                     // Vote actuator: the BT control signal may override the
                     // honest predicate with a policy abstention (e.g. the
                     // lazy-voter action sets `leios.vote = Abstain(reason)`).
@@ -707,6 +716,7 @@ impl LeiosState {
                     }
                 }
                 SlotEffect::Expired {
+                    rb_hash,
                     eb_slot,
                     had_quorum,
                     voted_weight,
@@ -714,6 +724,9 @@ impl LeiosState {
                     expected_weight,
                     ..
                 } => {
+                    let point = Point::Specific {slot: eb_slot, hash: rb_hash};
+                    info!("leios_store: elections expired for {point}");
+                    self.postponed_eb_tx_requests.remove(&point);
                     fx.push(LeiosEffect::EmitTelemetry(
                         LeiosTelemetryEvent::ElectionExpired {
                             eb_slot,
@@ -739,6 +752,7 @@ impl LeiosState {
         // EB is potentially relevant to the chain we'll soon adopt.
         if let Some(min_keep) = self.chain_tip_ctx.tip_rb_slot {
             self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
+            self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
             self.pending_eb_tx_fetches
                 .retain(|_, (s, _)| *s >= min_keep);
             self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
@@ -787,6 +801,7 @@ impl LeiosState {
         eb_hash: &[u8; 32],
         eb_slot: u64,
         eb_seen_slot: u64,
+        eb_current_slot: u64,
         tx_known: &dyn Fn(&TxId) -> TxAvailability,
     ) -> VoteDecision {
         // Predicate 1: LateEB.  The EB must have arrived before its
@@ -835,25 +850,38 @@ impl LeiosState {
         // unknown TXs.
         if let Some((_, tx_hashes)) = self.eb_tx_hashes.get(eb_hash) {
             let mut present = [0, 0];
+            let mut absent = 0;
             let mut decline = false;
-            let mut origin_by_slots: BTreeMap<(u64, bool), u64> = BTreeMap::new();
+            let mut origin_by_slots: BTreeMap<u64, [u64; 2]> = BTreeMap::new();
 
             for h in tx_hashes {
                 let (pinned, ours, gen_slot) = match tx_known(h) {
                     TxAvailability::Absent => {
                         decline = true;
+                        absent += 1;
                         continue
                     },
                     TxAvailability::Present { pinned, ours, gen_slot } => (pinned, ours, gen_slot)
                 };
-                origin_by_slots.entry((gen_slot, ours)).and_modify(|c| *c += 1).or_insert(1);
+                let entry = origin_by_slots.entry(gen_slot).or_insert([0, 0]);
+                entry[ours as usize] += 1;
                 present[pinned as usize] += 1;
             }
 
-            tracing::info!("Voting for EB: seen slot {}", eb_slot);
-            for ((slot, ours), count) in origin_by_slots.iter() {
-                tracing::info!("{slot}:{ours} => {count}");
+            info!("Voting for RB {}, EB {}, slot {}, announced {}, current {}",
+                hex_prefix(rb_hash), hex_prefix(eb_hash), eb_seen_slot, eb_slot, eb_current_slot
+            );
+            info!(" slot difference; extrn;  ours");
+            info!("------------------------------");
+            for (slot, count) in origin_by_slots.iter().rev() {
+                info!("{:16}; {:5}; {:5}", eb_current_slot - slot, count[0], count[1]);
             }
+            info!("------------------------------");
+            info!("Fetching Txs from: {:?}, Tx count: {}",
+                self.candidates.pending_eb_txs_fetches.iter(),
+                self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
+            );
+            info!("Total present: {}, absent {absent}", present.iter().sum::<usize>());
 
             if decline {
                 return Err(NoVoteReason::MissingTX {
@@ -1002,12 +1030,46 @@ impl LeiosState {
             tracing::debug!(node_id = %self.node_id, %point, peer = peer.0, "t22: filtered EB-txs offer (checksum-threshold)");
             return Vec::new();
         }
+
         self.evict_stale_in_flight(now);
-        let slot = match &point {
-            Point::Specific { slot, .. } => *slot,
-            _ => return Vec::new(),
-        };
+        if !matches!(&point, Point::Specific { .. }) {
+            return Vec::new();
+        }
         self.candidates.note_eb_txs_offered(point.clone(), peer);
+        self.initiate_eb_txs_fetch(&point, bitmap, now)
+    }
+
+    pub fn retry_postponed_eb_txs_fetches(
+        &mut self,
+        point: &Point,
+        bitmap: BTreeMap<u16, u64>,
+        now: Instant,
+    ) -> Vec<LeiosEffect> {
+        info!("leios_store: restarting fetch for {point}");
+
+        let mut fx = Vec::new();
+
+        self.candidates.clear_eb_txs_attempts(&point);
+        fx.append(&mut (self.initiate_eb_txs_fetch(point, bitmap, now)));
+
+        fx
+    }
+
+    /// Initiate EB Tx fetch for `point`. Requires `bitmap` of requested transactions
+    /// (should be computed before call).
+    /// This function is either called from `on_eb_tx_offered`, or independently, from on_slot
+    /// (in case of repeated tx fetch attempts).
+    pub fn initiate_eb_txs_fetch(
+        &mut self,
+        point: &Point,
+        bitmap: BTreeMap<u16, u64>,
+        now: Instant,
+    ) -> Vec<LeiosEffect> {
+        if !self.should_process_eb(point) {
+            //tracing::debug!(node_id = %self.node_id, %point, peer = peer.0, "t22: filtered EB-txs offer (checksum-threshold)");
+            return Vec::new();
+        }
+
         // Empty bitmap means the consumer has nothing to fetch (either
         // all txs known locally, or — more commonly — the EB body /
         // manifest hasn't arrived yet so we can't yet name the missing
@@ -1019,8 +1081,11 @@ impl LeiosState {
         // Per-slot gate keeps multiple offers from triggering parallel
         // fetches; the synthetic hash distinguishes the gate from an
         // EB-body fetch on the same slot.
+        let Point::Specific { slot, .. } = point else {
+            return Vec::new();
+        };
         let gate_key = Point::Specific {
-            slot,
+            slot: *slot,
             hash: [0xFE; 32],
         };
         if self.in_flight.contains_key(&gate_key) {
@@ -1047,7 +1112,7 @@ impl LeiosState {
             "fetching leios block txs"
         );
         vec![LeiosEffect::FetchLeiosBlockTxs {
-            point,
+            point: point.clone(),
             bitmap,
             peers,
         }]
@@ -1329,6 +1394,7 @@ impl LeiosState {
         bitmap: BTreeMap<u16, u64>,
     ) -> Vec<LeiosEffect> {
         if bitmap.is_empty() {
+            self.postponed_eb_tx_requests.remove(&point);
             return Vec::new();
         }
         let candidates = self.candidates.eb_txs_candidates(&point);
@@ -1336,6 +1402,8 @@ impl LeiosState {
             .eb_txs_policy
             .pick(&point, &bitmap, &candidates, self.rtt.as_ref());
         if peers.is_empty() {
+            // Request eb txs, if not all txs are known, but we asked all peers at the moment.
+            self.postponed_eb_tx_requests.insert(point);
             return Vec::new();
         }
         if !self.candidates.start_eb_txs_fetch(point.clone(), &peers) {
@@ -1449,7 +1517,7 @@ pub struct ValidatedVote<'a> {
 // Bitmap helpers (sparse 16-bit-segment / 64-bit-word format)
 // ---------------------------------------------------------------------------
 
-fn bitmap_to_indices(bitmap: &BTreeMap<u16, u64>) -> BTreeSet<u32> {
+pub fn bitmap_to_indices(bitmap: &BTreeMap<u16, u64>) -> BTreeSet<u32> {
     let mut out = BTreeSet::new();
     for (&segment, &word) in bitmap {
         for bit in 0..64 {

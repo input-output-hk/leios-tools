@@ -45,6 +45,7 @@ pub enum SlotEffect {
     /// example, EB tx manifests and in-flight tx-fetch entries keyed
     /// by this hash.
     Expired {
+        rb_hash: [u8; 32],
         eb_hash: [u8; 32],
         eb_slot: u64,
         had_quorum: bool,
@@ -431,11 +432,12 @@ impl Elections {
     pub fn prune_below_slot(&mut self, min_slot: u64) -> Vec<SlotEffect> {
         let expected_weight = self.cfg.expected_total_weight;
         let mut expired = Vec::new();
-        self.elections.retain(|_rb_hash, e| {
+        self.elections.retain(|rb_hash, e| {
             if e.announced_slot < min_slot {
                 expired.push(SlotEffect::Expired {
                     // The map is keyed by the announcing-RB hash, so emit the
                     // election's real EB hash here (not the key).
+                    rb_hash: rb_hash.clone(),
                     eb_hash: e.eb_hash,
                     eb_slot: e.announced_slot,
                     had_quorum: e.quorum_reached,
@@ -613,6 +615,7 @@ mod tests {
         assert_eq!(expired.len(), 1);
         match &expired[0] {
             SlotEffect::Expired {
+                rb_hash,
                 eb_hash,
                 eb_slot,
                 had_quorum,
@@ -620,7 +623,8 @@ mod tests {
                 voters,
                 expected_weight,
             } => {
-                assert_eq!(*eb_hash, h(2)); // the EB hash, not the RB key h(1)
+                assert_eq!(*rb_hash, h(1)); // RB key h(1)
+                assert_eq!(*eb_hash, h(2)); // the EB hash h(2), not the RB key h(1)
                 assert_eq!(*eb_slot, 10);
                 assert!(!*had_quorum);
                 assert_eq!(*voted_weight, 40);

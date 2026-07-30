@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use shared_consensus::mempool::TxId;
+use shared_consensus::leios::bitmap_to_indices;
 
 use shared_consensus::behaviour::actions::equivocation_bucket;
 use shared_consensus::behaviour::tree::control::OutboundControl;
@@ -1133,16 +1134,29 @@ pub async fn serve_leios_fetch(
                     peer = peer.0,
                     %point,
                     bitmap_chunks = bitmap.len(),
+                    requested = bitmap_to_indices(&bitmap).len(),
                     "leios_fetch: downstream requested EB txs from us"
                 );
                 let transactions = match &point {
-                    Point::Specific { slot, hash } => store.get_block_txs(*slot, hash, &bitmap),
+                    Point::Specific { slot, hash } => store.get_block_txs(*slot, hash, &bitmap, peer),
                     Point::Origin => None,
                 };
                 let Some(transactions) = transactions else {
                     // CIP-0164: server should disconnect if it doesn't have the requested EB txs.
+                    tracing::warn!(
+                        peer = peer.0,
+                        %point,
+                        "leios_fetch: requested EB txs not found in store, have to disconnect"
+                    );
                     break;
                 };
+                tracing::info!(
+                    peer = peer.0,
+                    %point,
+                    requested = bitmap_to_indices(&bitmap).len(),
+                    actual = transactions.len(),
+                    "leios_fetch: retrieved transactions from store"
+                );
                 // Echo the request's point + bitmap alongside the txs.
                 if runner
                     .send(&LfMsg::MsgLeiosBlockTxs {

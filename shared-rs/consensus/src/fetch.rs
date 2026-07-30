@@ -278,7 +278,7 @@ pub struct CandidateTracker {
 
     pending_block_fetches: BTreeSet<Point>,
     pending_eb_fetches: BTreeSet<Point>,
-    pending_eb_txs_fetches: BTreeSet<Point>,
+    pub pending_eb_txs_fetches: BTreeSet<Point>,
 
     /// Per-EB set of peers we've already asked for EB-txs.  Used to
     /// skip a peer on retry after a partial response.
@@ -339,6 +339,10 @@ impl CandidateTracker {
             .unwrap_or_default()
     }
 
+    pub fn clear_eb_txs_attempts(&mut self, point: &Point) {
+        self.eb_txs_attempts.remove(point);
+    }
+    
     /// EB-txs candidates excluding any peer we've already tried for
     /// this EB (used to advance the retry-after-partial-response flow).
     pub fn eb_txs_candidates(&self, point: &Point) -> Vec<PeerId> {
