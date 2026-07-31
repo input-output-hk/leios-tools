@@ -15,7 +15,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Emit `count` fabricated announcements per tick (junk-message DoS).
@@ -28,7 +28,7 @@ pub struct AnnounceFlood {
     pub slot_offset: i64,
 }
 
-impl LeafAction for AnnounceFlood {
+impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceFlood {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.fake_announce = true;
         // At least one; the actuator also clamps, but keep the control honest.

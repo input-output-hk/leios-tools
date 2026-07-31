@@ -13,9 +13,9 @@
 //! `specs/001-behavior-tree-engine/design/bt-grammar-and-semantics.md` §5.
 
 use super::actions::LeafAction;
-use super::condition::ConditionExpr;
+use super::condition::Condition;
 use super::control::ControlSignal;
-use super::env::TickCtx;
+use super::env::{ConsensusCtx, ParamOverrides, TreeContext};
 use super::Status;
 
 /// A behaviour's id (the `[behaviours.<id>]` key). Expanded instances share the
@@ -35,32 +35,36 @@ impl<S: Into<String>> From<S> for BehaviourId {
     }
 }
 
-/// A single node in the compiled tree.
+/// A single node in the compiled tree, generic over the tree instantiation's
+/// context family `C` (what Conditions read) and effect `E` (what Actions
+/// write). The type defaults bind the consensus instantiation
+/// (`ConsensusCtx`/`ControlSignal`), so the bare name `Behaviour` resolves to
+/// it and existing consumers need no type annotations.
 #[derive(Debug)]
-pub struct Behaviour {
+pub struct Behaviour<C: TreeContext = ConsensusCtx, E = ControlSignal> {
     pub id: BehaviourId,
-    pub kind: BehaviourKind,
+    pub kind: BehaviourKind<C, E>,
 }
 
 /// The node kinds. Composites and the `ForTicks` decorator own their (already
 /// expanded) children; leaves own their evaluator.
 #[derive(Debug)]
-pub enum BehaviourKind {
+pub enum BehaviourKind<C: TreeContext = ConsensusCtx, E = ControlSignal> {
     /// Ordered OR / fallback.
-    Selector(Vec<Behaviour>),
+    Selector(Vec<Behaviour<C, E>>),
     /// Ordered AND.
-    Sequence(Vec<Behaviour>),
+    Sequence(Vec<Behaviour<C, E>>),
     /// Concurrent AND, fail-fast. `succeeded[i]` tracks children held done
     /// until the join resets; it always has the same length as `children`.
     Join {
-        children: Vec<Behaviour>,
+        children: Vec<Behaviour<C, E>>,
         succeeded: Vec<bool>,
     },
     /// Duration cap: run `child` for at most `count` ticks of active life.
     ForTicks {
         count: u32,
         elapsed: u32,
-        child: Box<Behaviour>,
+        child: Box<Behaviour<C, E>>,
     },
     /// Pure timing gate: `Running` for `count` ticks of active life, then
     /// `Success`. Contributes **nothing** to the `ControlSignal` — it neither
@@ -69,13 +73,13 @@ pub enum BehaviourKind {
     /// `Join` it delays one branch without clobbering the others' contribution.
     Wait { count: u32, elapsed: u32 },
     /// Immediate predicate (never `Running`).
-    Condition(ConditionExpr),
-    /// A leaf action (control-signal contributor).
-    Action(Box<dyn LeafAction>),
+    Condition(Box<dyn Condition<C>>),
+    /// A leaf action (effect contributor).
+    Action(Box<dyn LeafAction<C, E>>),
 }
 
-impl Behaviour {
-    pub fn new(id: impl Into<BehaviourId>, kind: BehaviourKind) -> Self {
+impl<C: TreeContext, E> Behaviour<C, E> {
+    pub fn new(id: impl Into<BehaviourId>, kind: BehaviourKind<C, E>) -> Self {
         Self {
             id: id.into(),
             kind,
@@ -83,9 +87,9 @@ impl Behaviour {
     }
 }
 
-impl BehaviourKind {
+impl<C: TreeContext, E> BehaviourKind<C, E> {
     /// Build a `Join`, initialising the succeeded-set to match the children.
-    pub fn join(children: Vec<Behaviour>) -> Self {
+    pub fn join(children: Vec<Behaviour<C, E>>) -> Self {
         let succeeded = vec![false; children.len()];
         BehaviourKind::Join {
             children,
@@ -94,7 +98,7 @@ impl BehaviourKind {
     }
 
     /// Build a `ForTicks` decorator with a zeroed elapsed count.
-    pub fn for_ticks(count: u32, child: Behaviour) -> Self {
+    pub fn for_ticks(count: u32, child: Behaviour<C, E>) -> Self {
         BehaviourKind::ForTicks {
             count,
             elapsed: 0,
@@ -108,9 +112,9 @@ impl BehaviourKind {
     }
 }
 
-impl Behaviour {
+impl<C: TreeContext, E> Behaviour<C, E> {
     /// Tick this node, accumulating any active leaf's contribution into `out`.
-    pub fn tick(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+    pub fn tick(&mut self, ctx: &C::View<'_>, out: &mut E) -> Status {
         match &mut self.kind {
             BehaviourKind::Sequence(children) => tick_sequence(children, ctx, out),
             BehaviourKind::Selector(children) => tick_selector(children, ctx, out),
@@ -176,31 +180,25 @@ impl Behaviour {
 }
 
 /// Apply any live overrides addressed to `id` (store keys `"<id>.<field>"`) to
-/// `action` before it contributes. No-op when no store is present or nothing
-/// matches; the leaf coerces each TOML scalar to its field type via `set_param`.
-fn apply_action_overrides(id: &BehaviourId, action: &mut dyn LeafAction, ctx: &TickCtx) {
-    let Some(store) = ctx.action_params else {
-        return;
-    };
-    let prefix = format!("{}.", id.0);
-    // Collect this leaf's overrides under the lock (a `BTreeMap` prefix range —
-    // no full scan), then release the guard before calling into leaf code so we
-    // never hold the read lock across `set_param`.
-    let overrides: Vec<(String, toml::Value)> = {
-        let Ok(map) = store.read() else {
-            return;
-        };
-        map.range(prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
-            .collect()
-    };
-    for (field, value) in &overrides {
-        action.set_param(field, value);
+/// `action` before it contributes. No-op when the context exposes none; the
+/// leaf coerces each TOML scalar to its field type via `set_param`. Reads the
+/// overrides through the [`ParamOverrides`] seam so the generic tick never
+/// reaches into a concrete context's internals.
+fn apply_action_overrides<C: TreeContext, E>(
+    id: &BehaviourId,
+    action: &mut dyn LeafAction<C, E>,
+    ctx: &C::View<'_>,
+) {
+    for (field, value) in ctx.action_overrides(&id.0) {
+        action.set_param(&field, &value);
     }
 }
 
-fn tick_sequence(children: &mut [Behaviour], ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+fn tick_sequence<C: TreeContext, E>(
+    children: &mut [Behaviour<C, E>],
+    ctx: &C::View<'_>,
+    out: &mut E,
+) -> Status {
     let n = children.len();
     for i in 0..n {
         match children[i].tick(ctx, out) {
@@ -218,7 +216,11 @@ fn tick_sequence(children: &mut [Behaviour], ctx: &TickCtx, out: &mut ControlSig
     Status::Success
 }
 
-fn tick_selector(children: &mut [Behaviour], ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+fn tick_selector<C: TreeContext, E>(
+    children: &mut [Behaviour<C, E>],
+    ctx: &C::View<'_>,
+    out: &mut E,
+) -> Status {
     let n = children.len();
     for i in 0..n {
         match children[i].tick(ctx, out) {
@@ -236,11 +238,11 @@ fn tick_selector(children: &mut [Behaviour], ctx: &TickCtx, out: &mut ControlSig
     Status::Failure
 }
 
-fn tick_join(
-    children: &mut [Behaviour],
+fn tick_join<C: TreeContext, E>(
+    children: &mut [Behaviour<C, E>],
     succeeded: &mut [bool],
-    ctx: &TickCtx,
-    out: &mut ControlSignal,
+    ctx: &C::View<'_>,
+    out: &mut E,
 ) -> Status {
     let n = children.len();
     for i in 0..n {
@@ -273,12 +275,12 @@ fn tick_join(
     }
 }
 
-fn tick_for_ticks(
+fn tick_for_ticks<C: TreeContext, E>(
     count: u32,
     elapsed: &mut u32,
-    child: &mut Behaviour,
-    ctx: &TickCtx,
-    out: &mut ControlSignal,
+    child: &mut Behaviour<C, E>,
+    ctx: &C::View<'_>,
+    out: &mut E,
 ) -> Status {
     if *elapsed >= count {
         // Budget already spent: stable "done".
@@ -303,6 +305,8 @@ fn tick_for_ticks(
 /// life, then a stable `Success`. Contributes nothing to `out` — the accumulated
 /// signal during the wait is whatever other active branches produce (in a bare
 /// `Sequence` prefix that is the honest default, because nothing else is active).
+/// Being childless and contribution-free, it is independent of the tree's
+/// context/effect types, so it needs no generic parameters.
 ///
 /// The contract is literal: `Wait(N)` waits **N slots**. In `Sequence[ Wait(N),
 /// X ]`, `X` first activates on the `(N+1)`-th tick — N full slots elapse first.
@@ -315,22 +319,24 @@ fn tick_wait(count: u32, elapsed: &mut u32) -> Status {
     Status::Running
 }
 
-fn halt_from(children: &mut [Behaviour], start: usize) {
+fn halt_from<C: TreeContext, E>(children: &mut [Behaviour<C, E>], start: usize) {
     for c in &mut children[start..] {
         c.halt();
     }
 }
 
-/// The effective, validated tree, ticked as a unit once per slot.
+/// The effective, validated tree, ticked as a unit once per slot. Generic over
+/// the instantiation's context family `C` and effect `E`; the defaults bind the
+/// consensus instantiation so the bare name resolves to it.
 #[derive(Debug)]
-pub struct BehaviourTree {
+pub struct BehaviourTree<C: TreeContext = ConsensusCtx, E = ControlSignal> {
     name: String,
     seed: u64,
-    root: Behaviour,
+    root: Behaviour<C, E>,
 }
 
-impl BehaviourTree {
-    pub fn new(name: impl Into<String>, seed: u64, root: Behaviour) -> Self {
+impl<C: TreeContext, E> BehaviourTree<C, E> {
+    pub fn new(name: impl Into<String>, seed: u64, root: Behaviour<C, E>) -> Self {
         Self {
             name: name.into(),
             seed,
@@ -346,17 +352,19 @@ impl BehaviourTree {
         self.seed
     }
 
-    /// Tick the whole tree once. The only place decisions are made: returns the
-    /// root's status and the slot's accumulated `ControlSignal`.
-    pub fn tick(&mut self, ctx: &TickCtx) -> (Status, ControlSignal) {
-        let mut out = ControlSignal::default();
-        let status = self.root.tick(ctx, &mut out);
-        (status, out)
-    }
-
     /// Abort the whole tree (reset all carried state).
     pub fn halt(&mut self) {
         self.root.halt();
+    }
+}
+
+impl<C: TreeContext, E: Default> BehaviourTree<C, E> {
+    /// Tick the whole tree once. The only place decisions are made: returns the
+    /// root's status and the slot's accumulated effect.
+    pub fn tick(&mut self, ctx: &C::View<'_>) -> (Status, E) {
+        let mut out = E::default();
+        let status = self.root.tick(ctx, &mut out);
+        (status, out)
     }
 }
 
@@ -366,7 +374,9 @@ mod tests {
     use crate::behaviour::tree::actions::{HonestAction, LeafAction};
     use crate::behaviour::tree::condition::ConditionExpr;
     use crate::behaviour::tree::control::ControlSignal;
-    use crate::behaviour::tree::env::{DynamicEnv, EnvValue, NativeChainState};
+    use crate::behaviour::tree::env::{
+        ConsensusCtx, DynamicEnv, EnvValue, NativeChainState, TickCtx,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
@@ -394,7 +404,7 @@ mod tests {
         }
     }
 
-    impl LeafAction for Spy {
+    impl LeafAction<ConsensusCtx, ControlSignal> for Spy {
         fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
             self.ticks.fetch_add(1, Ordering::SeqCst);
             // Mark a contribution so we can observe it in `out`.
@@ -411,7 +421,7 @@ mod tests {
         Behaviour::new("leaf", BehaviourKind::Action(Box::new(spy)))
     }
 
-    fn action(b: impl LeafAction + 'static) -> Behaviour {
+    fn action(b: impl LeafAction<ConsensusCtx, ControlSignal> + 'static) -> Behaviour {
         Behaviour::new("a", BehaviourKind::Action(Box::new(b)))
     }
 
@@ -712,7 +722,7 @@ mod tests {
     #[test]
     fn condition_is_immediate_success_or_failure() {
         let expr = ConditionExpr::parse("cardano.current_slot >= 100").unwrap();
-        let mut cond = Behaviour::new("c", BehaviourKind::Condition(expr));
+        let mut cond = Behaviour::new("c", BehaviourKind::Condition(Box::new(expr)));
         let below = NativeChainState {
             current_slot: 50,
             ..Default::default()
@@ -738,7 +748,7 @@ mod tests {
                 Behaviour::new(
                     "attack",
                     BehaviourKind::Sequence(vec![
-                        Behaviour::new("cond", BehaviourKind::Condition(expr)),
+                        Behaviour::new("cond", BehaviourKind::Condition(Box::new(expr))),
                         Behaviour::new("adv", BehaviourKind::Action(Box::new(adv))),
                     ]),
                 ),
@@ -817,7 +827,7 @@ mod tests {
 
     #[test]
     fn behaviour_tree_ticks_root_and_returns_signal() {
-        let mut tree = BehaviourTree::new(
+        let mut tree: BehaviourTree = BehaviourTree::new(
             "t",
             42,
             Behaviour::new("honest", BehaviourKind::Action(Box::new(HonestAction))),
@@ -839,7 +849,7 @@ mod tests {
     /// A leaf with one tunable param, observable via `praos.reorg_depth`.
     #[derive(Debug)]
     struct Tunable(i64);
-    impl LeafAction for Tunable {
+    impl LeafAction<ConsensusCtx, ControlSignal> for Tunable {
         fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
             out.praos.reorg_depth = Some(self.0 as u64);
             Status::Running

@@ -13,7 +13,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Announce with a slot offset applied to the fabricated header.
@@ -24,7 +24,7 @@ pub struct AnnounceSlotSkew {
     pub slot_offset: i64,
 }
 
-impl LeafAction for AnnounceSlotSkew {
+impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceSlotSkew {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.fake_announce = true;
         out.leios.announce_slot_offset = self.slot_offset;
