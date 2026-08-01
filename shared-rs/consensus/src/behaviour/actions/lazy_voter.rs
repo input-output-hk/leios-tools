@@ -6,7 +6,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, VotePolicy};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 use crate::leios::NoVoteReason;
 
@@ -30,7 +30,7 @@ impl Default for LazyVoter {
     }
 }
 
-impl LeafAction for LazyVoter {
+impl LeafAction<ConsensusCtx, ControlSignal> for LazyVoter {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.vote = VotePolicy::Abstain(self.reason);
         Status::Running

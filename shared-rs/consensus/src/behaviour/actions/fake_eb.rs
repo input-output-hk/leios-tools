@@ -19,7 +19,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, FakeEbKind};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Phantom Tx EB — announces an EB of `n_txs` unfetchable phantom txs.
@@ -34,7 +34,7 @@ impl PhantomTxEb {
     }
 }
 
-impl LeafAction for PhantomTxEb {
+impl LeafAction<ConsensusCtx, ControlSignal> for PhantomTxEb {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.praos.fake_eb = Some(FakeEbKind::Phantom { n_txs: self.n_txs });
         Status::Running
@@ -53,7 +53,7 @@ impl DummyTxEb {
     }
 }
 
-impl LeafAction for DummyTxEb {
+impl LeafAction<ConsensusCtx, ControlSignal> for DummyTxEb {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.praos.fake_eb = Some(FakeEbKind::Dummy { n_txs: self.n_txs });
         Status::Running

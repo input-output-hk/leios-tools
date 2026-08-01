@@ -12,6 +12,45 @@ sim-rs replays runs from a seed, so a behaviour that needs randomness
 takes a `u64` at construction and seeds its own RNG, never reading the
 clock or the OS entropy pool.
 
+## Tree engine: generic over context + effect
+
+The behaviour-**tree** engine in `tree/` is generic over two parameters:
+
+- **`C` — context**: what `Condition`s read each tick.
+- **`E` — effect**: what `LeafAction`s write each tick.
+
+Consensus is one instantiation and the *default*, so `Behaviour`,
+`BehaviourKind`, and `BehaviourTree` stay bare names — no call-site churn
+for existing consumers (net-node, sim-rs):
+
+| Parameter | Consensus instantiation |
+|---|---|
+| `C` | `ConsensusCtx` (a marker whose `View<'a>` = `TickCtx<'a>`) |
+| `E` | `ControlSignal` |
+
+Seams introduced: `LeafAction<C, E>`, `Condition<C>`, `TreeContext` (a
+GAT — `type View<'a>` — because the per-tick context borrows), and
+`ParamOverrides` (live leaf-param overrides, off the context). A second
+instantiation can reuse the whole engine and TOML grammar with its own
+`C`/`E` and its own leaves/conditions, without touching the consensus one.
+
+The TOML compiler is generic too: `BtConfig::compile_with(action_binder,
+condition_binder)` compiles the same grammar into any `BehaviourTree<C, E>` —
+the caller supplies how a leaf `kind` and a condition string become its own
+leaves/conditions. `compile()` is the consensus binding of that entry.
+
+There is exactly **one** grammar and one parser. `BtConfig::parse` is
+vocabulary-agnostic: it enforces the domain-neutral structure (root, children,
+cycles, arity) and keeps `Action`/`Condition` leaves as raw source. Every
+instantiation calls it.
+
+What is consensus-specific is *validation*, not parsing: `validate` checks the
+consensus leaf vocabulary (each `Action` `spec` deserialises into a known
+`ActionSpec`; each condition parses and type-checks against `env.*`/`cardano.*`),
+and `compile` runs it for you. Another instantiation validates its own vocabulary
+in its binders instead — an unknown leaf kind or an unresolvable reference is
+rejected there, with the offending behaviour id attached.
+
 ## Hook taxonomy
 
 There are four kinds of hook on the [`Behaviour`] trait. Adding a new

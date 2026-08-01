@@ -11,14 +11,14 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Suppresses the cert on any CertRB this node produces. No parameters.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CertSuppressor;
 
-impl LeafAction for CertSuppressor {
+impl LeafAction<ConsensusCtx, ControlSignal> for CertSuppressor {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.praos.suppress_cert = true;
         Status::Running
