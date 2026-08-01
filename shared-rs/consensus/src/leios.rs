@@ -338,7 +338,7 @@ pub enum LeiosTelemetryEvent {
     LeiosBlockInfo {
         eb_slot: u64,
         tx_count: usize,
-    }
+    },
 }
 
 // ---------------------------------------------------------------------------
