@@ -2091,9 +2091,9 @@ impl SharedConsensus {
                 | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::ElectionExpired { .. })
                 | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosElectionInfo { .. })
                 | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosBlockInfo { .. }) => {
-                    // No 1:1 sim telemetry; sim's stat aggregator
-                    // derives equivalent signals from `votes_by_eb`
-                    // counts on the receive path.
+                    // No 1:1 sim telemetry; sim's stat aggregator either
+                    // derives equivalent signals or already has the required
+                    // info on the receive path.
                 }
                 // Fetch effects stay no-op: sim drives RB/EB
                 // fetches directly through its `Message` enum, so
