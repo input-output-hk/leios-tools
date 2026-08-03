@@ -1779,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn on_eb_received_emits_record_and_validate() {
+    fn on_eb_received_emits_required_effects() {
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
         let manifest = vec![tx_id(0xA0), tx_id(0xA1)];
         let fx = state.on_eb_received(None, point(10, 1), Some((None, manifest.clone())));
