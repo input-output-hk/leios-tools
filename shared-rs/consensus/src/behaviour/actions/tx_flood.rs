@@ -12,7 +12,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Drive the tx generator at `rate` txs/sec.
@@ -21,7 +21,7 @@ pub struct TxFlood {
     pub rate: u32,
 }
 
-impl LeafAction for TxFlood {
+impl LeafAction<ConsensusCtx, ControlSignal> for TxFlood {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.mempool.tx_flood_rate = self.rate;
         Status::Running
