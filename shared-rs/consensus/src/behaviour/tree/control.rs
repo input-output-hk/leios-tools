@@ -135,6 +135,13 @@ pub struct LeiosControl {
 pub struct MempoolControl {
     /// EB/tx processing filter.
     pub tx_filter: TxFilterPolicy,
+    /// `tx-flood` action: drive the local tx generator at this rate (txs/sec;
+    /// `0` = honest, no override). The net-node actuator applies it to the tx
+    /// generator so the node injects far faster than the network drains,
+    /// overflowing the mempool (evict-oldest) to displace honest txs. Integer
+    /// to keep the control signal `Eq`; fractional precision is irrelevant for
+    /// a flood.
+    pub tx_flood_rate: u32,
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.
@@ -223,6 +230,8 @@ mod tests {
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
         assert!(!d.leios.echo_to_source);
         assert_eq!(d.mempool.tx_filter, TxFilterPolicy::None);
+        // tx-flood must default off, or the honest node would flood.
+        assert_eq!(d.mempool.tx_flood_rate, 0);
     }
 
     #[test]

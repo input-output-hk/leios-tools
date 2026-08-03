@@ -95,10 +95,20 @@ pub enum ActionSpec {
     },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
+    /// Flood the local tx generator at `rate` txs/sec (garbage or magazine).
+    #[serde(rename = "tx-flood")]
+    TxFlood {
+        #[serde(default = "default_tx_flood_rate")]
+        rate: u32,
+    },
 }
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_tx_flood_rate() -> u32 {
+    1000
 }
 
 fn default_flood_count() -> u32 {
