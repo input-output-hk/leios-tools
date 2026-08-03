@@ -230,6 +230,8 @@ mod tests {
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
         assert!(!d.leios.echo_to_source);
         assert_eq!(d.mempool.tx_filter, TxFilterPolicy::None);
+        // tx-flood must default off, or the honest node would flood.
+        assert_eq!(d.mempool.tx_flood_rate, 0);
     }
 
     #[test]
