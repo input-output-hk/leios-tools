@@ -967,7 +967,7 @@ mod tests {
     use crate::protocols::Runner as ProtocolRunner;
     use crate::types::{Point, Tip, WrappedHeader};
 
-    use shared_consensus::mempool::{MempoolTx, TxBody, TxId};
+    use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 
     /// Minimal fake server: serves ChainSync and KeepAlive over MemBearer.
     /// Generates `block_count` blocks then holds at tip.
@@ -1499,13 +1499,11 @@ mod tests {
         // `[bytes(body), {}, true, null]` so it has a canonical Praos wire id
         // (`praos_tx_id`); an unparseable body would now be dropped, not sent.
         let tx = PendingTx {
-            tx: MempoolTx::new(
-                TxId::new_with_array([0x44; 32]),
-                TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
-                9,
-                false,
-                0,
-            ),
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([0x44; 32]),
+                body: TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
+                size: 9,
+            }),
             era: ts::ORIGIN_ERA,
         };
         tx_sender.send(tx).await.unwrap();

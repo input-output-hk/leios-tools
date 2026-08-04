@@ -6,8 +6,9 @@
 
 pub mod codec;
 
-use shared_consensus::mempool::{MempoolTx, TxBody, TxId};
+use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
 use shared_consensus::PeerId;
 use tokio::sync::mpsc;
@@ -109,12 +110,25 @@ pub struct TxIdAndSize {
 /// A pending transaction waiting to be announced and sent.
 #[derive(Debug, Clone)]
 pub struct PendingTx {
-    pub tx: MempoolTx,
+    pub tx: Arc<TxInfo>,
     /// HardFork era index for this tx, carried end-to-end so it is echoed
     /// back on the wire exactly as the tx was received (rather than being
     /// re-stamped with a fixed constant). For txs we originate locally this
     /// is [`ORIGIN_ERA`].
     pub era: u16,
+}
+
+impl PendingTx {
+    /// `era` is the HardFork era the tx arrived under, carried through so a bridged
+    /// tx is re-announced with its original era rather than re-stamped (see
+    /// `PendingTx::era`). Txs with no wire era of their own (e.g. Leios EB bodies
+    /// fetched by bitmap) pass `ORIGIN_ERA`.
+    pub fn new_with_body(body: TxBody, era: u16) -> Self {
+        PendingTx {
+            tx: TxInfo::new_with_body(body),
+            era,
+        }
+    }
 }
 
 /// A transaction body tagged with its HardFork era, as it appears in
@@ -288,11 +302,6 @@ fn announce_txs(
     announced: &mut VecDeque<PendingTx>,
     pending_bodies: &mut VecDeque<PendingTx>,
 ) -> Vec<TxIdAndSize> {
-    let txs_announcement = new_txs.iter().map(
-        |x| format!("{}:{},{}", x.tx.tx_id.hex_short(), x.tx.ours, x.tx.slot)
-    ).collect::<Vec<_>>();
-    tracing::info!("Announcing Txs (len={}): {:?}", txs_announcement.len(), txs_announcement);
-
     let mut reply = Vec::with_capacity(new_txs.len());
     for tx in new_txs {
         match praos_tx_id(tx) {
@@ -439,7 +448,7 @@ pub async fn run_client(
                         let pending = pending_bodies.remove(pos).expect("position valid");
                         txs.push(EraTxBody {
                             era: wire_era(pending.era),
-                            body: pending.tx.body,
+                            body: pending.tx.body.clone(),
                         });
                     }
                     // Per spec: omitted txs are treated as never announced.
@@ -662,13 +671,11 @@ mod tests {
             .and_then(|e| e.null())
             .expect("encoding test tx into a Vec is infallible");
         PendingTx {
-            tx: MempoolTx::new(
-                TxId::new_with_array([id_byte; 32]),
-                TxBody::new_with_vec(e.into_writer()),
-                size as u32,
-                false,
-                0,
-            ),
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([id_byte; 32]),
+                body: TxBody::new_with_vec(e.into_writer()),
+                size: size as u32,
+            }),
             era: ORIGIN_ERA,
         }
     }
@@ -686,13 +693,11 @@ mod tests {
         e.null().unwrap(); // aux data
         let tx = e.into_writer();
         let pending = PendingTx {
-            tx: MempoolTx::new(
-                TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
-                TxBody::new_with_slice(&tx),
-                tx.len() as u32,
-                false,
-                0,
-            ),
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
+                body: TxBody::new_with_slice(&tx),
+                size: tx.len() as u32,
+            }),
             era: ORIGIN_ERA,
         };
         let announced = praos_tx_id(&pending).expect("parseable tx has a canonical id");
@@ -842,14 +847,22 @@ mod tests {
             // Pre-load txs.
             tx_sender
                 .send(PendingTx {
-                    tx: MempoolTx::new(tx1_id, tx1.tx.body.clone(), 1500, false, 0),
+                    tx: Arc::new(TxInfo {
+                        tx_id: tx1_id,
+                        body: tx1.tx.body.clone(),
+                        size: 1500,
+                    }),
                     era: ORIGIN_ERA,
                 })
                 .await
                 .unwrap();
             tx_sender
                 .send(PendingTx {
-                    tx: MempoolTx::new(tx2_id, tx2.tx.body.clone(), 2000, false, 0),
+                    tx: Arc::new(TxInfo {
+                        tx_id: tx2_id,
+                        body: tx2.tx.body.clone(),
+                        size: 2000,
+                    }),
                     era: ORIGIN_ERA,
                 })
                 .await

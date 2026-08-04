@@ -2035,7 +2035,7 @@ impl SharedConsensus {
     fn collect_arcs(&self, pending: Vec<MempoolTx>) -> Vec<Arc<Transaction>> {
         pending
             .into_iter()
-            .filter_map(|tx| self.tx_arcs.get(&tx.tx_id).cloned())
+            .filter_map(|tx| self.tx_arcs.get(tx.id()).cloned())
             .collect()
     }
 

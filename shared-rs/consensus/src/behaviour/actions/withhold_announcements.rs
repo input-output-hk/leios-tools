@@ -6,18 +6,18 @@
 //! back; `u64::MAX` withholds it forever). Returns `Running` while installed.
 
 use crate::behaviour::tree::actions::LeafAction;
-use crate::behaviour::tree::control::{ControlSignal, TxAnnouncePolicy};
+use crate::behaviour::tree::control::{ControlSignal, TxSubmissionPolicy};
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Installs the withhold-announcements tx filter.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct WithholdAnnouncements {
+pub struct WithholdTxSubmission {
     withholding_slots: u64,
     tx_producer_only: bool,
 }
 
-impl WithholdAnnouncements {
+impl WithholdTxSubmission {
     pub fn new(delay_for_slots: u64, only_ours: bool) -> Self {
         Self {
             withholding_slots: delay_for_slots,
@@ -26,9 +26,9 @@ impl WithholdAnnouncements {
     }
 }
 
-impl LeafAction<ConsensusCtx, ControlSignal> for WithholdAnnouncements {
+impl LeafAction<ConsensusCtx, ControlSignal> for WithholdTxSubmission {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
-        out.mempool.announce_filter = TxAnnouncePolicy::WithholdAnnouncements {
+        out.mempool.tx_submission_filter = TxSubmissionPolicy::WithholdTxSubmission {
             withholding_slots: self.withholding_slots,
             tx_producer_only: self.tx_producer_only,
         };
@@ -57,7 +57,7 @@ mod tests {
     use super::*;
     use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
-    fn run(action: &mut WithholdAnnouncements) -> (Status, ControlSignal) {
+    fn run(action: &mut WithholdTxSubmission) -> (Status, ControlSignal) {
         let env = DynamicEnv::new();
         let state = NativeChainState::default();
         let ctx = TickCtx {
@@ -73,11 +73,11 @@ mod tests {
 
     #[test]
     fn installs_configured_announce_filter() {
-        let (s, out) = run(&mut WithholdAnnouncements::new(5, true));
+        let (s, out) = run(&mut WithholdTxSubmission::new(5, true));
         assert_eq!(s, Status::Running);
         assert_eq!(
-            out.mempool.announce_filter,
-            TxAnnouncePolicy::WithholdAnnouncements {
+            out.mempool.tx_submission_filter,
+            TxSubmissionPolicy::WithholdTxSubmission {
                 withholding_slots: 5,
                 tx_producer_only: true,
             }
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn touches_only_the_mempool_domain() {
-        let (_, out) = run(&mut WithholdAnnouncements::new(3, false));
+        let (_, out) = run(&mut WithholdTxSubmission::new(3, false));
         assert_eq!(out.praos, Default::default());
         assert_eq!(out.leios, Default::default());
     }

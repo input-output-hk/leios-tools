@@ -17,7 +17,8 @@ use net_core::protocols::txsubmission::{PendingTx, TxSubmission};
 use net_core::protocols::Role;
 use net_core::protocols::Runner;
 
-use shared_consensus::mempool::{MempoolTx, TxBody, TxId};
+use shared_consensus::mempool::{TxBody, TxId, TxInfo};
+use std::sync::Arc;
 
 use crate::connect;
 
@@ -47,13 +48,11 @@ fn generate_random_tx(rng: &mut StdRng, min_size: usize, max_size: usize) -> Pen
     rng.fill(payload.as_mut_slice());
 
     PendingTx {
-        tx: MempoolTx::new(
-            TxId::new_with_array(hash),
-            TxBody::new_with_vec(payload),
-            size as u32,
-            false,
-            0,
-        ),
+        tx: Arc::new(TxInfo {
+            tx_id: TxId::new_with_array(hash),
+            body: TxBody::new_with_vec(payload),
+            size: size as u32,
+        }),
         // Locally generated: stamp our origin era (current dev net = Dijkstra).
         era: txsubmission::ORIGIN_ERA,
     }

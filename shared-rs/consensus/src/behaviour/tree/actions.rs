@@ -80,7 +80,7 @@ pub fn build_action(
         ActionSpec::WithholdAnnouncements {
             withholding_slots,
             tx_producer_only,
-        } => Box::new(catalogue::WithholdAnnouncements::new(
+        } => Box::new(catalogue::WithholdTxSubmission::new(
             *withholding_slots,
             *tx_producer_only,
         )),

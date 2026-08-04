@@ -45,6 +45,6 @@ pub use lazy_voter::LazyVoter;
 pub use lie_about_eb_size::LieAboutEbSize;
 pub use rb_equivocator::{equivocation_bucket, RbHeaderEquivocator};
 pub use t22::T22;
-pub use withhold_announcements::WithholdAnnouncements;
+pub use withhold_announcements::WithholdTxSubmission;
 pub use tx_flood::TxFlood;
 pub use withhold_eb_announce::WithholdEbAnnounce;

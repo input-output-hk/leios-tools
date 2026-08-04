@@ -113,11 +113,11 @@ impl BodyPath {
             let mut manifest: Vec<TxId> = Vec::new();
             let mut bytes = 0usize;
             for tx in mempool.txs.iter() {
-                let next = bytes + tx.size as usize;
+                let next = bytes + tx.size();
                 if next > eb_body_max_bytes && !manifest.is_empty() {
                     break;
                 }
-                manifest.push(tx.tx_id.clone());
+                manifest.push(tx.id().clone());
                 bytes = next;
                 if bytes >= eb_body_max_bytes {
                     break;
@@ -142,15 +142,18 @@ mod tests {
     use crate::config::CommitteeSelection;
     use crate::elections::{Elections, ElectionsConfig};
     use crate::leios::VotingConfig;
-    use crate::mempool::{EbKey, MempoolState, TxBody, TxId};
+    use crate::mempool::{EbKey, MempoolState, TxBody, TxId, TxInfo};
     use crate::pipeline::PipelineConfig;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn pending(id: u8, size: u32) -> MempoolTx {
         MempoolTx {
-            tx_id: TxId::new_with_slice(&[id; 32]),
-            body: TxBody::new_with_vec(vec![0u8; size as usize]),
-            size,
+            tx: Arc::new(TxInfo{
+                tx_id: TxId::new_with_slice(&[id; 32]),
+                body: TxBody::new_with_vec(vec![0u8; size as usize]),
+                size,
+            }),
             ours: false,
             slot: 0,
         }
@@ -224,8 +227,8 @@ mod tests {
         populate(&mut state, &[(1, 200), (2, 200), (3, 200), (4, 200)]);
         let body = BodyPath::decide(&mut state, 500, EB_CAP, &leios, false);
         assert_eq!(body.inline.len(), 2);
-        assert_eq!(body.inline[0].tx_id, TxId::new_with_slice(&[1u8; 32]));
-        assert_eq!(body.inline[1].tx_id, TxId::new_with_slice(&[2u8; 32]));
+        assert_eq!(body.inline[0].id(), &TxId::new_with_slice(&[1u8; 32]));
+        assert_eq!(body.inline[1].id(), &TxId::new_with_slice(&[2u8; 32]));
         assert_eq!(body.manifest.len(), 2);
         assert_eq!(body.manifest[0], TxId::new_with_slice(&[3u8; 32]));
         assert_eq!(body.manifest[1], TxId::new_with_slice(&[4u8; 32]));
@@ -255,7 +258,7 @@ mod tests {
         // drain_up_to(500) takes [250] (next would be 501 > 500 with
         // non-empty result).  Residual = [251] → manifest.
         assert_eq!(body.inline.len(), 1);
-        assert_eq!(body.inline[0].tx_id, TxId::new_with_slice(&[1u8; 32]));
+        assert_eq!(body.inline[0].id(), &TxId::new_with_slice(&[1u8; 32]));
         assert_eq!(body.manifest, vec![TxId::new_with_slice(&[2u8; 32])]);
     }
 
