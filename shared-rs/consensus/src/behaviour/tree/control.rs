@@ -13,9 +13,7 @@
 //! [`BehaviourTree::tick`]: super::behaviour::BehaviourTree::tick
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::behaviour::RbProductionStrategy;
-use crate::behaviour::tree::control::FakeEbKind::Phantom;
 use crate::leios::NoVoteReason;
 use crate::peer::PeerId;
 use crate::production::BodyPath;
