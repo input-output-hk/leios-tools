@@ -7,7 +7,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, TxAnnouncePolicy};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Installs the withhold-announcements tx filter.
@@ -26,7 +26,7 @@ impl WithholdAnnouncements {
     }
 }
 
-impl LeafAction for WithholdAnnouncements {
+impl LeafAction<ConsensusCtx, ControlSignal> for WithholdAnnouncements {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.mempool.announce_filter = TxAnnouncePolicy::WithholdAnnouncements {
             withholding_slots: self.withholding_slots,
