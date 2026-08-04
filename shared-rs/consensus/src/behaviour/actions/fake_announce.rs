@@ -10,14 +10,14 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Announce without an election win. No parameters.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FakeAnnounce;
 
-impl LeafAction for FakeAnnounce {
+impl LeafAction<ConsensusCtx, ControlSignal> for FakeAnnounce {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.fake_announce = true;
         Status::Running

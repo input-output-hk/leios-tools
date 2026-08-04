@@ -16,10 +16,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::actions::{build_action, HonestAction};
+use super::actions::{build_action, HonestAction, LeafAction};
 use super::behaviour::{Behaviour, BehaviourId, BehaviourKind, BehaviourTree};
-use super::condition::ConditionExpr;
-use super::env::EnvValue;
+use super::condition::{Condition, ConditionExpr};
+use super::env::{ConsensusCtx, EnvValue, TreeContext};
 use crate::behaviour::registry::{child_seed, ActionSpec};
 
 /// A precise load/validation error naming the offending id/field.
@@ -99,19 +99,35 @@ pub struct ModuleMeta {
     pub revision: u32,
 }
 
-/// A parsed (but not yet expanded) behaviour definition. `Condition` carries its
-/// already-parsed expression and `Action` its deserialised spec, so load-time
-/// errors surface before compilation.
+/// A structurally-parsed (but not yet expanded or domain-bound) behaviour
+/// definition. `Condition` and `Action` keep their **raw** source — the
+/// expression text and the `(kind, params)` of the action `spec` — so that a
+/// single parsed config can be compiled against any tree instantiation via
+/// [`BtConfig::compile_with`]. The domain binders (consensus, cluster, …) turn
+/// the raw source into a concrete [`Condition`]/[`LeafAction`] at compile time.
 #[derive(Debug, Clone)]
 pub enum RawBehaviour {
     Selector(Vec<BehaviourId>),
     Sequence(Vec<BehaviourId>),
     Join(Vec<BehaviourId>),
-    ForTicks { count: u32, child: BehaviourId },
-    Wait { count: u32 },
-    Condition(ConditionExpr),
+    ForTicks {
+        count: u32,
+        child: BehaviourId,
+    },
+    /// Pure timing gate — childless and contribution-free, so it is
+    /// domain-neutral and needs no binder.
+    Wait {
+        count: u32,
+    },
+    /// Raw condition expression source, bound by a condition binder.
+    Condition(String),
     Honest,
-    Action(ActionSpec),
+    /// Raw action `kind` + the full `spec` params table (which also carries
+    /// `kind`), bound by an action binder.
+    Action {
+        kind: String,
+        params: toml::Table,
+    },
 }
 
 /// The on-disk config in typed form. Compile it into a [`BehaviourTree`].
@@ -127,9 +143,19 @@ pub struct BtConfig {
 }
 
 impl BtConfig {
-    /// Parse a self-contained config from TOML text. Rejects a non-empty
-    /// `includes`. Does not yet check references/cycles — call
-    /// [`validate`](Self::validate) or [`compile`](Self::compile).
+    /// Parse a self-contained config from TOML text.
+    ///
+    /// There is exactly **one** grammar and one parser: `Action`/`Condition`
+    /// leaves are kept as raw source (the leaf `kind` + `spec` table, and the
+    /// expression text), so a single parsed config can be bound to any tree
+    /// instantiation via [`compile_with`](Self::compile_with). Rejects a
+    /// non-empty `includes` and enforces the domain-neutral structure.
+    ///
+    /// Parsing deliberately does **not** check the leaf *vocabulary* — whether
+    /// `kind` names a known action, or a condition's references resolve — because
+    /// that vocabulary differs per instantiation. Those checks belong to the
+    /// domain: see [`validate`](Self::validate) for the consensus ones, which
+    /// [`compile`](Self::compile) runs for you.
     pub fn parse(text: &str) -> Result<BtConfig, ConfigError> {
         let root: toml::Table =
             toml::from_str(text).map_err(|e| ConfigError::Toml(e.to_string()))?;
@@ -185,9 +211,51 @@ impl BtConfig {
         })
     }
 
-    /// Enforce every validation rule (spec FR-013): one `[run]`; root defined;
-    /// children resolve; no cycles; arity; condition refs resolve and type-check.
+    /// Enforce every validation rule (spec FR-013) for the **consensus**
+    /// instantiation: the domain-neutral structure
+    /// ([`validate_structure`](Self::validate_structure)) plus the consensus leaf
+    /// vocabulary — every `Action` `spec` deserialises into a known
+    /// [`ActionSpec`], and every `Condition` expression parses and type-checks
+    /// against `env.*`/`cardano.*`.
+    ///
+    /// This is the consensus counterpart to another instantiation's binder
+    /// checks: [`parse`](Self::parse) is vocabulary-agnostic, so all
+    /// consensus-specific rejection happens here (and in
+    /// [`compile`](Self::compile), which calls this first).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_structure()?;
+        for (id, raw) in &self.behaviours {
+            match raw {
+                RawBehaviour::Action { params, .. } => {
+                    let _spec: ActionSpec = toml::Value::Table(params.clone()).try_into().map_err(
+                        |e: toml::de::Error| ConfigError::ActionSpec {
+                            id: id.0.clone(),
+                            msg: e.to_string(),
+                        },
+                    )?;
+                }
+                RawBehaviour::Condition(src) => {
+                    let expr = ConditionExpr::parse(src).map_err(|m| ConfigError::Condition {
+                        id: id.0.clone(),
+                        msg: m,
+                    })?;
+                    expr.validate(&self.env)
+                        .map_err(|m| ConfigError::Condition {
+                            id: id.0.clone(),
+                            msg: m,
+                        })?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Domain-neutral structural validation shared by every instantiation: one
+    /// `[run]`; root defined; children resolve; composite/decorator arity; no
+    /// reference cycles. Leaf-vocabulary binding (conditions, actions) is left
+    /// to the domain binders in [`compile_with`](Self::compile_with).
+    pub fn validate_structure(&self) -> Result<(), ConfigError> {
         let run = self
             .run
             .as_ref()
@@ -221,6 +289,8 @@ impl BtConfig {
                     }
                     self.require_defined(id, child)?;
                 }
+                // `Wait`'s count is structural (domain-neutral), so it is checked
+                // here rather than in a binder.
                 RawBehaviour::Wait { count } => {
                     if *count < 1 {
                         return Err(ConfigError::BadArity {
@@ -229,14 +299,10 @@ impl BtConfig {
                         });
                     }
                 }
-                RawBehaviour::Condition(expr) => {
-                    expr.validate(&self.env)
-                        .map_err(|m| ConfigError::Condition {
-                            id: id.0.clone(),
-                            msg: m,
-                        })?;
+                // Condition/Action references are validated by the domain binder
+                // (consensus does it eagerly in `validate`), not structurally.
+                RawBehaviour::Condition(_) | RawBehaviour::Honest | RawBehaviour::Action { .. } => {
                 }
-                RawBehaviour::Honest | RawBehaviour::Action(_) => {}
             }
         }
 
@@ -248,17 +314,77 @@ impl BtConfig {
     }
 
     /// Validate, then expand the references from `root` into an owned
-    /// [`BehaviourTree`] (each reference becomes an independent instance, with
-    /// its own node-local state and a deterministic per-instance action seed).
+    /// consensus [`BehaviourTree`] (each reference becomes an independent
+    /// instance, with its own node-local state and a deterministic per-instance
+    /// action seed).
+    ///
+    /// A thin wrapper over [`compile_with`](Self::compile_with): it validates
+    /// (structural + consensus condition typing) and binds the consensus leaf
+    /// vocabulary — `build_action` for actions, [`ConditionExpr`] for
+    /// conditions — so the consensus behaviour is unchanged.
     pub fn compile(&self) -> Result<BehaviourTree, ConfigError> {
         self.validate()?;
+        self.compile_with(
+            |_kind, params, seed| {
+                let spec: ActionSpec = toml::Value::Table(params.clone()).try_into().map_err(
+                    |e: toml::de::Error| ConfigError::ActionSpec {
+                        id: String::new(),
+                        msg: e.to_string(),
+                    },
+                )?;
+                Ok(build_action(&spec, seed))
+            },
+            |src| {
+                let expr = ConditionExpr::parse(src).map_err(|m| ConfigError::Condition {
+                    id: String::new(),
+                    msg: m,
+                })?;
+                Ok(Box::new(expr) as Box<dyn Condition<ConsensusCtx>>)
+            },
+        )
+    }
+
+    /// Validate the structure, then expand the references from `root` into an
+    /// owned [`BehaviourTree<C, E>`], binding each `Action`/`Condition` leaf
+    /// through the supplied binders. This is the generic compile entry that lets
+    /// a second instantiation reuse the whole TOML grammar and tree walker
+    /// (FR-001) while supplying its own leaf vocabulary:
+    ///
+    /// - `action_binder(kind, params, seed)` turns a raw action `spec` (its
+    ///   `kind` string and full params table) plus a deterministic per-instance
+    ///   `seed` into a boxed [`LeafAction<C, E>`];
+    /// - `condition_binder(expr_src)` turns a raw condition expression into a
+    ///   boxed [`Condition<C>`] (it may parse via [`ConditionExpr`] and bind its
+    ///   own [`ValueResolver`](super::condition::ValueResolver)).
+    ///
+    /// A binder error is tagged with the offending behaviour id. Structural
+    /// validation (root/children/cycles/arity) is domain-neutral and always
+    /// runs first.
+    pub fn compile_with<C, E, FA, FC>(
+        &self,
+        action_binder: FA,
+        condition_binder: FC,
+    ) -> Result<BehaviourTree<C, E>, ConfigError>
+    where
+        C: TreeContext,
+        FA: Fn(&str, &toml::Table, u64) -> Result<Box<dyn LeafAction<C, E>>, ConfigError>,
+        FC: Fn(&str) -> Result<Box<dyn Condition<C>>, ConfigError>,
+    {
+        self.validate_structure()?;
         let run = self
             .run
             .as_ref()
             .ok_or_else(|| ConfigError::Run("missing [run]".to_string()))?;
         let mut on_path: Vec<BehaviourId> = Vec::new();
         let mut action_counter: usize = 0;
-        let root = self.expand(&run.root, run.seed, &mut on_path, &mut action_counter)?;
+        let root = self.expand_with(
+            &run.root,
+            run.seed,
+            &mut on_path,
+            &mut action_counter,
+            &action_binder,
+            &condition_binder,
+        )?;
         Ok(BehaviourTree::new(run.name.clone(), run.seed, root))
     }
 
@@ -314,13 +440,21 @@ impl BtConfig {
         Ok(())
     }
 
-    fn expand(
+    #[allow(clippy::too_many_arguments)]
+    fn expand_with<C, E, FA, FC>(
         &self,
         id: &BehaviourId,
         seed: u64,
         on_path: &mut Vec<BehaviourId>,
         action_counter: &mut usize,
-    ) -> Result<Behaviour, ConfigError> {
+        action_binder: &FA,
+        condition_binder: &FC,
+    ) -> Result<Behaviour<C, E>, ConfigError>
+    where
+        C: TreeContext,
+        FA: Fn(&str, &toml::Table, u64) -> Result<Box<dyn LeafAction<C, E>>, ConfigError>,
+        FC: Fn(&str) -> Result<Box<dyn Condition<C>>, ConfigError>,
+    {
         if on_path.contains(id) {
             let mut path: Vec<String> = on_path.iter().map(|b| b.0.clone()).collect();
             path.push(id.0.clone());
@@ -336,26 +470,54 @@ impl BtConfig {
         on_path.push(id.clone());
 
         let kind = match raw {
-            RawBehaviour::Selector(ch) => {
-                BehaviourKind::Selector(self.expand_all(ch, seed, on_path, action_counter)?)
-            }
-            RawBehaviour::Sequence(ch) => {
-                BehaviourKind::Sequence(self.expand_all(ch, seed, on_path, action_counter)?)
-            }
-            RawBehaviour::Join(ch) => {
-                BehaviourKind::join(self.expand_all(ch, seed, on_path, action_counter)?)
-            }
+            RawBehaviour::Selector(ch) => BehaviourKind::Selector(self.expand_all(
+                ch,
+                seed,
+                on_path,
+                action_counter,
+                action_binder,
+                condition_binder,
+            )?),
+            RawBehaviour::Sequence(ch) => BehaviourKind::Sequence(self.expand_all(
+                ch,
+                seed,
+                on_path,
+                action_counter,
+                action_binder,
+                condition_binder,
+            )?),
+            RawBehaviour::Join(ch) => BehaviourKind::join(self.expand_all(
+                ch,
+                seed,
+                on_path,
+                action_counter,
+                action_binder,
+                condition_binder,
+            )?),
             RawBehaviour::ForTicks { count, child } => {
-                let c = self.expand(child, seed, on_path, action_counter)?;
+                let c = self.expand_with(
+                    child,
+                    seed,
+                    on_path,
+                    action_counter,
+                    action_binder,
+                    condition_binder,
+                )?;
                 BehaviourKind::for_ticks(*count, c)
             }
+            // Domain-neutral: no binder needed.
             RawBehaviour::Wait { count } => BehaviourKind::wait(*count),
-            RawBehaviour::Condition(expr) => BehaviourKind::Condition(expr.clone()),
+            RawBehaviour::Condition(src) => {
+                let cond = condition_binder(src).map_err(|e| attach_id(e, id))?;
+                BehaviourKind::Condition(cond)
+            }
             RawBehaviour::Honest => BehaviourKind::Action(Box::new(HonestAction)),
-            RawBehaviour::Action(spec) => {
+            RawBehaviour::Action { kind, params } => {
                 let action_seed = child_seed(seed, *action_counter);
                 *action_counter += 1;
-                BehaviourKind::Action(build_action(spec, action_seed))
+                let action =
+                    action_binder(kind, params, action_seed).map_err(|e| attach_id(e, id))?;
+                BehaviourKind::Action(action)
             }
         };
 
@@ -363,16 +525,53 @@ impl BtConfig {
         Ok(Behaviour::new(id.clone(), kind))
     }
 
-    fn expand_all(
+    #[allow(clippy::too_many_arguments)]
+    fn expand_all<C, E, FA, FC>(
         &self,
         ids: &[BehaviourId],
         seed: u64,
         on_path: &mut Vec<BehaviourId>,
         action_counter: &mut usize,
-    ) -> Result<Vec<Behaviour>, ConfigError> {
+        action_binder: &FA,
+        condition_binder: &FC,
+    ) -> Result<Vec<Behaviour<C, E>>, ConfigError>
+    where
+        C: TreeContext,
+        FA: Fn(&str, &toml::Table, u64) -> Result<Box<dyn LeafAction<C, E>>, ConfigError>,
+        FC: Fn(&str) -> Result<Box<dyn Condition<C>>, ConfigError>,
+    {
         ids.iter()
-            .map(|c| self.expand(c, seed, on_path, action_counter))
+            .map(|c| {
+                self.expand_with(
+                    c,
+                    seed,
+                    on_path,
+                    action_counter,
+                    action_binder,
+                    condition_binder,
+                )
+            })
             .collect()
+    }
+}
+
+/// Tag a binder error with the offending behaviour id when the binder left the
+/// id blank (binders receive only the raw source, not the id).
+fn attach_id(e: ConfigError, id: &BehaviourId) -> ConfigError {
+    match e {
+        ConfigError::Condition { id: ref i, msg } if i.is_empty() => ConfigError::Condition {
+            id: id.0.clone(),
+            msg,
+        },
+        ConfigError::ActionSpec { id: ref i, msg } if i.is_empty() => ConfigError::ActionSpec {
+            id: id.0.clone(),
+            msg,
+        },
+        ConfigError::BadField { id: ref i, msg } if i.is_empty() => ConfigError::BadField {
+            id: id.0.clone(),
+            msg,
+        },
+        other => other,
     }
 }
 
@@ -527,11 +726,10 @@ fn parse_behaviour(id: &str, t: &toml::Table) -> Result<RawBehaviour, ConfigErro
                     id: id.to_string(),
                     msg: "Condition needs string `expression`".to_string(),
                 })?;
-            let expr = ConditionExpr::parse(expr_str).map_err(|m| ConfigError::Condition {
-                id: id.to_string(),
-                msg: m,
-            })?;
-            Ok(RawBehaviour::Condition(expr))
+            // Kept as raw source; the domain condition binder parses/validates
+            // it. Consensus [`parse`] eagerly re-parses to preserve the parse-
+            // time syntax check.
+            Ok(RawBehaviour::Condition(expr_str.to_string()))
         }
         "HonestAction" => Ok(RawBehaviour::Honest),
         "Action" => {
@@ -539,13 +737,26 @@ fn parse_behaviour(id: &str, t: &toml::Table) -> Result<RawBehaviour, ConfigErro
                 id: id.to_string(),
                 msg: "Action needs a `spec` table".to_string(),
             })?;
-            let spec: ActionSpec = spec_v.clone().try_into().map_err(|e: toml::de::Error| {
-                ConfigError::ActionSpec {
+            let params = spec_v
+                .as_table()
+                .ok_or_else(|| ConfigError::BadField {
                     id: id.to_string(),
-                    msg: e.to_string(),
-                }
-            })?;
-            Ok(RawBehaviour::Action(spec))
+                    msg: "Action `spec` must be a table".to_string(),
+                })?
+                .clone();
+            // Kept as raw `(kind, params)`; the domain action binder builds the
+            // concrete leaf from them. `kind` itself is structural, so an absent
+            // or non-string one is rejected here rather than reaching a binder as
+            // an empty kind (which every binder would have to re-validate).
+            let kind = params
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| ConfigError::BadField {
+                    id: id.to_string(),
+                    msg: "Action `spec` must have a string `kind`".to_string(),
+                })?
+                .to_string();
+            Ok(RawBehaviour::Action { kind, params })
         }
         other => Err(ConfigError::UnknownType {
             id: id.to_string(),
@@ -578,7 +789,9 @@ fn children(id: &str, t: &toml::Table) -> Result<Vec<BehaviourId>, ConfigError> 
 mod tests {
     use super::*;
     use crate::behaviour::tree::control::{EbSizePolicy, OutboundControl, VotePolicy};
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState, TickCtx};
+    use crate::behaviour::tree::env::{
+        DynamicEnv, NativeChainState, ParamOverrides, TickCtx, TreeContext,
+    };
     use crate::behaviour::tree::Status;
     use crate::behaviour::RbProductionStrategy;
     use crate::leios::NoVoteReason;
@@ -908,8 +1121,15 @@ root = "a"
 type = "Action"
 spec = { kind = "not-a-real-action" }
 "#;
+        // An unknown action kind is a consensus *vocabulary* error, so it is
+        // raised by `validate`/`compile` rather than by the shared parser.
+        let cfg = BtConfig::parse(text).expect("structurally valid");
         assert!(matches!(
-            BtConfig::parse(text),
+            cfg.validate(),
+            Err(ConfigError::ActionSpec { .. })
+        ));
+        assert!(matches!(
+            BtConfig::compile_str(text),
             Err(ConfigError::ActionSpec { .. })
         ));
     }
@@ -1039,6 +1259,217 @@ spec = { kind = "lazy-voter" }
             let rb = tick_at(&mut b, slot);
             assert_eq!(ra.0, rb.0, "status diverged at slot {slot}");
             assert_eq!(ra.1, rb.1, "control signal diverged at slot {slot}");
+        }
+    }
+
+    // ---- Generic entrypoints: a non-consensus instantiation ----
+    //
+    // A minimal second instantiation proves `parse` + `compile_with`
+    // are usable without any consensus type: `Effect` is a counter, the
+    // context view carries one number the condition compares against, and the
+    // binders understand a single leaf kind and a single condition form.
+
+    /// The toy instantiation's per-tick view: one readable number.
+    #[derive(Debug)]
+    struct ToyView(u64);
+
+    impl ParamOverrides for ToyView {
+        fn action_overrides(&self, _behaviour_id: &str) -> Vec<(String, toml::Value)> {
+            Vec::new()
+        }
+    }
+
+    /// The toy instantiation marker.
+    #[derive(Debug)]
+    enum ToyCtx {}
+
+    impl TreeContext for ToyCtx {
+        type View<'a> = ToyView;
+    }
+
+    /// Leaf that bumps the effect counter while active.
+    #[derive(Debug)]
+    struct Bump(u64);
+
+    impl LeafAction<ToyCtx, u64> for Bump {
+        fn contribute(&mut self, _ctx: &ToyView, out: &mut u64) -> Status {
+            *out += self.0;
+            Status::Running
+        }
+    }
+
+    /// Condition `value >= n`.
+    #[derive(Debug)]
+    struct AtLeast(u64);
+
+    impl Condition<ToyCtx> for AtLeast {
+        fn eval(&self, ctx: &ToyView) -> bool {
+            ctx.0 >= self.0
+        }
+    }
+
+    fn toy_action(
+        kind: &str,
+        params: &toml::Table,
+        _seed: u64,
+    ) -> Result<Box<dyn LeafAction<ToyCtx, u64>>, ConfigError> {
+        match kind {
+            "bump" => {
+                let by = params
+                    .get("by")
+                    .and_then(toml::Value::as_integer)
+                    .unwrap_or(1);
+                Ok(Box::new(Bump(by as u64)))
+            }
+            other => Err(ConfigError::ActionSpec {
+                id: String::new(), // left blank: `attach_id` fills the behaviour id
+                msg: format!("unknown toy kind {other:?}"),
+            }),
+        }
+    }
+
+    fn toy_condition(src: &str) -> Result<Box<dyn Condition<ToyCtx>>, ConfigError> {
+        // Only `value >= <int>` is understood.
+        match src
+            .strip_prefix("value >= ")
+            .and_then(|n| n.trim().parse().ok())
+        {
+            Some(n) => Ok(Box::new(AtLeast(n))),
+            None => Err(ConfigError::Condition {
+                id: String::new(), // left blank: `attach_id` fills the behaviour id
+                msg: format!("unsupported toy condition {src:?}"),
+            }),
+        }
+    }
+
+    const TOY: &str = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Selector"
+children = ["gate", "work"]
+[behaviours.gate]
+type = "Condition"
+expression = "value >= 10"
+[behaviours.work]
+type = "Action"
+spec = { kind = "bump", by = 3 }
+"#;
+
+    #[test]
+    fn compile_with_builds_a_non_consensus_instantiation() {
+        let cfg = BtConfig::parse(TOY).unwrap();
+        let mut tree = cfg.compile_with(toy_action, toy_condition).unwrap();
+
+        // Gate false (value < 10) → the selector falls through to the leaf,
+        // which bumps the effect by its `by` param.
+        let (status, out) = tree.tick(&ToyView(0));
+        assert_eq!(status, Status::Running);
+        assert_eq!(out, 3);
+
+        // Gate true → the condition succeeds and the leaf never contributes.
+        let (status, out) = tree.tick(&ToyView(10));
+        assert_eq!(status, Status::Success);
+        assert_eq!(out, 0);
+    }
+
+    #[test]
+    fn compile_with_tags_binder_errors_with_the_behaviour_id() {
+        // An action kind the toy binder doesn't know: the binder returns a
+        // blank-id error and `attach_id` fills in the offending behaviour.
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Action"
+spec = { kind = "nope" }
+"#;
+        let cfg = BtConfig::parse(text).unwrap();
+        let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
+        match err {
+            ConfigError::ActionSpec { id, msg } => {
+                assert_eq!(id, "root", "binder error must carry the behaviour id");
+                assert!(msg.contains("nope"), "msg should name the kind: {msg}");
+            }
+            other => panic!("expected ActionSpec, got {other:?}"),
+        }
+
+        // Same for a condition the toy binder can't parse.
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Condition"
+expression = "cardano.current_slot >= 1"
+"#;
+        let cfg = BtConfig::parse(text).unwrap();
+        let err = cfg.compile_with(toy_action, toy_condition).unwrap_err();
+        match err {
+            ConfigError::Condition { id, .. } => assert_eq!(id, "root"),
+            other => panic!("expected Condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_vocabulary_agnostic_and_domains_reject_in_their_own_layer() {
+        // `TOY` uses a leaf kind and a condition form that mean nothing to
+        // consensus. The single shared parser accepts it — the structure is
+        // fine, and the vocabulary is the domain's business.
+        let cfg = BtConfig::parse(TOY).expect("one grammar: parse is vocabulary-agnostic");
+
+        // The toy domain binds it happily...
+        assert!(cfg.compile_with(toy_action, toy_condition).is_ok());
+
+        // ...while consensus rejects the same config in ITS layer: `validate`
+        // (and therefore `compile`), not `parse`. Which vocabulary error comes
+        // first depends on behaviour-id ordering, so assert the layer, not the
+        // variant — `TOY` is invalid to consensus in both its action and its
+        // condition.
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::Condition { .. } | ConfigError::ActionSpec { .. })
+        ));
+        assert!(cfg.compile().is_err());
+
+        // Structural validation still applies to every domain: an undefined
+        // child is a hard error regardless of instantiation.
+        let missing_child = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Sequence"
+children = ["ghost"]
+"#;
+        let cfg = BtConfig::parse(missing_child).unwrap();
+        assert!(cfg.validate_structure().is_err());
+        assert!(cfg.compile_with(toy_action, toy_condition).is_err());
+    }
+
+    #[test]
+    fn action_spec_without_a_string_kind_is_a_structural_error() {
+        let text = r#"
+[run]
+name = "toy"
+seed = 9
+root = "root"
+[behaviours.root]
+type = "Action"
+spec = { by = 3 }
+"#;
+        match BtConfig::parse(text) {
+            Err(ConfigError::BadField { id, msg }) => {
+                assert_eq!(id, "root");
+                assert!(msg.contains("kind"), "msg should mention `kind`: {msg}");
+            }
+            other => panic!("expected BadField for the missing kind, got {other:?}"),
         }
     }
 }

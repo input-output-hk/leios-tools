@@ -10,7 +10,7 @@
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::{ControlSignal, OutboundControl};
-use crate::behaviour::tree::env::TickCtx;
+use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 use crate::behaviour::RbProductionStrategy;
 use crate::peer::PeerId;
@@ -32,7 +32,7 @@ impl RbHeaderEquivocator {
     }
 }
 
-impl LeafAction for RbHeaderEquivocator {
+impl LeafAction<ConsensusCtx, ControlSignal> for RbHeaderEquivocator {
     fn contribute(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.praos.production = RbProductionStrategy::Equivocate { ways: self.ways };
         out.praos.outbound = OutboundControl::EquivocateRouting {
