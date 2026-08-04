@@ -845,13 +845,13 @@ impl LeiosState {
         // check; the validator will reject the EB body if it references
         // unknown TXs.
         if let Some((_, tx_hashes)) = self.eb_tx_hashes.get(eb_hash) {
-            let mut present = [0, 0];
+            let mut present = [0, 0]; // [pinned,unpinned]
+            let mut origin = [0,0]; // [ours,outside]
             let mut absent = 0;
             let mut decline = false;
-            let mut origin_by_slots: BTreeMap<u64, [u64; 2]> = BTreeMap::new();
 
             for h in tx_hashes {
-                let (pinned, ours, gen_slot) = match tx_known(h) {
+                let (pinned, ours, _gen_slot) = match tx_known(h) {
                     TxAvailability::Absent => {
                         decline = true;
                         absent += 1;
@@ -859,14 +859,21 @@ impl LeiosState {
                     },
                     TxAvailability::Present { pinned, ours, gen_slot } => (pinned, ours, gen_slot)
                 };
-                let entry = origin_by_slots.entry(gen_slot).or_insert([0, 0]);
-                entry[ours as usize] += 1;
+                origin[ours as usize] += 1;
                 present[pinned as usize] += 1;
             }
 
-            info!("Voting for RB {}, EB {}, slot {}, announced {}, current {}",
-                hex_prefix(rb_hash), hex_prefix(eb_hash), eb_seen_slot, eb_slot, eb_current_slot
+            let point = Point::Specific {
+                hash: rb_hash.clone(),
+                slot: eb_slot,
+            };
+            info!("Voting point {point}, EB {}, seen at {eb_seen_slot}, current {eb_current_slot}; total txs {}, \"\
+                   present (pinned {}/unpinned {}) (ours {}/outside {}), absent {absent}; pending fetches {}",
+                hex_prefix(eb_hash), present.iter().sum::<usize>(),
+                present[true as usize], present[false as usize], origin[true as usize], origin[false as usize],
+                self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
             );
+/*
             info!(" slot difference; extrn;  ours");
             info!("------------------------------");
             for (slot, count) in origin_by_slots.iter().rev() {
@@ -877,8 +884,8 @@ impl LeiosState {
                 self.candidates.pending_eb_txs_fetches.iter(),
                 self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
             );
-            info!("Total present: {}, absent {absent}", present.iter().sum::<usize>());
-
+            info!("Total present: {}, absent {absent}", );
+*/
             if decline {
                 return Err(NoVoteReason::MissingTX {
                     required: tx_hashes.len(),
