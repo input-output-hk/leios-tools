@@ -360,24 +360,6 @@ impl MempoolState {
         self.control = control.clone();
     }
 
-    // -- Network event handlers --------------------------------------------
-
-    /// A tx body arrived from the network.  If the mempool already
-    /// holds it (or it's pending validation), emits `TxRejected` with
-    /// `AlreadyKnown` and discards.  Otherwise records the body and
-    /// emits `ValidateTx`; the wrapper validates and reports back via
-    /// [`Self::on_tx_validated`] or [`Self::on_tx_validation_failed`].
-    pub fn on_tx_received(&mut self, tx_id: TxId, body: TxBody) -> Vec<MempoolEffect> {
-        if self.pending_validation.contains_key(&tx_id) || self.contains(&tx_id) {
-            return vec![MempoolEffect::TxRejected {
-                tx_id,
-                reason: TxRejectReason::AlreadyKnown,
-            }];
-        }
-        self.pending_validation.insert(tx_id.clone(), body.clone());
-        vec![MempoolEffect::ValidateTx { tx_id, body }]
-    }
-
     // -- Validation outcomes -----------------------------------------------
 
     /// Admit a tx that's already been validated externally — typically
@@ -981,6 +963,22 @@ impl MempoolState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tx body arrived from the network.  If the mempool already
+    /// holds it (or it's pending validation), emits `TxRejected` with
+    /// `AlreadyKnown` and discards.  Otherwise records the body and
+    /// emits `ValidateTx`; the wrapper validates and reports back via
+    /// [`Self::on_tx_validated`] or [`Self::on_tx_validation_failed`].
+    pub fn on_tx_received(pool: &mut MempoolState, tx_id: TxId, body: TxBody) -> Vec<MempoolEffect> {
+        if pool.pending_validation.contains_key(&tx_id) || self.contains(&tx_id) {
+            return vec![MempoolEffect::TxRejected {
+                tx_id,
+                reason: TxRejectReason::AlreadyKnown,
+            }];
+        }
+        pool.pending_validation.insert(tx_id.clone(), body.clone());
+        vec![MempoolEffect::ValidateTx { tx_id, body }]
+    }
 
     /// Validator confirmed the body for `tx_id` — admit it.  If the
     /// queue is at capacity, evicts the oldest tx and emits a

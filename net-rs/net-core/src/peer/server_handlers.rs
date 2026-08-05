@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use shared_consensus::mempool::TxId;
-use shared_consensus::leios::bitmap_to_indices;
+use shared_consensus::leios::bitmap_length;
 
 use shared_consensus::behaviour::actions::equivocation_bucket;
 use shared_consensus::behaviour::tree::control::OutboundControl;
@@ -1152,7 +1152,7 @@ pub async fn serve_leios_fetch(
                     peer = peer.0,
                     %point,
                     bitmap_chunks = bitmap.len(),
-                    requested = bitmap_to_indices(&bitmap).len(),
+                    requested = bitmap_length(&bitmap),
                     "leios_fetch: downstream requested EB txs from us"
                 );
                 let transactions = match &point {
@@ -1171,7 +1171,7 @@ pub async fn serve_leios_fetch(
                 tracing::info!(
                     peer = peer.0,
                     %point,
-                    requested = bitmap_to_indices(&bitmap).len(),
+                    requested = bitmap_length(&bitmap),
                     actual = transactions.len(),
                     "leios_fetch: retrieved transactions from store"
                 );

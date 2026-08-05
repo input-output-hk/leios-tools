@@ -1554,6 +1554,14 @@ pub fn bitmap_to_indices(bitmap: &BTreeMap<u16, u64>) -> BTreeSet<u32> {
     out
 }
 
+pub fn bitmap_length(bitmap: &BTreeMap<u16, u64>) -> usize {
+    let mut len = 0;
+    for (_segment, &word) in bitmap {
+        len += word.count_ones() as usize;
+    };
+    len
+}
+
 fn indices_to_bitmap(indices: &[u32]) -> BTreeMap<u16, u64> {
     let mut out: BTreeMap<u16, u64> = BTreeMap::new();
     for &idx in indices {
