@@ -419,9 +419,9 @@ pub struct LeiosState {
     /// If txs were not fully retrieved from leios nodes, EB Point is written
     /// so the retrieval attempt can be repeated next slot.
     /// Inserted when `retry_eb_tx_fetch` ran out of peers.
-    /// Removed either when all txs are fetched, or when corresponding EB becomes
-    /// outdated.
-    pub postponed_eb_tx_requests: HashSet<Point>,
+    /// Removed, when txs fetch is restarted, and when all txs are fetched.
+    /// Pruned when EB (corresponding to the Point) becomes outdated.
+    postponed_eb_tx_requests: HashSet<Point>,
 
     /// EB hashes the local node holds a chain-committed cert for whose
     /// body it has not validated locally.  Producer-side EB-safety
@@ -563,6 +563,12 @@ impl LeiosState {
         self.eb_txs_policy = policy;
     }
 
+    /// Take postponed requests to restart them.
+    pub fn take_postponed_eb_tx_requests(&mut self) -> HashSet<Point> {
+        std::mem::take(&mut self.postponed_eb_tx_requests)
+    }
+
+
     /// Build the sparse CIP-0164 bitmap of manifest indices whose tx
     /// bodies are *not* locally available, ready to feed
     /// [`Self::on_eb_txs_offered`] or directly into the wire
@@ -602,6 +608,42 @@ impl LeiosState {
     }
 
     // -- Slot tick ----------------------------------------------------------
+
+    /// Cleaning procedure for all left-overs from previous EB and EB tx fetching attempts,
+    /// Main reason for the procedure: to avoid memory leaks.
+    fn prune_chain_progress(&mut self, min_keep: u64) {
+        self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
+        self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
+        self.pending_eb_tx_fetches
+            .retain(|_, (slot, _)| *slot >= min_keep);
+        self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
+        self.validated_eb_bodies.retain(|_, s| *s >= min_keep);
+        // Pruned elections emit their final voting tally so the quorum-
+        // margin sensor sees end-of-round weight (incl. elections that
+        // never reached quorum), not the always-~τ formation-time reading.
+        for eff in self.elections.prune_below_slot(min_keep) {
+            if let crate::elections::SlotEffect::Expired {
+                eb_slot,
+                had_quorum,
+                voted_weight,
+                voters,
+                expected_weight,
+                ..
+            } = eff
+            {
+                fx.push(LeiosEffect::EmitTelemetry(
+                    LeiosTelemetryEvent::ElectionExpired {
+                        eb_slot,
+                        had_quorum,
+                        voted_weight,
+                        voters,
+                        expected_weight,
+                    },
+                ));
+            }
+        }
+        self.candidates.prune_below_slot(min_keep);
+    }
 
     /// Drive the election state machine forward, decide voting for any
     /// election entering the Voting phase, and prune stale Leios-fetch
@@ -749,37 +791,7 @@ impl LeiosState {
         // RB (`tip_rb_slot = None`), no prune fires — every received
         // EB is potentially relevant to the chain we'll soon adopt.
         if let Some(min_keep) = self.chain_tip_ctx.tip_rb_slot {
-            self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
-            self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
-            self.pending_eb_tx_fetches
-                .retain(|_, (slot, _)| *slot >= min_keep);
-            self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
-            self.validated_eb_bodies.retain(|_, s| *s >= min_keep);
-            // Pruned elections emit their final voting tally so the quorum-
-            // margin sensor sees end-of-round weight (incl. elections that
-            // never reached quorum), not the always-~τ formation-time reading.
-            for eff in self.elections.prune_below_slot(min_keep) {
-                if let crate::elections::SlotEffect::Expired {
-                    eb_slot,
-                    had_quorum,
-                    voted_weight,
-                    voters,
-                    expected_weight,
-                    ..
-                } = eff
-                {
-                    fx.push(LeiosEffect::EmitTelemetry(
-                        LeiosTelemetryEvent::ElectionExpired {
-                            eb_slot,
-                            had_quorum,
-                            voted_weight,
-                            voters,
-                            expected_weight,
-                        },
-                    ));
-                }
-            }
-            self.candidates.prune_below_slot(min_keep);
+            self.prune_chain_progress(min_keep);
         }
         fx
     }
@@ -1031,6 +1043,14 @@ impl LeiosState {
         self.initiate_eb_txs_fetch(&point, bitmap, now)
     }
 
+    /// Initiate fetch restarting, if all previous attempts were unsuscessful: maybe some peers
+    /// got new information?
+    /// This function depends on the new bitmap, so it's not implemented in full inside
+    /// shared consensus. Instead, it's initiated from outer loop -- where Ledger is avaialble;
+    /// That outer loop should:
+    /// * take all postponed fetches using `take_postponed_eb_requests`,
+    /// * recalculate new `bitmap`s (which are unavailable at this level)
+    /// * return control/information back onto shared consensus level using this function.
     pub fn retry_postponed_eb_txs_fetches(
         &mut self,
         point: &Point,
@@ -1393,7 +1413,12 @@ impl LeiosState {
             .eb_txs_policy
             .pick(&point, &bitmap, &candidates, self.rtt.as_ref());
         if peers.is_empty() {
-            // Request eb txs, if not all txs are known, but we asked all peers at the moment.
+            // If not all txs are known, but we asked all peers at the moment, we should
+            // try to repeat the request in a slot, when new data could become available for
+            // the peers (by calling `take_postponed_eb_tx_requests` and further processing
+            // the data).
+            // This repeated processing may happen only for L_hdr*3 + L_vote slots, since
+            // after this number of slots the election (voting) process will have no sense.
             self.postponed_eb_tx_requests.insert(point);
             return Vec::new();
         }
