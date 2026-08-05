@@ -413,6 +413,7 @@ pub struct LeiosState {
     /// Per-EB requested bitmap.  Set when a `FetchLeiosBlockTxs` is
     /// emitted; used at response time to verify which manifest indices
     /// were actually fulfilled.
+    /// Map: RB-hash -> (slot, bitmap)
     pub pending_eb_tx_fetches: BTreeMap<[u8; 32], (u64, BTreeMap<u16, u64>)>,
 
     /// If txs were not fully retrieved from leios nodes, EB Point is written
@@ -751,7 +752,7 @@ impl LeiosState {
             self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
             self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
             self.pending_eb_tx_fetches
-                .retain(|_, (s, _)| *s >= min_keep);
+                .retain(|_, (slot, _)| *slot >= min_keep);
             self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
             self.validated_eb_bodies.retain(|_, s| *s >= min_keep);
             // Pruned elections emit their final voting tally so the quorum-
@@ -869,10 +870,9 @@ impl LeiosState {
                 slot: eb_slot,
             };
             info!("Voting point {point}, EB {}, seen at {eb_seen_slot}, current {eb_current_slot}; total txs {}, \"\
-                   present (pinned {}/unpinned {}) (ours {}/outside {}), absent {absent}; pending fetches {}",
+                   present (pinned {}/unpinned {}) (ours {}/outside {}), absent {absent}",
                 hex_prefix(eb_hash), present.iter().sum::<usize>(),
                 present[true as usize], present[false as usize], origin[true as usize], origin[false as usize],
-                self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
             );
 
             if decline {
@@ -1058,7 +1058,6 @@ impl LeiosState {
         now: Instant,
     ) -> Vec<LeiosEffect> {
         if !self.should_process_eb(point) {
-            //tracing::debug!(node_id = %self.node_id, %point, peer = peer.0, "t22: filtered EB-txs offer (checksum-threshold)");
             return Vec::new();
         }
 

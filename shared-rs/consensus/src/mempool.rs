@@ -382,12 +382,12 @@ impl MempoolState {
 
     /// Admit a tx that's already been validated externally — typically
     /// a locally-produced tx the wrapper has validated against its own
-    /// ledger view, or a test fixture.  Bypasses the
-    /// `on_tx_received` → `ValidateTx` → `on_tx_validated` dance.
+    /// ledger view, or a test fixture.
     ///
     /// `ours` records the provenance stamped onto [`MempoolTx::ours`]:
     /// `true` for a tx this node generated, `false` for a peer-sent tx
     /// the wrapper validated inline.
+    /// `slot` is the moment (=slot) of tx receiving/generating.
     pub fn admit_validated(
         &mut self,
         tx_id: TxId,
