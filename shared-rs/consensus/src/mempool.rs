@@ -970,7 +970,7 @@ mod tests {
     /// emits `ValidateTx`; the wrapper validates and reports back via
     /// [`Self::on_tx_validated`] or [`Self::on_tx_validation_failed`].
     pub fn on_tx_received(pool: &mut MempoolState, tx_id: TxId, body: TxBody) -> Vec<MempoolEffect> {
-        if pool.pending_validation.contains_key(&tx_id) || self.contains(&tx_id) {
+        if pool.pending_validation.contains_key(&tx_id) || pool.contains(&tx_id) {
             return vec![MempoolEffect::TxRejected {
                 tx_id,
                 reason: TxRejectReason::AlreadyKnown,
@@ -1092,7 +1092,7 @@ mod tests {
     fn on_tx_received_emits_validate_tx() {
         let mut s = MempoolState::new(10);
         let (tx_id, body, _) = tx(1, 100);
-        let fx = s.on_tx_received(tx_id.clone(), body.clone());
+        let fx = on_tx_received(&mut s, tx_id.clone(), body.clone());
         assert_eq!(fx.len(), 1);
         match &fx[0] {
             MempoolEffect::ValidateTx { tx_id: id, body: b } => {
@@ -1108,9 +1108,9 @@ mod tests {
     fn on_tx_received_dedup_pending_returns_already_known() {
         let mut s = MempoolState::new(10);
         let (tx_id, body, _) = tx(1, 100);
-        let _ = s.on_tx_received(tx_id.clone(), body.clone());
+        let _ = on_tx_received(&mut s, tx_id.clone(), body.clone());
         // Second arrival while pending.
-        let fx = s.on_tx_received(tx_id.clone(), body);
+        let fx = on_tx_received(&mut s, tx_id.clone(), body);
         assert_eq!(fx.len(), 1);
         assert!(matches!(
             fx[0],
@@ -1126,7 +1126,7 @@ mod tests {
         let mut s = MempoolState::new(10);
         let _ = admit(&mut s, 1, 100);
         let (tx_id, body, _) = tx(1, 100);
-        let fx = s.on_tx_received(tx_id, body);
+        let fx = on_tx_received(&mut s, tx_id, body);
         assert!(matches!(
             fx[0],
             MempoolEffect::TxRejected {
@@ -1140,7 +1140,7 @@ mod tests {
     fn on_tx_validated_admits_to_queue() {
         let mut s = MempoolState::new(10);
         let (tx_id, body, sz) = tx(1, 100);
-        let _ = s.on_tx_received(tx_id.clone(), body);
+        let _ = on_tx_received(&mut s, tx_id.clone(), body);
         let fx = on_tx_validated(&mut s, tx_id.clone(), sz, 0);
         assert!(fx.is_empty()); // no overflow → no effect
         assert_eq!(s.len(), 1);
@@ -1161,7 +1161,7 @@ mod tests {
     fn on_tx_validation_failed_emits_rejected() {
         let mut s = MempoolState::new(10);
         let (tx_id, body, _) = tx(1, 100);
-        let _ = s.on_tx_received(tx_id.clone(), body);
+        let _ = on_tx_received(&mut s, tx_id.clone(), body);
         let fx = on_tx_validation_failed(&mut s, tx_id.clone(), "bad signature".into());
         assert_eq!(fx.len(), 1);
         match &fx[0] {
@@ -1527,7 +1527,7 @@ mod tests {
         // admit_validated supersedes — pending entry dropped.
         let mut s = MempoolState::new(10);
         let (tx_id, body, sz) = tx(1, 100);
-        let _ = s.on_tx_received(tx_id.clone(), body.clone());
+        let _ = on_tx_received(&mut s, tx_id.clone(), body.clone());
         assert!(s.pending_validation.contains_key(&tx_id));
         let _ = s.admit_validated(tx_id.clone(), body, sz, 0, false);
         assert!(!s.pending_validation.contains_key(&tx_id));
@@ -1554,7 +1554,7 @@ mod tests {
 
         // Network-validated path never marks a tx as ours.
         let (net_id, net_body, _net_sz) = tx(3, 10);
-        let _ = s.on_tx_received(net_id.clone(), net_body);
+        let _ = on_tx_received(&mut s, net_id.clone(), net_body);
         let _ = on_tx_validated(&mut s, net_id.clone(), 10, 43);
         let net = s.txs.iter().find(|t| t.id() == &net_id).unwrap();
         assert!(!net.ours);
