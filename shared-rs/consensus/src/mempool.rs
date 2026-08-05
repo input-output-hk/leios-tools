@@ -34,7 +34,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use serde::Serialize;
 use tracing::info;
-use crate::behaviour::tree::control::TxSubmissionPolicy;
+use crate::behaviour::tree::control::TxWithholdingPolicy;
 use crate::peer::PeerId;
 use crate::types::hex_prefix;
 
@@ -491,10 +491,10 @@ impl MempoolState {
 
     /// Check current transaction WRT filtering rules.
     /// Return true if Tx to remain, false if Tx should not be announced.
-    fn filter_transaction_announcement(&self, current_slot: u64, tx_id: &TxId) -> bool {
-        let (delay, only_ours) = if let TxSubmissionPolicy::WithholdTxSubmission {
+    fn filter_transactions(&self, current_slot: u64, tx_id: &TxId) -> bool {
+        let (delay, only_ours) = if let TxWithholdingPolicy::WithholdTxs {
             withholding_slots: delay_for_slots, tx_producer_only: only_ours
-        } = &self.control.mempool.tx_submission_filter {
+        } = &self.control.mempool.tx_withholding_filter {
             (*delay_for_slots, *only_ours)
         } else {
             return true;
@@ -544,7 +544,7 @@ impl MempoolState {
 
             unann.iter().filter(
                 |tx| {
-                    let leave = self.filter_transaction_announcement(current_slot, tx);
+                    let leave = self.filter_transactions(current_slot, tx);
                     control_stats[leave as usize] += 1;
                     leave
                 }
@@ -601,7 +601,7 @@ impl MempoolState {
     pub fn mark_announced_to_peer(&mut self, peer_id: PeerId, tx_id: &TxId, current_slot: u64) -> bool {
         self.ensure_peer_registered(peer_id);
 
-        if !self.filter_transaction_announcement(current_slot, tx_id) {
+        if !self.filter_transactions(current_slot, tx_id) {
             return false;
             // TODO: if transaction is filtered, should we announce it later, when filter dropped?
         }
@@ -1052,9 +1052,9 @@ mod tests {
 
     /// Install a `WithholdTxSubmission` announcement-filter policy.
     fn apply_withhold(state: &mut MempoolState, withholding_slots: u64, tx_producer_only: bool) {
-        use crate::behaviour::tree::control::{ControlSignal, TxSubmissionPolicy};
+        use crate::behaviour::tree::control::{ControlSignal, TxWithholdingPolicy};
         let mut cs = ControlSignal::default();
-        cs.mempool.tx_submission_filter = TxSubmissionPolicy::WithholdTxSubmission {
+        cs.mempool.tx_withholding_filter = TxWithholdingPolicy::WithholdTxs {
             withholding_slots,
             tx_producer_only,
         };

@@ -134,7 +134,7 @@ pub struct LeiosControl {
 pub struct MempoolControl {
     /// EB/tx processing filter.
     pub tx_filter: TxFilterPolicy,
-    pub tx_submission_filter: TxSubmissionPolicy,
+    pub tx_withholding_filter: TxWithholdingPolicy,
     /// `tx-flood` action: drive the local tx generator at this rate (txs/sec;
     /// `0` = honest, no override). The net-node actuator applies it to the tx
     /// generator so the node injects far faster than the network drains,
@@ -213,12 +213,12 @@ pub enum TxFilterPolicy {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum TxSubmissionPolicy {
+pub enum TxWithholdingPolicy {
     #[default]
     None,
 
     /// Never announce (some of) txs
-    WithholdTxSubmission {
+    WithholdTxs {
         /// Delay in announcements for slots
         /// 0 -- don't delay (effectively no filtering);
         /// Set to MAX_INT to never announce

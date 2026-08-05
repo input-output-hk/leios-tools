@@ -36,7 +36,7 @@ pub enum ActionSpec {
         hide_eb_tx_received: bool,
     },
     #[serde(rename = "withhold-announcements")]
-    WithholdAnnouncements {
+    WithholdTxs {
         withholding_slots: u64,
         tx_producer_only: bool,
     },

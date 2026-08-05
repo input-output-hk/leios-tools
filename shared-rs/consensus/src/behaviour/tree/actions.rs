@@ -77,10 +77,10 @@ pub fn build_action(
             *non_voting_threshold,
             *hide_eb_tx_received,
         )),
-        ActionSpec::WithholdAnnouncements {
+        ActionSpec::WithholdTxs {
             withholding_slots,
             tx_producer_only,
-        } => Box::new(catalogue::WithholdTxSubmission::new(
+        } => Box::new(catalogue::WithholdTxs::new(
             *withholding_slots,
             *tx_producer_only,
         )),

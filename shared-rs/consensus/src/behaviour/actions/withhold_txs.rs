@@ -1,23 +1,27 @@
-//! `withhold-announcements` — delay (or suppress) tx announcements to peers.
+//! `withhold-txs` — delay (or suppress) tx propagation to peers.
 //!
-//! Sets `mempool.announce_filter = WithholdAnnouncements { delay_for_slots,
-//! only_ours }`; the mempool actuator then honours the policy in
-//! `peek_unannounced_for_peer` (a tx younger than `delay_for_slots` is held
-//! back; `u64::MAX` withholds it forever). Returns `Running` while installed.
+//! Implementation of LeafAction for WithholdTxs.
+//! Leaf-level data type, which delivers information to real transaction filtering code
+//! in consensus.
 
 use crate::behaviour::tree::actions::LeafAction;
-use crate::behaviour::tree::control::{ControlSignal, TxSubmissionPolicy};
+use crate::behaviour::tree::control::{ControlSignal, TxWithholdingPolicy};
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
-/// Installs the withhold-announcements tx filter.
+/// Installs the withholding transactinos filter.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct WithholdTxSubmission {
+pub struct WithholdTxs {
+    /// Delays transaction propagation to peers for this many slots.
     withholding_slots: u64,
+
+    /// Delay transaction propagation:
+    /// * only if tx is produced by the current node (`true`)
+    /// * for all txs in mempool (`false`)
     tx_producer_only: bool,
 }
 
-impl WithholdTxSubmission {
+impl WithholdTxs {
     pub fn new(delay_for_slots: u64, only_ours: bool) -> Self {
         Self {
             withholding_slots: delay_for_slots,
@@ -26,9 +30,9 @@ impl WithholdTxSubmission {
     }
 }
 
-impl LeafAction<ConsensusCtx, ControlSignal> for WithholdTxSubmission {
+impl LeafAction<ConsensusCtx, ControlSignal> for WithholdTxs {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
-        out.mempool.tx_submission_filter = TxSubmissionPolicy::WithholdTxSubmission {
+        out.mempool.tx_withholding_filter = TxWithholdingPolicy::WithholdTxs {
             withholding_slots: self.withholding_slots,
             tx_producer_only: self.tx_producer_only,
         };
@@ -57,7 +61,7 @@ mod tests {
     use super::*;
     use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
-    fn run(action: &mut WithholdTxSubmission) -> (Status, ControlSignal) {
+    fn run(action: &mut WithholdTxs) -> (Status, ControlSignal) {
         let env = DynamicEnv::new();
         let state = NativeChainState::default();
         let ctx = TickCtx {
@@ -73,11 +77,11 @@ mod tests {
 
     #[test]
     fn installs_configured_tx_submission_withholding_filter() {
-        let (s, out) = run(&mut WithholdTxSubmission::new(5, true));
+        let (s, out) = run(&mut WithholdTxs::new(5, true));
         assert_eq!(s, Status::Running);
         assert_eq!(
-            out.mempool.tx_submission_filter,
-            TxSubmissionPolicy::WithholdTxSubmission {
+            out.mempool.tx_withholding_filter,
+            TxWithholdingPolicy::WithholdTxs {
                 withholding_slots: 5,
                 tx_producer_only: true,
             }
@@ -86,7 +90,7 @@ mod tests {
 
     #[test]
     fn touches_only_the_mempool_domain() {
-        let (_, out) = run(&mut WithholdTxSubmission::new(3, false));
+        let (_, out) = run(&mut WithholdTxs::new(3, false));
         assert_eq!(out.praos, Default::default());
         assert_eq!(out.leios, Default::default());
     }
