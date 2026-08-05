@@ -35,6 +35,11 @@ pub enum ActionSpec {
         non_voting_threshold: u8,
         hide_eb_tx_received: bool,
     },
+    #[serde(rename = "withhold-announcements")]
+    WithholdTxs {
+        withholding_slots: u64,
+        tx_producer_only: bool,
+    },
     #[serde(rename = "deep-reorg")]
     DeepReorg { every_slots: u64, depth: u64 },
     #[serde(rename = "drop-inbound-peers")]

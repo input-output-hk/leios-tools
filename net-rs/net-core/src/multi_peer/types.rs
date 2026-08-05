@@ -117,6 +117,7 @@ pub enum NetworkEvent {
 
     /// Leios: fetched transactions for an EB arrived.
     LeiosBlockTxsReceived {
+        peer_id: PeerId,
         point: Point,
         transactions: Vec<TxBody>,
     },

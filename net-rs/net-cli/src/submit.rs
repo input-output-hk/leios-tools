@@ -17,7 +17,8 @@ use net_core::protocols::txsubmission::{PendingTx, TxSubmission};
 use net_core::protocols::Role;
 use net_core::protocols::Runner;
 
-use shared_consensus::mempool::{TxBody, TxId};
+use shared_consensus::mempool::{TxBody, TxId, TxInfo};
+use std::sync::Arc;
 
 use crate::connect;
 
@@ -47,9 +48,11 @@ fn generate_random_tx(rng: &mut StdRng, min_size: usize, max_size: usize) -> Pen
     rng.fill(payload.as_mut_slice());
 
     PendingTx {
-        tx_id: TxId::new_with_array(hash),
-        body: TxBody::new_with_vec(payload),
-        size: size as u32,
+        tx: Arc::new(TxInfo {
+            tx_id: TxId::new_with_array(hash),
+            body: TxBody::new_with_vec(payload),
+            size: size as u32,
+        }),
         // Locally generated: stamp our origin era (current dev net = Dijkstra).
         era: txsubmission::ORIGIN_ERA,
     }
@@ -150,7 +153,7 @@ pub async fn run(
             }
 
             let tx = generate_random_tx(&mut rng, min_size, max_size);
-            println!("  generated tx #{} ({} bytes)", i + 1, tx.size);
+            println!("  generated tx #{} ({} bytes)", i + 1, tx.tx.size);
             if tx_sender.send(tx).await.is_err() {
                 break; // client protocol finished
             }
@@ -160,7 +163,9 @@ pub async fn run(
 
     // Run the client protocol.
     let mut runner = Runner::<TxSubmission>::new(Role::Client, ts_send, ts_recv);
-    let result = txsubmission::run_client(&mut runner, &mut tx_receiver, None).await;
+    let result =
+        txsubmission::run_client(&mut runner, &mut tx_receiver, None, shared_consensus::PeerId(0))
+            .await;
 
     match &result {
         Ok(()) => println!("txsubmission complete"),

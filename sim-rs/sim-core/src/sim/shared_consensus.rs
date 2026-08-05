@@ -609,10 +609,11 @@ impl NodeImpl for SharedConsensus {
         let tx_arcs = &self.tx_arcs;
         let tx_known = |key: &TxId| {
             if mempool.eb_pinned.contains_key(key) {
-                TxAvailability::PresentPinned
+                // Ours/gen_slot stats are not supported for sim
+                TxAvailability::Present { pinned: true, ours: false, gen_slot: 0 }
             }
             else if mempool.has_tx(key) || tx_arcs.contains_key(key) {
-                TxAvailability::PresentUnpinned
+                TxAvailability::Present { pinned: false, ours: false, gen_slot: 0 }
             }
             else {
                 TxAvailability::Absent
@@ -650,7 +651,7 @@ impl NodeImpl for SharedConsensus {
         // txs only, in `handle_message::Tx`.
         let fx =
             self.mempool
-                .admit_validated(id, TxBody::new_with_vec(Vec::new()), tx.bytes as u32);
+                .admit_validated(id, TxBody::new_with_vec(Vec::new()), tx.bytes as u32, self.current_slot, true);
         self.apply_mempool_effects(&mut out, fx);
         // Announce to every consumer. linear_leios announces only to
         // consumers (downstream peers); we mirror that here.
@@ -747,6 +748,8 @@ impl NodeImpl for SharedConsensus {
                     key.clone(),
                     TxBody::new_with_vec(vec![]),
                     tx.bytes as u32,
+                    self.current_slot,
+                    false,
                 );
                 let admitted = !fx
                     .iter()
@@ -2032,7 +2035,7 @@ impl SharedConsensus {
     fn collect_arcs(&self, pending: Vec<MempoolTx>) -> Vec<Arc<Transaction>> {
         pending
             .into_iter()
-            .filter_map(|tx| self.tx_arcs.get(&tx.tx_id).cloned())
+            .filter_map(|tx| self.tx_arcs.get(tx.id()).cloned())
             .collect()
     }
 

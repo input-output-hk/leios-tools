@@ -6,9 +6,11 @@
 
 pub mod codec;
 
-use shared_consensus::mempool::{TxBody, TxId};
+use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
+use shared_consensus::PeerId;
 use tokio::sync::mpsc;
 
 use crate::protocols::{Agency, Protocol, ProtocolError, Runner};
@@ -108,14 +110,25 @@ pub struct TxIdAndSize {
 /// A pending transaction waiting to be announced and sent.
 #[derive(Debug, Clone)]
 pub struct PendingTx {
-    pub tx_id: TxId,
-    pub body: TxBody,
-    pub size: u32,
+    pub tx: Arc<TxInfo>,
     /// HardFork era index for this tx, carried end-to-end so it is echoed
     /// back on the wire exactly as the tx was received (rather than being
     /// re-stamped with a fixed constant). For txs we originate locally this
     /// is [`ORIGIN_ERA`].
     pub era: u16,
+}
+
+impl PendingTx {
+    /// `era` is the HardFork era the tx arrived under, carried through so a bridged
+    /// tx is re-announced with its original era rather than re-stamped (see
+    /// `PendingTx::era`). Txs with no wire era of their own (e.g. Leios EB bodies
+    /// fetched by bitmap) pass `ORIGIN_ERA`.
+    pub fn new_with_body(body: TxBody, era: u16) -> Self {
+        PendingTx {
+            tx: TxInfo::new_with_body(body),
+            era,
+        }
+    }
 }
 
 /// A transaction body tagged with its HardFork era, as it appears in
@@ -257,7 +270,7 @@ fn ack_and_prune(
         let Some(acked) = announced.pop_front() else {
             break;
         };
-        if let Some(pos) = pending_bodies.iter().position(|p| p.tx_id == acked.tx_id) {
+        if let Some(pos) = pending_bodies.iter().position(|p| p.tx.tx_id == acked.tx.tx_id) {
             pending_bodies.remove(pos);
         }
     }
@@ -276,7 +289,7 @@ fn ack_and_prune(
 /// by that id but never match it back, stranding it. A silent fallback here is
 /// how that class of bug hid; a parse failure is now surfaced, not papered over.
 fn praos_tx_id(tx: &PendingTx) -> Option<TxId> {
-    net_codec::wire_tx_id(tx.body.get_slice()).map(TxId::new_with_array)
+    net_codec::wire_tx_id(tx.tx.body.get_slice()).map(TxId::new_with_array)
 }
 
 /// Build the `MsgReplyTxIds` payload for a batch of txs, tracking exactly the
@@ -295,7 +308,7 @@ fn announce_txs(
             Some(tx_id) => {
                 reply.push(TxIdAndSize {
                     tx_id,
-                    size: tx.size,
+                    size: tx.tx.size,
                     era: wire_era(tx.era),
                 });
                 announced.push_back(tx.clone());
@@ -303,7 +316,7 @@ fn announce_txs(
             }
             None => {
                 tracing::warn!(
-                    size = tx.size,
+                    size = tx.tx.size,
                     "dropping tx with no canonical Praos wire id (unparseable body); \
                      not announcing on TxSubmission"
                 );
@@ -322,6 +335,7 @@ pub async fn run_client(
     runner: &mut Runner<TxSubmission>,
     tx_receiver: &mut mpsc::Receiver<PendingTx>,
     request_sender: Option<mpsc::Sender<u16>>,
+    _peer_id: PeerId,
 ) -> Result<(), ProtocolError> {
     // Send MsgInit to transition StInit -> StIdle.
     runner.send(&Message::MsgInit).await?;
@@ -434,7 +448,7 @@ pub async fn run_client(
                         let pending = pending_bodies.remove(pos).expect("position valid");
                         txs.push(EraTxBody {
                             era: wire_era(pending.era),
-                            body: pending.body,
+                            body: pending.tx.body.clone(),
                         });
                     }
                     // Per spec: omitted txs are treated as never announced.
@@ -657,9 +671,11 @@ mod tests {
             .and_then(|e| e.null())
             .expect("encoding test tx into a Vec is infallible");
         PendingTx {
-            tx_id: TxId::new_with_array([id_byte; 32]),
-            body: TxBody::new_with_vec(e.into_writer()),
-            size: size as u32,
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([id_byte; 32]),
+                body: TxBody::new_with_vec(e.into_writer()),
+                size: size as u32,
+            }),
             era: ORIGIN_ERA,
         }
     }
@@ -677,9 +693,11 @@ mod tests {
         e.null().unwrap(); // aux data
         let tx = e.into_writer();
         let pending = PendingTx {
-            tx_id: TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
-            body: TxBody::new_with_slice(&tx),
-            size: tx.len() as u32,
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([0xAB; 32]), // arbitrary internal (TxHash) key
+                body: TxBody::new_with_slice(&tx),
+                size: tx.len() as u32,
+            }),
             era: ORIGIN_ERA,
         };
         let announced = praos_tx_id(&pending).expect("parseable tx has a canonical id");
@@ -689,12 +707,12 @@ mod tests {
             "announced id must be the canonical body-element TxId"
         );
         assert_ne!(
-            announced, pending.tx_id,
+            announced, pending.tx.tx_id,
             "must not be the internal TxHash key"
         );
         assert_ne!(
             announced,
-            TxId::new_with_array(pending.body.get_blake2b_256()),
+            TxId::new_with_array(pending.tx.body.get_blake2b_256()),
             "must not be the whole-tx hash"
         );
     }
@@ -733,7 +751,7 @@ mod tests {
             1,
             "acked-but-unrequested bodies must be pruned, not stranded"
         );
-        assert_eq!(pending.front().unwrap().tx_id, make_test_tx(3, 64).tx_id);
+        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(3, 64).tx.tx_id);
     }
 
     #[test]
@@ -752,7 +770,7 @@ mod tests {
         ack_and_prune(&mut announced, &mut pending, 1);
         assert_eq!(announced.len(), 1);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending.front().unwrap().tx_id, make_test_tx(2, 64).tx_id);
+        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(2, 64).tx.tx_id);
     }
 
     #[tokio::test]
@@ -761,8 +779,8 @@ mod tests {
 
         let tx1 = make_test_tx(0x01, 1500);
         let tx2 = make_test_tx(0x02, 2000);
-        let tx1_id = tx1.tx_id.clone();
-        let tx2_id = tx2.tx_id.clone();
+        let tx1_id = tx1.tx.tx_id.clone();
+        let tx2_id = tx2.tx.tx_id.clone();
 
         // Server: drive the protocol by requesting tx ids, then txs.
         let server = tokio::spawn(async move {
@@ -829,18 +847,22 @@ mod tests {
             // Pre-load txs.
             tx_sender
                 .send(PendingTx {
-                    tx_id: tx1_id,
-                    body: tx1.body.clone(),
-                    size: 1500,
+                    tx: Arc::new(TxInfo {
+                        tx_id: tx1_id,
+                        body: tx1.tx.body.clone(),
+                        size: 1500,
+                    }),
                     era: ORIGIN_ERA,
                 })
                 .await
                 .unwrap();
             tx_sender
                 .send(PendingTx {
-                    tx_id: tx2_id,
-                    body: tx2.body.clone(),
-                    size: 2000,
+                    tx: Arc::new(TxInfo {
+                        tx_id: tx2_id,
+                        body: tx2.tx.body.clone(),
+                        size: 2000,
+                    }),
                     era: ORIGIN_ERA,
                 })
                 .await
@@ -848,7 +870,7 @@ mod tests {
             // Close channel so client knows no more txs.
             drop(tx_sender);
 
-            run_client(&mut runner, &mut tx_receiver, None)
+            run_client(&mut runner, &mut tx_receiver, None, PeerId(0))
                 .await
                 .unwrap();
         });
@@ -899,7 +921,7 @@ mod tests {
             // Drop sender immediately — no txs to send.
             drop(_tx_sender);
 
-            run_client(&mut runner, &mut tx_receiver, None)
+            run_client(&mut runner, &mut tx_receiver, None, PeerId(0))
                 .await
                 .unwrap();
         });

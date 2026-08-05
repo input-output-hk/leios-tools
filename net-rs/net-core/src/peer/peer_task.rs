@@ -516,7 +516,7 @@ pub(crate) fn spawn_txsubmission(
             }
         });
 
-        if let Err(e) = txsubmission::run_client(&mut runner, &mut tx_receiver, Some(req_tx)).await
+        if let Err(e) = txsubmission::run_client(&mut runner, &mut tx_receiver, Some(req_tx), peer_id).await
         {
             let _ = event_sender
                 .send((
@@ -912,6 +912,7 @@ pub(crate) async fn run_peer_task(mut config: PeerTaskConfig) {
 
     // Build shared command senders for dispatch.
     let senders = ClientProtocolSenders {
+        peer_id,
         fetch: fetch_sender,
         peer_share: peer_share_sender,
         tx_submit: tx_submit_sender,
@@ -966,7 +967,7 @@ mod tests {
     use crate::protocols::Runner as ProtocolRunner;
     use crate::types::{Point, Tip, WrappedHeader};
 
-    use shared_consensus::mempool::{TxBody, TxId};
+    use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 
     /// Minimal fake server: serves ChainSync and KeepAlive over MemBearer.
     /// Generates `block_count` blocks then holds at tip.
@@ -1498,16 +1499,19 @@ mod tests {
         // `[bytes(body), {}, true, null]` so it has a canonical Praos wire id
         // (`praos_tx_id`); an unparseable body would now be dropped, not sent.
         let tx = PendingTx {
-            tx_id: TxId::new_with_array([0x44; 32]),
-            body: TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
-            size: 9,
+            tx: Arc::new(TxInfo {
+                tx_id: TxId::new_with_array([0x44; 32]),
+                body: TxBody::new_with_vec(vec![0x84, 0x44, 0x0A, 0x0B, 0x0C, 0x0D, 0xA0, 0xF5, 0xF6]),
+                size: 9,
+            }),
             era: ts::ORIGIN_ERA,
         };
         tx_sender.send(tx).await.unwrap();
 
         // Server should receive TransactionReceived event.
         let result = tokio::time::timeout(Duration::from_secs(5), async {
-            let (_id, event) = server_event_rx.recv().await.unwrap();
+            let (origin, event) = server_event_rx.recv().await.unwrap();
+
             match event {
                 PeerEvent::TransactionReceived { body, era } => {
                     assert_eq!(
@@ -1517,6 +1521,7 @@ mod tests {
                         ])
                     );
                     assert_eq!(era, ts::ORIGIN_ERA);
+                    assert_eq!(origin, server_peer_id);
                 }
                 other => panic!("expected TransactionReceived, got {other:?}"),
             }

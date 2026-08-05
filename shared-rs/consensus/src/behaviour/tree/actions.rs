@@ -77,6 +77,13 @@ pub fn build_action(
             *non_voting_threshold,
             *hide_eb_tx_received,
         )),
+        ActionSpec::WithholdTxs {
+            withholding_slots,
+            tx_producer_only,
+        } => Box::new(catalogue::WithholdTxs::new(
+            *withholding_slots,
+            *tx_producer_only,
+        )),
         ActionSpec::DeepReorg { every_slots, depth } => {
             Box::new(catalogue::DeepReorg::new(*every_slots, *depth))
         }
