@@ -278,7 +278,7 @@ pub struct CandidateTracker {
 
     pending_block_fetches: BTreeSet<Point>,
     pending_eb_fetches: BTreeSet<Point>,
-    pub pending_eb_txs_fetches: BTreeSet<Point>,
+    pending_eb_txs_fetches: BTreeSet<Point>,
 
     /// Per-EB set of peers we've already asked for EB-txs.  Used to
     /// skip a peer on retry after a partial response.

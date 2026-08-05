@@ -409,6 +409,7 @@ pub struct LeiosState {
     /// validation precedes announcement, and every voter would abstain
     /// with `EBValidating`.
     validated_eb_bodies: BTreeMap<[u8; 32], u64>,
+    
     /// Per-EB requested bitmap.  Set when a `FetchLeiosBlockTxs` is
     /// emitted; used at response time to verify which manifest indices
     /// were actually fulfilled.
@@ -873,19 +874,7 @@ impl LeiosState {
                 present[true as usize], present[false as usize], origin[true as usize], origin[false as usize],
                 self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
             );
-/*
-            info!(" slot difference; extrn;  ours");
-            info!("------------------------------");
-            for (slot, count) in origin_by_slots.iter().rev() {
-                info!("{:16}; {:5}; {:5}", eb_current_slot - slot, count[0], count[1]);
-            }
-            info!("------------------------------");
-            info!("Fetching Txs from: {:?}, Tx count: {}",
-                self.candidates.pending_eb_txs_fetches.iter(),
-                self.pending_eb_tx_fetches.get(rb_hash).map(|(_,x)| x.len()).unwrap_or_default()
-            );
-            info!("Total present: {}, absent {absent}", );
-*/
+
             if decline {
                 return Err(NoVoteReason::MissingTX {
                     required: tx_hashes.len(),
