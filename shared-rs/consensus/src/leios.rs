@@ -611,7 +611,9 @@ impl LeiosState {
 
     /// Cleaning procedure for all left-overs from previous EB and EB tx fetching attempts,
     /// Main reason for the procedure: to avoid memory leaks.
-    fn prune_chain_progress(&mut self, min_keep: u64) {
+    /// `min_keep` -- minimal slot, which is to remain in memory
+    /// `fx` -- effects output.
+    fn prune_chain_progress(&mut self, min_keep: u64, fx: &mut Vec<LeiosEffect>) {
         self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
         self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
         self.pending_eb_tx_fetches
@@ -791,7 +793,7 @@ impl LeiosState {
         // RB (`tip_rb_slot = None`), no prune fires — every received
         // EB is potentially relevant to the chain we'll soon adopt.
         if let Some(min_keep) = self.chain_tip_ctx.tip_rb_slot {
-            self.prune_chain_progress(min_keep);
+            self.prune_chain_progress(min_keep, &mut fx);
         }
         fx
     }
@@ -1413,10 +1415,10 @@ impl LeiosState {
             .eb_txs_policy
             .pick(&point, &bitmap, &candidates, self.rtt.as_ref());
         if peers.is_empty() {
-            // If not all txs are known, but we asked all peers at the moment, we should
-            // try to repeat the request in a slot, when new data could become available for
-            // the peers (by calling `take_postponed_eb_tx_requests` and further processing
-            // the data).
+            // If not all txs are known, but we asked all peers at the moment, we may
+            // try to repeat the request in the next slot, when new data could become available
+            // for the peers: we should call `take_postponed_eb_tx_requests` and restart
+            // requests for the points again.
             // This repeated processing may happen only for L_hdr*3 + L_vote slots, since
             // after this number of slots the election (voting) process will have no sense.
             self.postponed_eb_tx_requests.insert(point);
