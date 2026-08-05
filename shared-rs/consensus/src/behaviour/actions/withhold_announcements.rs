@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn installs_configured_announce_filter() {
+    fn installs_configured_tx_submission_withholding_filter() {
         let (s, out) = run(&mut WithholdTxSubmission::new(5, true));
         assert_eq!(s, Status::Running);
         assert_eq!(

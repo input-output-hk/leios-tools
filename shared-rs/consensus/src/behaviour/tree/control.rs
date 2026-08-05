@@ -220,7 +220,7 @@ pub enum TxSubmissionPolicy {
     /// Never announce (some of) txs
     WithholdTxSubmission {
         /// Delay in announcements for slots
-        /// 0 -- dont' delay (effectively no filtering);
+        /// 0 -- don't delay (effectively no filtering);
         /// Set to MAX_INT to never announce
         /// If transaction is removed from mempool before delay has elapsed - it's not announced
         /// at all.

@@ -409,7 +409,7 @@ pub struct LeiosState {
     /// validation precedes announcement, and every voter would abstain
     /// with `EBValidating`.
     validated_eb_bodies: BTreeMap<[u8; 32], u64>,
-    
+
     /// Per-EB requested bitmap.  Set when a `FetchLeiosBlockTxs` is
     /// emitted; used at response time to verify which manifest indices
     /// were actually fulfilled.

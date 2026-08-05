@@ -1043,6 +1043,24 @@ mod tests {
         state.admit_validated(tx_id, body, sz, 0, false)
     }
 
+    /// Admit a tx with an explicit acceptance `slot` and `ours` provenance,
+    /// so the announcement filter can be exercised end-to-end.
+    fn admit_full(state: &mut MempoolState, id: u8, size: u32, slot: u64, ours: bool) {
+        let (tx_id, body, sz) = tx(id, size);
+        let _ = state.admit_validated(tx_id, body, sz, slot, ours);
+    }
+
+    /// Install a `WithholdTxSubmission` announcement-filter policy.
+    fn apply_withhold(state: &mut MempoolState, withholding_slots: u64, tx_producer_only: bool) {
+        use crate::behaviour::tree::control::{ControlSignal, TxSubmissionPolicy};
+        let mut cs = ControlSignal::default();
+        cs.mempool.tx_submission_filter = TxSubmissionPolicy::WithholdTxSubmission {
+            withholding_slots,
+            tx_producer_only,
+        };
+        state.apply_control(&cs);
+    }
+
     /// Build an `Arc<TxInfo>` with an explicit tx-id (which need not match
     /// the body hash), for exercising the receiver-side `merge_eb_body` path.
     fn eb_tx(tx_id: TxId, body: TxBody, size: u32) -> Arc<TxInfo> {
@@ -1346,6 +1364,136 @@ mod tests {
         assert!(s.peer_advertised.contains_key(&peer));
         s.forget_peer(peer);
         assert!(!s.peer_advertised.contains_key(&peer));
+    }
+
+    // -- WithholdTxSubmission announcement filter --------------------------
+
+    #[test]
+    fn no_policy_announces_everything() {
+        // Sanity baseline: with the default (None) policy the filter is a
+        // no-op, so provenance and slot are irrelevant.
+        let mut s = MempoolState::new(10);
+        admit_full(&mut s, 1, 100, 0, true);
+        admit_full(&mut s, 2, 100, 42, false);
+        let out = s.peek_unannounced_for_peer(pid(0), 10, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn withhold_suppresses_within_delay_window() {
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 5, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        // current_slot 3 is inside the 5-slot window (3 - 0 = 3 < 5) → withheld.
+        assert!(s.peek_unannounced_for_peer(pid(0), 10, 3).is_empty());
+    }
+
+    #[test]
+    fn withhold_boundary_slot_before_delay_is_still_withheld() {
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 5, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        // current_slot 4: 4 - 0 = 4 < 5 → still inside the window.
+        assert!(s.peek_unannounced_for_peer(pid(0), 10, 4).is_empty());
+    }
+
+    #[test]
+    fn withhold_announces_after_delay_lapses() {
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 5, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        // current_slot 5: 5 - 0 = 5 is NOT < 5 → the window has lapsed.
+        let out = s.peek_unannounced_for_peer(pid(0), 10, 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id(), &TxId::new_with_slice(&[1u8; 32]));
+    }
+
+    #[test]
+    fn withheld_tx_stays_owed_and_is_announced_on_a_later_peek() {
+        // A tx withheld inside the window must remain in the per-peer owed
+        // set so a later peek (after the delay) still announces it.
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 5, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        let peer = pid(0);
+        assert!(s.peek_unannounced_for_peer(peer, 10, 2).is_empty());
+        let out = s.peek_unannounced_for_peer(peer, 10, 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id(), &TxId::new_with_slice(&[1u8; 32]));
+    }
+
+    #[test]
+    fn withhold_producer_only_skips_peer_txs() {
+        // tx_producer_only = true → the filter applies only to txs this node
+        // generated; peer txs are announced even inside the window.
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 100, true);
+        admit_full(&mut s, 1, 100, 0, false); // peer tx → announced
+        admit_full(&mut s, 2, 100, 0, true); // our tx → withheld
+        let out = s.peek_unannounced_for_peer(pid(0), 10, 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id(), &TxId::new_with_slice(&[1u8; 32]));
+    }
+
+    #[test]
+    fn withhold_not_producer_only_suppresses_peer_txs_too() {
+        // tx_producer_only = false → the filter applies to every tx.
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 100, false);
+        admit_full(&mut s, 1, 100, 0, false); // peer tx → withheld
+        admit_full(&mut s, 2, 100, 0, true); // our tx → withheld
+        assert!(s.peek_unannounced_for_peer(pid(0), 10, 0).is_empty());
+    }
+
+    #[test]
+    fn withhold_slots_max_never_announces() {
+        // withholding_slots = u64::MAX → the window never lapses (doc claim).
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, u64::MAX, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        assert!(s
+            .peek_unannounced_for_peer(pid(0), 10, 1_000_000)
+            .is_empty());
+    }
+
+    #[test]
+    fn withhold_slots_zero_announces_immediately() {
+        // withholding_slots = 0 → no slot is ever inside the window, so the
+        // policy degenerates to no filtering (doc claim).
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 0, false);
+        admit_full(&mut s, 1, 100, 0, true);
+        let out = s.peek_unannounced_for_peer(pid(0), 10, 0);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn withheld_txs_do_not_consume_max_count_budget() {
+        // Behaviour change: `take(max_count)` runs *after* the filter, so a
+        // withheld tx must not eat into the per-call announcement budget.
+        let mut s = MempoolState::new(10);
+        apply_withhold(&mut s, 100, true); // withhold only our own txs
+        // The owed set iterates in ascending TxId order, so the two withheld
+        // (ours) txs — ids 1 & 2 — are visited before any announceable peer
+        // tx (ids 3, 4, 5).
+        admit_full(&mut s, 1, 100, 0, true); // ours → withheld
+        admit_full(&mut s, 2, 100, 0, true); // ours → withheld
+        admit_full(&mut s, 3, 100, 0, false); // peer → announceable
+        admit_full(&mut s, 4, 100, 0, false); // peer → announceable
+        admit_full(&mut s, 5, 100, 0, false); // peer → announceable
+
+        // With max_count = 2 the old take-then-filter order would consume the
+        // budget on ids 1 & 2 and then filter them out, yielding nothing.
+        // Filter-then-take instead returns the first two announceable txs.
+        let out = s.peek_unannounced_for_peer(pid(0), 2, 0);
+        let ids: Vec<TxId> = out.iter().map(|t| t.id().clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                TxId::new_with_slice(&[3u8; 32]),
+                TxId::new_with_slice(&[4u8; 32]),
+            ]
+        );
     }
 
     // -- admit_validated bypass --------------------------------------------
