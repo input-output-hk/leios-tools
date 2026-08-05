@@ -9,7 +9,7 @@ use crate::behaviour::tree::control::{ControlSignal, TxWithholdingPolicy};
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
-/// Installs the withholding transactinos filter.
+/// Installs the withholding transactions filter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WithholdTxs {
     /// Delays transaction propagation to peers for this many slots.

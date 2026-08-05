@@ -452,18 +452,16 @@ impl MempoolState {
         self.tx_index.contains(tx_id)
     }
 
-    /// Look up a tx by its id across both compartments — the free
-    /// FIFO pool and the EB-pinned pool.  Linear scan over `txs`;
-    /// mempool sizes this prototype targets keep it acceptable.
+    /// Look up a tx by its id across both compartments — the EB-pinned
+    /// pool (an indexed `O(log n)` map) and the free FIFO pool.  The
+    /// indexed pool is checked first so pinned lookups avoid the linear
+    /// scan over `txs`; the free-pool scan only runs when the id isn't
+    /// pinned.  Mempool sizes this prototype targets keep it acceptable.
     fn get_record_by_id(&self, tx_id: &TxId) -> Option<MempoolTx> {
-        if let Some(record) = self
-            .txs
-            .iter()
-            .find(|tx| tx.id() == tx_id)
-        {
+        if let Some(record) = self.eb_pinned.get(tx_id) {
             return Some(record.clone());
         }
-        self.eb_pinned.get(tx_id).cloned()
+        self.txs.iter().find(|tx| tx.id() == tx_id).cloned()
     }
 
     /// Look up a tx body by id.

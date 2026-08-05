@@ -1329,7 +1329,6 @@ dependencies = [
  "minicbor 0.25.1",
  "rand 0.8.6",
  "serde",
- "serde_json",
  "toml 0.8.23",
  "tracing",
 ]

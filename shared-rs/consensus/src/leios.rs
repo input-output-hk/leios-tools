@@ -861,8 +861,8 @@ impl LeiosState {
         // check; the validator will reject the EB body if it references
         // unknown TXs.
         if let Some((_, tx_hashes)) = self.eb_tx_hashes.get(eb_hash) {
-            let mut present = [0, 0]; // [pinned,unpinned]
-            let mut origin = [0,0]; // [ours,outside]
+            let mut present = [0, 0]; // indexed by `pinned as usize`: [unpinned, pinned]
+            let mut origin = [0, 0]; // indexed by `ours as usize`: [outside, ours]
             let mut absent = 0;
             let mut decline = false;
 
@@ -885,7 +885,7 @@ impl LeiosState {
             };
             info!("Voting point {point}, EB {}, seen at {eb_seen_slot}, current {eb_current_slot}; total txs {}, \"\
                    present (pinned {}/unpinned {}) (ours {}/outside {}), absent {absent}",
-                hex_prefix(eb_hash), present.iter().sum::<usize>(),
+                hex_prefix(eb_hash), tx_hashes.len(),
                 present[true as usize], present[false as usize], origin[true as usize], origin[false as usize],
             );
 
@@ -1045,12 +1045,12 @@ impl LeiosState {
         self.initiate_eb_txs_fetch(&point, bitmap, now)
     }
 
-    /// Initiate fetch restarting, if all previous attempts were unsuscessful: maybe some peers
+    /// Initiate fetch restarting, if all previous attempts were unsuccessful: maybe some peers
     /// got new information?
     /// This function depends on the new bitmap, so it's not implemented in full inside
-    /// shared consensus. Instead, it's initiated from outer loop -- where Ledger is avaialble;
+    /// shared consensus. Instead, it's initiated from outer loop -- where Ledger is available;
     /// That outer loop should:
-    /// * take all postponed fetches using `take_postponed_eb_requests`,
+    /// * take all postponed fetches using `take_postponed_eb_tx_requests`,
     /// * recalculate new `bitmap`s (which are unavailable at this level)
     /// * return control/information back onto shared consensus level using this function.
     pub fn retry_postponed_eb_txs_fetches(
