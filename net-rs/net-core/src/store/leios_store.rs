@@ -18,6 +18,8 @@ use shared_consensus::PeerId;
 use crate::protocols::leios_fetch::bitmap;
 use crate::types::{Point, Vote, WrappedHeader};
 use shared_consensus::mempool::{TxBody, TxId};
+use shared_consensus::types::hex_prefix;
+use tracing::info;
 
 /// Resolves a transaction body by its 32-byte hash. The Leios store calls
 /// this when a peer asks for an EB's txs and only the manifest is cached
@@ -323,6 +325,7 @@ impl LeiosStore {
         for (idx, body) in indexed {
             entry.entry(idx).or_insert(body);
         }
+        info!("leios_store: injecting block_txs {point}: txs {}, from {source:?}", entry.len());
         inner.max_slot = inner.max_slot.max(slot);
         Self::push_notification(
             &mut inner,
@@ -342,6 +345,8 @@ impl LeiosStore {
             .enumerate()
             .map(|(i, b)| (i as u32, b))
             .collect();
+
+        info!("leios_store: injecting full block_txs {point}: txs {}, from {source:?}", indexed.len());
         self.inject_block_txs(point, indexed, source);
     }
 
@@ -432,6 +437,7 @@ impl LeiosStore {
         slot: u64,
         hash: &[u8; 32],
         bitmap: &BTreeMap<u16, u64>,
+        peer_id: PeerId,
     ) -> Option<Vec<TxBody>> {
         let key = BlockKey { slot, hash: *hash };
         let (block_txs, manifest) = {
@@ -454,6 +460,7 @@ impl LeiosStore {
                 resolver?.resolve_body(h)
             })
             .collect();
+        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.map(|x| x.len()).unwrap_or_default());
         Some(selected)
     }
 
@@ -666,6 +673,7 @@ impl LeiosStore {
             for key in to_remove {
                 inner.blocks.remove(&key);
                 inner.block_txs.remove(&key);
+                info!("leios_store: removing old block_txs {}/{}", key.slot, hex_prefix(&key.hash));
             }
         }
     }
@@ -798,8 +806,8 @@ mod tests {
         store.inject_block_txs_full(point, txs.clone(), None);
 
         let bitmap = bitmap::select_all(txs.len() as u32);
-        assert_eq!(store.get_block_txs(42, &hash, &bitmap), Some(txs));
-        assert_eq!(store.get_block_txs(99, &hash, &bitmap), None);
+        assert_eq!(store.get_block_txs(42, &hash, &bitmap, PeerId(1)), Some(txs));
+        assert_eq!(store.get_block_txs(99, &hash, &bitmap, PeerId(3)), None);
     }
 
     #[test]
@@ -815,7 +823,7 @@ mod tests {
         store.inject_block_txs_full(point, txs, None);
 
         let bitmap = BTreeMap::new();
-        assert_eq!(store.get_block_txs(42, &hash, &bitmap), Some(Vec::new()));
+        assert_eq!(store.get_block_txs(42, &hash, &bitmap, PeerId(7)), Some(Vec::new()));
     }
 
     #[test]
@@ -829,7 +837,7 @@ mod tests {
 
         // Pick out-of-order indices spanning two segments to check ordering.
         let bitmap = bitmap::from_indices(&[65, 0, 63]);
-        let got = store.get_block_txs(1, &hash, &bitmap).unwrap();
+        let got = store.get_block_txs(1, &hash, &bitmap, PeerId(11)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -873,7 +881,7 @@ mod tests {
 
         // Bitmap selects indices 0 and 2.
         let bitmap = bitmap::from_indices(&[0, 2]);
-        let got = store.get_block_txs(5, &eb_hash, &bitmap).unwrap();
+        let got = store.get_block_txs(5, &eb_hash, &bitmap, PeerId(23)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -902,7 +910,7 @@ mod tests {
         store.record_eb_manifest(point, vec![tx_id_from_arr(h0), tx_id_from_arr(h1)], None);
 
         let bitmap = bitmap::from_indices(&[0, 1]);
-        let got = store.get_block_txs(7, &eb_hash, &bitmap).unwrap();
+        let got = store.get_block_txs(7, &eb_hash, &bitmap, PeerId(31)).unwrap();
         assert_eq!(got, vec![TxBody::new_with_vec(vec![0xAA])]);
     }
 
@@ -930,7 +938,7 @@ mod tests {
         store.record_eb_manifest(point, vec![tx_id(0), tx_id(0)], None);
 
         let bitmap = bitmap::from_indices(&[0, 1]);
-        let got = store.get_block_txs(1, &eb_hash, &bitmap).unwrap();
+        let got = store.get_block_txs(1, &eb_hash, &bitmap, PeerId(42)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -945,7 +953,7 @@ mod tests {
         let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(HashMap::new()));
         let (store, _rx) = LeiosStore::new_with_resolver(100, Some(resolver));
         let bitmap = bitmap::from_indices(&[0]);
-        assert!(store.get_block_txs(99, &[0xFF; 32], &bitmap).is_none());
+        assert!(store.get_block_txs(99, &[0xFF; 32], &bitmap, PeerId(5)).is_none());
     }
 
     #[test]
@@ -961,7 +969,7 @@ mod tests {
 
         // Bit 99 is past the available 2 txs; should be silently dropped.
         let bitmap = bitmap::from_indices(&[0, 99]);
-        let got = store.get_block_txs(5, &hash, &bitmap).unwrap();
+        let got = store.get_block_txs(5, &hash, &bitmap, PeerId(17)).unwrap();
         assert_eq!(got, vec![TxBody::new_with_vec(vec![1u8])]);
     }
 
@@ -984,7 +992,7 @@ mod tests {
         store.inject_block_txs(point, second, None);
 
         let bitmap = bitmap::from_indices(&[0, 1, 2, 3]);
-        let got = store.get_block_txs(7, &hash, &bitmap).unwrap();
+        let got = store.get_block_txs(7, &hash, &bitmap, PeerId(19)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -1036,7 +1044,7 @@ mod tests {
         store.inject_block_txs(point, b, None);
 
         let bitmap = bitmap::from_indices(&[0]);
-        let got = store.get_block_txs(9, &hash, &bitmap).unwrap();
+        let got = store.get_block_txs(9, &hash, &bitmap, PeerId(29)).unwrap();
         assert_eq!(got, vec![TxBody::new_with_vec(vec![0xC0])]);
     }
 
@@ -1070,7 +1078,7 @@ mod tests {
         store.inject_block_txs(point, partial, None);
 
         let bitmap = bitmap::from_indices(&[0, 1, 2]);
-        let got = store.get_block_txs(11, &eb_hash, &bitmap).unwrap();
+        let got = store.get_block_txs(11, &eb_hash, &bitmap, PeerId(37)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -1394,7 +1402,7 @@ mod tests {
         );
         assert!(
             store
-                .get_block_txs(1, &[0x22; 32], &bitmap::select_all(64))
+                .get_block_txs(1, &[0x22; 32], &bitmap::select_all(64), PeerId(43))
                 .is_none(),
             "old eb_tx_hashes should be evicted past retention window"
         );

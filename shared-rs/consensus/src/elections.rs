@@ -631,7 +631,7 @@ mod tests {
                 voters,
                 expected_weight,
             } => {
-                assert_eq!(*eb_hash, h(2)); // the EB hash, not the RB key h(1)
+                assert_eq!(*eb_hash, h(2)); // the EB hash h(2), not the RB key h(1)
                 assert_eq!(*eb_slot, 10);
                 assert!(!*had_quorum);
                 assert_eq!(*voted_weight, 40);

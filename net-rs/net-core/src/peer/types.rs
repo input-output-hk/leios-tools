@@ -13,7 +13,6 @@ use crate::protocols::txsubmission::PendingTx;
 use crate::types::{BlockBody, Point, Tip, Vote, WrappedHeader};
 use shared_consensus::mempool::TxBody;
 use std::sync::Arc;
-
 // ---------------------------------------------------------------------------
 // Peer ↔ Coordinator
 // ---------------------------------------------------------------------------

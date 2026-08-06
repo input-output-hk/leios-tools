@@ -339,6 +339,10 @@ impl CandidateTracker {
             .unwrap_or_default()
     }
 
+    pub fn clear_eb_txs_attempts(&mut self, point: &Point) {
+        self.eb_txs_attempts.remove(point);
+    }
+    
     /// EB-txs candidates excluding any peer we've already tried for
     /// this EB (used to advance the retry-after-partial-response flow).
     pub fn eb_txs_candidates(&self, point: &Point) -> Vec<PeerId> {

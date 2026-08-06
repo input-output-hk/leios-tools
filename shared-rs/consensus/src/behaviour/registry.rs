@@ -35,6 +35,11 @@ pub enum ActionSpec {
         non_voting_threshold: u8,
         hide_eb_tx_received: bool,
     },
+    #[serde(rename = "withhold-announcements")]
+    WithholdTxs {
+        withholding_slots: u64,
+        tx_producer_only: bool,
+    },
     #[serde(rename = "deep-reorg")]
     DeepReorg { every_slots: u64, depth: u64 },
     #[serde(rename = "drop-inbound-peers")]
@@ -95,10 +100,20 @@ pub enum ActionSpec {
     },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
+    /// Flood the local tx generator at `rate` txs/sec (garbage or magazine).
+    #[serde(rename = "tx-flood")]
+    TxFlood {
+        #[serde(default = "default_tx_flood_rate")]
+        rate: u32,
+    },
 }
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_tx_flood_rate() -> u32 {
+    1000
 }
 
 fn default_flood_count() -> u32 {
