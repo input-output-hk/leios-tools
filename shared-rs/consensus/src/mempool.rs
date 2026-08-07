@@ -470,7 +470,7 @@ impl MempoolState {
     }
 
     /// Check current transaction WRT filtering rules.
-    /// Return true if Tx to remain, false if Tx should not be transmitted.
+    /// Return true if the tx should remain; false if it should not be transmitted.
     fn filter_transactions(&self, current_slot: u64, tx_id: &TxId) -> bool {
         let (delay, only_ours) = if let TxWithholdingPolicy::WithholdTxs {
             withholding_slots: delay_for_slots, tx_producer_only: only_ours
