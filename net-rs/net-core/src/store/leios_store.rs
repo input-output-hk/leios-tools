@@ -180,9 +180,13 @@ pub const MAX_NOTIFICATIONS: usize = 10_000;
 pub struct LeiosStore {
     inner: Mutex<LeiosStoreInner>,
     notify: watch::Sender<u64>,
-    /// Optional callback that resolves a tx body by its hash. Used to
-    /// serve EB tx requests for EBs whose manifest is cached locally
-    /// but whose full bodies aren't (i.e. receivers, not producers).
+    /// Optional callback that resolves a tx body by its hash. Retained as an
+    /// extension point: `get_block_txs` now serves EB txs ONLY from stored
+    /// `block_txs` (own EBs pinned at produce time, received EBs fully fetched),
+    /// because resolving a received EB's manifest against the mempool served
+    /// wrong bodies (`MsgLeiosBlockTxs` hash mismatch → connection tear-down). A
+    /// future hash-verified resolver could reuse this hook.
+    #[allow(dead_code)]
     tx_body_resolver: Option<Arc<dyn TxBodyResolver>>,
 }
 
@@ -440,27 +444,23 @@ impl LeiosStore {
         peer_id: PeerId,
     ) -> Option<Vec<TxBody>> {
         let key = BlockKey { slot, hash: *hash };
-        let (block_txs, manifest) = {
+        let block_txs = {
             let inner = self.inner.lock().unwrap();
-            (
-                inner.block_txs.get(&key).cloned(),
-                inner.eb_tx_hashes.get(&key).cloned(),
-            )
+            inner.block_txs.get(&key).cloned()
         };
-        if block_txs.is_none() && manifest.is_none() {
-            return None;
-        }
-        let resolver = self.tx_body_resolver.as_ref();
+        // Serve ONLY from stored bodies (`block_txs`): our own EBs — whose bodies
+        // are pinned at produce time — and received EBs we have fully fetched.
+        // We deliberately do NOT fall back to the mempool tx-body resolver: for a
+        // RECEIVED EB we may hold the manifest but not the exact committed bodies,
+        // and serving resolver-guessed txs yields a `MsgLeiosBlockTxs` hash
+        // mismatch that tears the mux connection down. Serve the COMPLETE
+        // requested set in bitmap order, or `None` so the responder disconnects
+        // (CIP-0164) — never a partial/misaligned or wrong-body response.
+        let block_txs = block_txs?;
         let selected: Vec<TxBody> = bitmap::iter_indices(bitmap)
-            .filter_map(|i| {
-                if let Some(body) = block_txs.as_ref().and_then(|m| m.get(&i).cloned()) {
-                    return Some(body);
-                }
-                let h = manifest.as_ref()?.get(i as usize)?;
-                resolver?.resolve_body(h)
-            })
-            .collect();
-        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.map(|x| x.len()).unwrap_or_default());
+            .map(|i| block_txs.get(&i).cloned())
+            .collect::<Option<Vec<TxBody>>>()?;
+        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.len());
         Some(selected)
     }
 
@@ -856,7 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_resolves_via_manifest_and_resolver() {
+    fn get_block_txs_manifest_only_returns_none() {
+        // A cached manifest WITHOUT stored bodies is not servable: we serve EB
+        // txs only from `block_txs` (own EBs pinned at produce time; received EBs
+        // fully fetched), never by resolving the manifest against the mempool —
+        // that served wrong bodies for received EBs and tore the mux down.
         let h0 = [0x10u8; 32];
         let h1 = [0x20u8; 32];
         let h2 = [0x30u8; 32];
@@ -879,39 +883,9 @@ mod tests {
             None,
         );
 
-        // Bitmap selects indices 0 and 2.
+        // Manifest present but no block_txs → None (resolver is not consulted).
         let bitmap = bitmap::from_indices(&[0, 2]);
-        let got = store.get_block_txs(5, &eb_hash, &bitmap, PeerId(23)).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                TxBody::new_with_vec(vec![1u8]),
-                TxBody::new_with_vec(vec![3u8])
-            ]
-        );
-    }
-
-    #[test]
-    fn get_block_txs_resolver_partial_drops_unknown_bodies() {
-        let h0 = [0x40u8; 32];
-        let h1 = [0x50u8; 32];
-        // Only h0 is resolvable.
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(HashMap::from([(
-            tx_id_from_arr(h0),
-            TxBody::new_with_vec(vec![0xAA]),
-        )])));
-        let (store, _rx) = LeiosStore::new_with_resolver(100, Some(resolver));
-
-        let eb_hash = [0xCCu8; 32];
-        let point = Point::Specific {
-            slot: 7,
-            hash: eb_hash,
-        };
-        store.record_eb_manifest(point, vec![tx_id_from_arr(h0), tx_id_from_arr(h1)], None);
-
-        let bitmap = bitmap::from_indices(&[0, 1]);
-        let got = store.get_block_txs(7, &eb_hash, &bitmap, PeerId(31)).unwrap();
-        assert_eq!(got, vec![TxBody::new_with_vec(vec![0xAA])]);
+        assert!(store.get_block_txs(5, &eb_hash, &bitmap, PeerId(23)).is_none());
     }
 
     #[test]
@@ -957,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_ignores_out_of_range_bits() {
+    fn get_block_txs_returns_none_when_an_index_is_missing() {
         let (store, _rx) = LeiosStore::new(100);
         let hash = [0xAA; 32];
         let txs = vec![
@@ -967,10 +941,12 @@ mod tests {
         let point = Point::Specific { slot: 5, hash };
         store.inject_block_txs_full(point, txs, None);
 
-        // Bit 99 is past the available 2 txs; should be silently dropped.
+        // Bit 99 is past the available 2 txs. We must NOT serve a partial set —
+        // a shorter/misaligned response is rejected downstream as a
+        // MsgLeiosBlockTxs mismatch and tears the mux down. An unservable index
+        // yields None so the responder disconnects (CIP-0164).
         let bitmap = bitmap::from_indices(&[0, 99]);
-        let got = store.get_block_txs(5, &hash, &bitmap, PeerId(17)).unwrap();
-        assert_eq!(got, vec![TxBody::new_with_vec(vec![1u8])]);
+        assert!(store.get_block_txs(5, &hash, &bitmap, PeerId(17)).is_none());
     }
 
     #[test]
@@ -1049,9 +1025,10 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_unions_block_txs_with_manifest_resolver() {
-        // Sparse block_txs has indices 0 and 2; manifest+resolver covers
-        // index 1. The union must satisfy a request for all three.
+    fn get_block_txs_partial_block_txs_returns_none() {
+        // Sparse block_txs (indices 0 and 2) can't satisfy a request for 0,1,2:
+        // there is no manifest+resolver union anymore. A missing index -> None
+        // (the responder disconnects) rather than serving a misaligned set.
         let h0 = [0x10u8; 32];
         let h1 = [0x20u8; 32];
         let h2 = [0x30u8; 32];
@@ -1077,16 +1054,9 @@ mod tests {
         partial.insert(2u32, TxBody::new_with_vec(vec![0xD2]));
         store.inject_block_txs(point, partial, None);
 
+        // Index 1 is not in block_txs → the whole request is unservable.
         let bitmap = bitmap::from_indices(&[0, 1, 2]);
-        let got = store.get_block_txs(11, &eb_hash, &bitmap, PeerId(37)).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                TxBody::new_with_vec(vec![0xD0]),
-                TxBody::new_with_vec(vec![0xD1]),
-                TxBody::new_with_vec(vec![0xD2])
-            ]
-        );
+        assert!(store.get_block_txs(11, &eb_hash, &bitmap, PeerId(37)).is_none());
     }
 
     #[test]

@@ -3619,33 +3619,20 @@ mod tests {
     /// serve `get_block_txs` by resolving each requested hash through
     /// the configured `TxBodyResolver`.
     #[tokio::test]
-    async fn record_leios_eb_manifest_enables_resolver_backed_serve() {
-        use crate::store::leios_store::TxBodyResolver;
-
-        struct StubResolver(HashMap<TxId, TxBody>);
-        impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody> {
-                self.0.get(tx_id).cloned()
-            }
-        }
-
+    async fn record_leios_eb_manifest_alone_is_not_servable() {
+        // Recording an EB manifest WITHOUT stored bodies must NOT make the EB
+        // servable: serving is from `block_txs` only, never by resolving the
+        // manifest against the mempool (that served wrong bodies for received
+        // EBs and tore the mux down).
         let h0 = [0x01u8; 32];
         let h1 = [0x02u8; 32];
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(
-            [
-                (TxId::new_with_array(h0), TxBody::new_with_vec(vec![10u8])),
-                (TxId::new_with_array(h1), TxBody::new_with_vec(vec![20u8])),
-            ]
-            .into_iter()
-            .collect(),
-        ));
 
         let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
         let (net_event_sender, _net_event_receiver) = mpsc::channel(NETWORK_EVENTS_CAPACITY);
         let (net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
         let config = CoordinatorConfig::default();
         let (chain_store, _chain_rx) = ChainStore::new(100);
-        let (leios_store, _leios_rx) = LeiosStore::new_with_resolver(100, Some(resolver.clone()));
+        let (leios_store, _leios_rx) = LeiosStore::new(100);
         let coordinator = Coordinator::new(
             config,
             peer_event_sender,
@@ -3672,24 +3659,15 @@ mod tests {
             .await
             .expect("command should accept");
 
-        // Poll until the manifest is stored.
+        // Give the coordinator time to process the manifest, then confirm the EB
+        // is still NOT servable — we hold the manifest but no bodies.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1]);
-        let mut got = None;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            if let Some(stored) = leios_store.get_block_txs(4, &eb_hash, &bitmap, PeerId(10)) {
-                if !stored.is_empty() {
-                    got = Some(stored);
-                    break;
-                }
-            }
-        }
-        assert_eq!(
-            got,
-            Some(vec![
-                TxBody::new_with_vec(vec![10u8]),
-                TxBody::new_with_vec(vec![20u8])
-            ])
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            leios_store
+                .get_block_txs(4, &eb_hash, &bitmap, PeerId(10))
+                .is_none(),
+            "manifest without bodies must not be servable"
         );
 
         net_cmd_sender
@@ -3807,14 +3785,19 @@ mod tests {
             )
             .await;
 
-        // Bodies are merged at the right positions.
-        let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1, 2]);
+        // The fetched bodies are merged at their manifest positions (0 and 2).
+        // Requesting exactly those two serves them from block_txs, ascending —
+        // confirming the reinjection landed at the right positions.
+        let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 2]);
         let got = leios_store
             .get_block_txs(12, &eb_hash, &bitmap, PeerId(41))
-            .expect("store should know about EB");
-        // Index 1 is missing (we never fetched it); union returns just
-        // 0 and 2 in ascending order.
+            .expect("store should serve the fetched-and-merged bodies");
         assert_eq!(got, vec![body0.clone(), body2.clone()]);
+        // Index 1 was never fetched, so a request that includes it is unservable.
+        let bitmap_all = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1, 2]);
+        assert!(leios_store
+            .get_block_txs(12, &eb_hash, &bitmap_all, PeerId(41))
+            .is_none());
 
         // The application also gets the original event with all bodies.
         match net_event_receiver.try_recv().expect("event emitted") {
