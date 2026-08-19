@@ -1542,16 +1542,13 @@ pub struct ValidatedVote<'a> {
 // Bitmap helpers (sparse 16-bit-segment / 64-bit-word format)
 // ---------------------------------------------------------------------------
 
+// Delegate to the canonical `crate::bitmap` codec (MSB-first per CIP-0164 —
+// see that module's docs). These once carried a duplicate LSB-first
+// implementation, which disagreed with the wire codec the moment a bitmap
+// round-tripped through the network (the responder read positions the
+// requester never meant).
 pub fn bitmap_to_indices(bitmap: &BTreeMap<u16, u64>) -> BTreeSet<u32> {
-    let mut out = BTreeSet::new();
-    for (&segment, &word) in bitmap {
-        for bit in 0..64 {
-            if word & (1u64 << bit) != 0 {
-                out.insert((segment as u32) * 64 + bit as u32);
-            }
-        }
-    }
-    out
+    crate::bitmap::iter_indices(bitmap).collect()
 }
 
 pub fn bitmap_length(bitmap: &BTreeMap<u16, u64>) -> usize {
@@ -1563,13 +1560,7 @@ pub fn bitmap_length(bitmap: &BTreeMap<u16, u64>) -> usize {
 }
 
 fn indices_to_bitmap(indices: &[u32]) -> BTreeMap<u16, u64> {
-    let mut out: BTreeMap<u16, u64> = BTreeMap::new();
-    for &idx in indices {
-        let segment = (idx / 64) as u16;
-        let bit = idx % 64;
-        *out.entry(segment).or_insert(0) |= 1u64 << bit;
-    }
-    out
+    crate::bitmap::from_indices(indices)
 }
 
 #[cfg(test)]
@@ -2206,9 +2197,9 @@ mod tests {
         let ha = tx_id(0xA0);
         let hb = tx_id(0xA1);
         state.eb_tx_hashes.insert(h(1), (10, vec![ha.clone(), hb]));
-        // Pretend we requested both indices 0 and 1.
-        let mut requested = BTreeMap::new();
-        requested.insert(0u16, 0b11u64);
+        // Pretend we requested both indices 0 and 1 (built via the canonical
+        // MSB-first codec, not a raw mask literal).
+        let requested = crate::bitmap::from_indices(&[0, 1]);
         state.pending_eb_tx_fetches.insert(h(1), (10, requested));
         // Only body for index 0 (ha) arrives.
         let outcome = state.match_eb_tx_response(
@@ -2221,8 +2212,7 @@ mod tests {
         );
         assert_eq!(outcome.requested, 2);
         // Index 1 still missing.
-        let mut expected_remaining = BTreeMap::new();
-        expected_remaining.insert(0u16, 0b10u64);
+        let expected_remaining = crate::bitmap::from_indices(&[1]);
         assert_eq!(outcome.remaining_bitmap, expected_remaining);
         // pending_eb_tx_fetches updated to remaining-only.
         assert_eq!(
@@ -2239,8 +2229,7 @@ mod tests {
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
         let ha = tx_id(0xA0);
         state.eb_tx_hashes.insert(h(1), (10, vec![ha.clone()]));
-        let mut requested = BTreeMap::new();
-        requested.insert(0u16, 0b1u64);
+        let requested = crate::bitmap::from_indices(&[0]);
         state.pending_eb_tx_fetches.insert(h(1), (10, requested));
         let outcome = state.match_eb_tx_response(
             &point(10, 1),
