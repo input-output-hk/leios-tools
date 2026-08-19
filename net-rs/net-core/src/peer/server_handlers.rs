@@ -2282,17 +2282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leios_fetch_serves_bitmap_via_manifest_and_resolver() {
-        use crate::store::leios_store::TxBodyResolver;
-        use std::sync::Arc;
-
-        struct StubResolver(std::collections::HashMap<TxId, TxBody>);
-        impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody> {
-                self.0.get(tx_id).cloned()
-            }
-        }
-
+    async fn leios_fetch_serves_bitmap_from_block_txs() {
         let lf_proto = ProtocolConfig {
             id: leios_fetch::PROTOCOL_ID,
             traffic_class: TrafficClass::Priority,
@@ -2303,26 +2293,22 @@ mod tests {
         let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
             mux_pair_for_protocol(&lf_proto);
 
-        let h0 = TxId::new_with_array([0xA0u8; 32]);
-        let h1 = TxId::new_with_array([0xA1u8; 32]);
-        let h2 = TxId::new_with_array([0xA2u8; 32]);
-        // Bodies are single valid CBOR values (1-byte bytestrings,
-        // 0x41 = bytes(1)) — txs pass through the codec as raw CBOR.
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(
-            [
-                (h0.clone(), TxBody::new_with_vec(vec![0x41, 0xB0])),
-                (h1.clone(), TxBody::new_with_vec(vec![0x41, 0xB1])),
-                (h2.clone(), TxBody::new_with_vec(vec![0x41, 0xB2])),
-            ]
-            .into_iter()
-            .collect(),
-        ));
-        // Receiver-style store: only the manifest is recorded; bodies
-        // come from the resolver.
-        let (store, _rx) = LeiosStore::new_with_resolver(100, Some(resolver));
+        // Serving is from stored `block_txs` only. Inject the EB's full ordered
+        // bodies at positions 0..N (producers pin these at produce time;
+        // receivers merge them as fetched). Bodies are single valid CBOR values
+        // (1-byte bytestrings, 0x41 = bytes(1)) — txs pass through as raw CBOR.
+        let (store, _rx) = LeiosStore::new(100);
         let hash = [0xEFu8; 32];
         let point = Point::Specific { slot: 33, hash };
-        store.record_eb_manifest(point.clone(), vec![h0, h1, h2], None);
+        store.inject_block_txs_full(
+            point.clone(),
+            vec![
+                TxBody::new_with_vec(vec![0x41, 0xB0]),
+                TxBody::new_with_vec(vec![0x41, 0xB1]),
+                TxBody::new_with_vec(vec![0x41, 0xB2]),
+            ],
+            None,
+        );
 
         let server_handle = tokio::spawn(serve_leios_fetch(
             server_send,
