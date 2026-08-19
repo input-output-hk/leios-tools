@@ -456,7 +456,9 @@ impl LeiosStore {
         // mismatch that tears the mux connection down. Serve the COMPLETE
         // requested set in bitmap order, or `None` so the responder disconnects
         // (CIP-0164) — never a partial/misaligned or wrong-body response.
-        let block_txs = block_txs?;
+        let Some(block_txs) = block_txs else {
+            return None;
+        };
         let selected: Vec<TxBody> = bitmap::iter_indices(bitmap)
             .map(|i| block_txs.get(&i).cloned())
             .collect::<Option<Vec<TxBody>>>()?;
