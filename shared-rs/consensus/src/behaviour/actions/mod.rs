@@ -40,7 +40,7 @@ pub use deep_reorg::DeepReorg;
 pub use drop_inbound::DropInboundPeers;
 pub use echo_to_source::EchoToSource;
 pub use fake_announce::FakeAnnounce;
-pub use fake_eb::{DummyTxEb, PhantomTxEb};
+pub use fake_eb::{DummyTxEb, HollowEb, LoadedTxEb, PhantomTxEb};
 pub use lazy_voter::LazyVoter;
 pub use lie_about_eb_size::LieAboutEbSize;
 pub use rb_equivocator::{equivocation_bucket, RbHeaderEquivocator};

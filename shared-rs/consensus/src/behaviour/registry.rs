@@ -69,6 +69,23 @@ pub enum ActionSpec {
         #[serde(default = "default_fake_eb_txs")]
         n_txs: u32,
     },
+    /// Hollow EB — empty manifest announced with a false declared size.
+    /// Probes whether the receiver gates/pre-allocates on the advertised
+    /// `eb_size` before fetching the (empty) body.
+    #[serde(rename = "hollow-eb")]
+    HollowEb {
+        #[serde(default = "default_hollow_bytes")]
+        declared_bytes: u64,
+    },
+    /// Loaded Tx EB — fabricated EB whose manifest is sourced from the node's
+    /// configured attack magazine (`eb_magazine_path`): `take` real, offline-
+    /// authored txs (e.g. double-spends or theft txs) pinned + served like
+    /// Dummy. The magazine decides the payload; the node stays threat-agnostic.
+    #[serde(rename = "loaded-tx-eb")]
+    LoadedTxEb {
+        #[serde(default = "default_fake_eb_txs")]
+        take: u32,
+    },
     #[serde(rename = "announce-size-lie")]
     AnnounceSizeLie {
         #[serde(default = "default_lie_scale")]
@@ -110,6 +127,10 @@ pub enum ActionSpec {
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_hollow_bytes() -> u64 {
+    100_000
 }
 
 fn default_tx_flood_rate() -> u32 {

@@ -60,6 +60,46 @@ impl LeafAction<ConsensusCtx, ControlSignal> for DummyTxEb {
     }
 }
 
+/// Hollow EB — announces an empty EB with a false declared size.
+#[derive(Debug, Clone, Copy)]
+pub struct HollowEb {
+    declared_bytes: u64,
+}
+
+impl HollowEb {
+    pub fn new(declared_bytes: u64) -> Self {
+        Self { declared_bytes }
+    }
+}
+
+impl LeafAction<ConsensusCtx, ControlSignal> for HollowEb {
+    fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+        out.praos.fake_eb = Some(FakeEbKind::Hollow {
+            declared_bytes: self.declared_bytes,
+        });
+        Status::Running
+    }
+}
+
+/// Loaded Tx EB — announces an EB sourced from the node's attack magazine.
+#[derive(Debug, Clone, Copy)]
+pub struct LoadedTxEb {
+    take: u32,
+}
+
+impl LoadedTxEb {
+    pub fn new(take: u32) -> Self {
+        Self { take }
+    }
+}
+
+impl LeafAction<ConsensusCtx, ControlSignal> for LoadedTxEb {
+    fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+        out.praos.fake_eb = Some(FakeEbKind::Loaded { take: self.take });
+        Status::Running
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
