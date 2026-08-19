@@ -105,6 +105,10 @@ pub fn build_action(
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
         ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
         ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
+        ActionSpec::HollowEb { declared_bytes } => {
+            Box::new(catalogue::HollowEb::new(*declared_bytes))
+        }
+        ActionSpec::LoadedTxEb { take } => Box::new(catalogue::LoadedTxEb::new(*take)),
         ActionSpec::AnnounceSizeLie {
             scale_num,
             scale_den,

@@ -77,6 +77,16 @@ pub enum FakeEbKind {
     Phantom { n_txs: u32 },
     /// Dummy Tx EB — `n_txs` fabricated txs with servable bodies pinned.
     Dummy { n_txs: u32 },
+    /// Hollow EB — empty manifest (zero txs) announced with a false declared
+    /// size of `declared_bytes`. The EB body is empty and servable; only the
+    /// advertised size lies. Probes whether the receiver gates or pre-allocates
+    /// on the declared `eb_size` before fetching the (empty) body.
+    Hollow { declared_bytes: u64 },
+    /// Loaded Tx EB — manifest of `take` real txs drawn from the node's
+    /// configured attack magazine (`eb_magazine_path`), pinned + served like
+    /// Dummy. Actuation reads the magazine, so the payload (double-spend,
+    /// theft, …) lives in the magazine bytes, not the node code.
+    Loaded { take: u32 },
 }
 
 /// Leios-domain actuator inputs.
