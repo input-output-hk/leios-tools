@@ -489,12 +489,12 @@ impl MempoolState {
         }
 
         let Some(record) = self.get_record_by_id(tx_id) else {
-            tracing::error!("filter_transaction: transaction {} not found in mempool",
+            tracing::warn!("filter_transaction: transaction {} not found in mempool",
                 tx_id.hex_short()
             );
 
-            // If tx is absent in mempool, there is no way to provide it anyway
-            return true; // false;
+            // TODO: proper filter
+            return true;
         };
         let generator_applicable = record.ours || !only_ours;
         // If delay = 0, then no delay is applicable, no filtering
