@@ -24,7 +24,7 @@ pub use selection::{resolve_assignments, BehaviourSelection};
 /// Production-time strategy for self-produced RBs, carried in
 /// [`tree::control::PraosControl::production`] and read by the producer.
 /// Honest nodes use [`RbProductionStrategy::Normal`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RbProductionStrategy {
     /// Produce one honest RB (the default).
     #[default]

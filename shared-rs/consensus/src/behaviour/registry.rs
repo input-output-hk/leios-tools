@@ -39,6 +39,12 @@ pub enum ActionSpec {
     WithholdTxs {
         withholding_slots: u64,
         tx_producer_only: bool,
+        /// Whether to withhold txs on the tx-submission protocol.
+        #[serde(default = "default_true")]
+        withhold_tx_submission: bool,
+        /// Whether to withhold txs on the Leios fetch protocol.
+        #[serde(default)]
+        withhold_leios_fetch: bool,
     },
     #[serde(rename = "deep-reorg")]
     DeepReorg { every_slots: u64, depth: u64 },
@@ -110,6 +116,10 @@ pub enum ActionSpec {
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_tx_flood_rate() -> u32 {

@@ -691,26 +691,22 @@ pub async fn serve_txsubmission(
     let mut outstanding: usize = 0;
 
     loop {
-        let (ack, req) = if outstanding > 0 {
-            let ack = outstanding as u16;
-            outstanding = 0;
-            (ack, txsubmission::MAX_UNACKED as u16)
-        } else {
-            (0u16, txsubmission::MAX_UNACKED as u16)
-        };
+        // Ack every tx-id we pulled last round (`outstanding`); it is re-set
+        // from this round's reply below (fetch-all-then-ack).
+        let ack = outstanding as u16;
+        let req = txsubmission::MAX_UNACKED as u16;
 
-        let blocking = outstanding == 0 && ack == 0;
-        if blocking {
-            runner
-                .send(&TsMsg::MsgRequestTxIdsBlocking { ack, req })
-                .await
-                .ok();
-        } else {
-            runner
-                .send(&TsMsg::MsgRequestTxIdsNonBlocking { ack, req })
-                .await
-                .ok();
-        }
+        // TxSubmission2 requires a BLOCKING MsgRequestTxIds whenever no
+        // unacknowledged tx-ids remain after the ack; a NON-blocking request
+        // with an empty unacked window makes the provider throw
+        // `ProtocolErrorRequestNonBlocking` and tear down the whole connection
+        // (the mux reset we hit once a peer started offering us txs under load).
+        // Because this consumer acks its entire window every round, the window
+        // is always empty here — so the request is always blocking.
+        runner
+            .send(&TsMsg::MsgRequestTxIdsBlocking { ack, req })
+            .await
+            .ok();
 
         let msg = match runner.recv().await {
             Ok(msg) => msg,
@@ -2292,7 +2288,7 @@ mod tests {
 
         struct StubResolver(std::collections::HashMap<TxId, TxBody>);
         impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody> {
+            fn resolve_body(&self, _slot: u64, tx_id: &TxId) -> Option<TxBody> {
                 self.0.get(tx_id).cloned()
             }
         }

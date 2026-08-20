@@ -471,22 +471,30 @@ impl MempoolState {
 
     /// Check current transaction WRT filtering rules.
     /// Return true if Tx to remain, false if Tx should not be transmitted.
-    fn filter_transactions(&self, current_slot: u64, tx_id: &TxId) -> bool {
-        let (delay, only_ours) = if let TxWithholdingPolicy::WithholdTxs {
-            withholding_slots: delay_for_slots, tx_producer_only: only_ours
+    fn filter_transaction(&self, current_slot: u64, tx_id: &TxId, is_leios_fetch: bool) -> bool {
+        let (delay, only_ours, tx_submission, tx_fetch) = if let TxWithholdingPolicy::WithholdTxs {
+            withholding_slots: delay_for_slots,
+            tx_producer_only: only_ours,
+            withhold_tx_submission: tx_submission,
+            withhold_leios_fetch: tx_fetch,
         } = &self.control.mempool.tx_withholding_filter {
-            (*delay_for_slots, *only_ours)
+            (*delay_for_slots, *only_ours, *tx_submission, *tx_fetch)
         } else {
             return true;
         };
 
+        // Retain transaction, if the protocol is not withheld
+        if (is_leios_fetch && !tx_fetch) || (!is_leios_fetch && !tx_submission) {
+            return true;
+        }
+
         let Some(record) = self.get_record_by_id(tx_id) else {
-            tracing::error!("filter_transaction_announcement: transaction {} not found in mempool",
+            tracing::warn!("filter_transaction: transaction {} not found in mempool",
                 tx_id.hex_short()
             );
 
-            // If tx is absent in mempool, there is no way to provide it anyway
-            return false;
+            // TODO: proper filter
+            return true;
         };
         let generator_applicable = record.ours || !only_ours;
         // If delay = 0, then no delay is applicable, no filtering
@@ -524,7 +532,7 @@ impl MempoolState {
 
             unann.iter().filter(
                 |tx| {
-                    let leave = self.filter_transactions(current_slot, tx);
+                    let leave = self.filter_transaction(current_slot, tx, false);
                     control_stats[leave as usize] += 1;
                     leave
                 }
@@ -581,7 +589,7 @@ impl MempoolState {
     pub fn mark_announced_to_peer(&mut self, peer_id: PeerId, tx_id: &TxId, current_slot: u64) -> bool {
         self.ensure_peer_registered(peer_id);
 
-        if !self.filter_transactions(current_slot, tx_id) {
+        if !self.filter_transaction(current_slot, tx_id, false) {
             return false;
             // TODO: if transaction is filtered, should we announce it later, when filter dropped?
         }
@@ -1053,6 +1061,8 @@ mod tests {
         cs.mempool.tx_withholding_filter = TxWithholdingPolicy::WithholdTxs {
             withholding_slots,
             tx_producer_only,
+            withhold_tx_submission: true,
+            withhold_leios_fetch: false,
         };
         state.apply_control(&cs);
     }
