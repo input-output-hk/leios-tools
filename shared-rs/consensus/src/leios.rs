@@ -1118,7 +1118,7 @@ impl LeiosState {
         bitmap: BTreeMap<u16, u64>,
         now: Instant,
     ) -> Vec<LeiosEffect> {
-        if self.max_leios_fetch_txs_waves == 0 {
+        if self.max_leios_fetch_txs_waves == 0 || bitmap.is_empty() {
             return Vec::new();
         }
         else if self.leios_fetch_txs_waves_count.contains_key(point) {
