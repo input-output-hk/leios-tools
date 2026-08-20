@@ -335,6 +335,10 @@ pub enum LeiosTelemetryEvent {
         eb_slot: u64,
         perm_committee: bool,
     },
+    LeiosBlockInfo {
+        eb_slot: u64,
+        tx_count: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1155,10 @@ impl LeiosState {
         let mut fx = Vec::new();
         if let (Some((eb_key, tx_hashes)), Point::Specific { slot, hash }) = (manifest_hashes, &point) {
             self.eb_tx_hashes.insert(*hash, (*slot, tx_hashes.clone()));
+            fx.push(LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosBlockInfo {
+                eb_slot: *slot,
+                tx_count: tx_hashes.len(),
+            }));
             fx.push(LeiosEffect::RecordLeiosEbManifest {
                 source,
                 point: point.clone(),
@@ -1876,13 +1884,17 @@ mod tests {
     }
 
     #[test]
-    fn on_eb_received_emits_record_and_validate() {
+    fn on_eb_received_emits_required_effects() {
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
         let manifest = vec![tx_id(0xA0), tx_id(0xA1)];
         let fx = state.on_eb_received(None, point(10, 1), Some((None, manifest.clone())));
-        assert_eq!(fx.len(), 2);
-        assert!(matches!(fx[0], LeiosEffect::RecordLeiosEbManifest { .. }));
-        assert!(matches!(fx[1], LeiosEffect::ValidateEb { .. }));
+        assert_eq!(fx.len(), 3);
+        assert!(matches!(
+            fx[0],
+            LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosBlockInfo { .. })
+        ));
+        assert!(matches!(fx[1], LeiosEffect::RecordLeiosEbManifest { .. }));
+        assert!(matches!(fx[2], LeiosEffect::ValidateEb { .. }));
         assert_eq!(
             state.eb_tx_hashes.get(&h(1)).map(|(_, v)| v),
             Some(&manifest)
