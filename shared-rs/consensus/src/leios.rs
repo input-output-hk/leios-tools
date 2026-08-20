@@ -1089,7 +1089,7 @@ impl LeiosState {
 
         match self.leios_fetch_txs_waves_count.get(point) {
             None => {
-                tracing::error!("leios_store: next leios fetch txs wave inititated without first wave; point {point}");
+                tracing::error!("leios_store: next leios fetch txs wave initiated without first wave; point {point}");
                 return Vec::new();
             }
             Some(cnt) if *cnt >= self.max_leios_fetch_txs_waves => {
