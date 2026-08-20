@@ -388,6 +388,15 @@ pub struct PraosState {
     /// our sync frontier during catch-up). Used to classify whether a block
     /// is immutable (older than `tip - k`) for the EB-fetch trigger.
     pub highest_tip_block_no: u64,
+
+    /// Highest block number of any peer *header* we have rolled forward — the
+    /// accurate sync frontier. Unlike `highest_tip_block_no` (which tracks the
+    /// wire `Tip.block_no`, reported as 0/Origin during a peer's early blocks),
+    /// this is set from every rolled-forward `header_block_no`, so it reflects
+    /// how far the network has actually progressed as seen by us. The forge
+    /// gate (`is_caught_up`) uses this so we don't mint stale low blocks (0/1)
+    /// during initial sync when the wire tip under-reports the real height.
+    pub seen_header_frontier: u64,
 }
 
 impl PraosState {
@@ -444,6 +453,7 @@ impl PraosState {
             rtt,
             control: crate::behaviour::tree::control::ControlSignal::default(),
             highest_tip_block_no: 0,
+            seen_header_frontier: 0,
         }
     }
 
@@ -785,6 +795,10 @@ impl PraosState {
         // `tip_block_no` is the producer's actual tip — needed to tell whether
         // a block is immutable (`tip - k`) for the EB-fetch trigger.
         self.highest_tip_block_no = self.highest_tip_block_no.max(tip_block_no);
+        // Accurate sync frontier: every rolled-forward header counts, even when
+        // the wire tip is Origin/0 (a peer's early blocks). Set before the
+        // early-return below so block-0/1 headers still advance it.
+        self.seen_header_frontier = self.seen_header_frontier.max(header_block_no);
 
         // The announced header may be an ancestor of `tip` while a peer
         // catches up.  Use whichever pair matches.
