@@ -26,7 +26,7 @@ use tracing::info;
 /// locally — typically the host application's mempool answers.
 pub trait TxBodyResolver: Send + Sync {
     /// Return the body for `tx_id`, or `None` if unknown.
-    fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody>;
+    fn resolve_body(&self, slot: u64, tx_id: &TxId) -> Option<TxBody>;
 }
 
 /// A notification about available Leios data, served by LeiosNotify.
@@ -457,7 +457,7 @@ impl LeiosStore {
                     return Some(body);
                 }
                 let h = manifest.as_ref()?.get(i as usize)?;
-                resolver?.resolve_body(h)
+                resolver?.resolve_body(slot, h)
             })
             .collect();
         info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.map(|x| x.len()).unwrap_or_default());
@@ -850,7 +850,7 @@ mod tests {
 
     struct StubResolver(HashMap<TxId, TxBody>);
     impl TxBodyResolver for StubResolver {
-        fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody> {
+        fn resolve_body(&self, _slot: u64, tx_id: &TxId) -> Option<TxBody> {
             self.0.get(tx_id).cloned()
         }
     }

@@ -18,7 +18,7 @@
 //! wire-format vote body and sends it.  Same principle as `praos`:
 //! this crate is format-agnostic.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Not;
 use std::time::{Duration, Instant};
 
@@ -399,6 +399,11 @@ pub struct LeiosState {
     pub voting_config: VotingConfig,
     pub pipeline: PipelineConfig,
 
+    /// Fine-tuning parameter for leios-fetch behaviour.
+    /// Later to be replaced with config,
+    ///  if more similar parameters emerge
+    pub max_leios_fetch_txs_waves: usize,
+
     /// Per-EB ordered tx-hash list, decoded from the EB manifest on
     /// `on_eb_received`.  Tagged with the EB's announced slot so stale
     /// entries can be pruned in `on_slot`.
@@ -420,12 +425,18 @@ pub struct LeiosState {
     /// Map: RB-hash -> (slot, bitmap)
     pub pending_eb_tx_fetches: BTreeMap<[u8; 32], (u64, BTreeMap<u16, u64>)>,
 
-    /// If txs were not fully retrieved from leios nodes, EB Point is written
-    /// so the retrieval attempt can be repeated next slot.
+    /// If txs were not fully retrieved from leios nodes (one wave for leios
+    /// fetches performed), EB Point is written so the retrieval attempt wave
+    /// can be repeated next slot.
     /// Inserted when `retry_eb_tx_fetch` ran out of peers.
     /// Removed, when txs fetch is restarted, and when all txs are fetched.
     /// Pruned when EB (corresponding to the Point) becomes outdated.
-    postponed_eb_tx_requests: HashSet<Point>,
+    /// The number of postponed requests iterations ("waves") for a point is
+    next_fetch_txs_wave: HashSet<Point>,
+
+    /// Total number of leios fetch txs attempt waves per point.
+    /// Each wave -- requests to each peer about txs for the Point.
+    leios_fetch_txs_waves_count: HashMap<Point, usize>,
 
     /// EB hashes the local node holds a chain-committed cert for whose
     /// body it has not validated locally.  Producer-side EB-safety
@@ -483,12 +494,14 @@ impl LeiosState {
         elections: Elections,
         voting_config: VotingConfig,
         pipeline: PipelineConfig,
+        max_leios_fetch_txs_waves: usize,
     ) -> Self {
         Self::with_fetch(
             node_id,
             elections,
             voting_config,
             pipeline,
+            max_leios_fetch_txs_waves,
             Box::new(LowestRttFirst),
             Box::new(LowestRttFirst),
             Box::new(UniformRtt(Duration::ZERO)),
@@ -502,6 +515,7 @@ impl LeiosState {
         elections: Elections,
         voting_config: VotingConfig,
         pipeline: PipelineConfig,
+        max_leios_fetch_txs_waves: usize,
         eb_policy: Box<dyn EbFetchPolicy + Send + Sync>,
         eb_txs_policy: Box<dyn EbTxsFetchPolicy + Send + Sync>,
         rtt: Box<dyn PeerRtt + Send + Sync>,
@@ -511,10 +525,12 @@ impl LeiosState {
             elections,
             voting_config,
             pipeline,
+            max_leios_fetch_txs_waves,
             eb_tx_hashes: BTreeMap::new(),
             validated_eb_bodies: BTreeMap::new(),
             pending_eb_tx_fetches: BTreeMap::new(),
-            postponed_eb_tx_requests: HashSet::new(),
+            next_fetch_txs_wave: HashSet::new(),
+            leios_fetch_txs_waves_count: HashMap::new(),
             endorsed_unvalidated_ebs: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             chain_tip_ctx: ChainTipContext::default(),
@@ -569,9 +585,8 @@ impl LeiosState {
 
     /// Take postponed requests to restart them.
     pub fn take_postponed_eb_tx_requests(&mut self) -> HashSet<Point> {
-        std::mem::take(&mut self.postponed_eb_tx_requests)
+        std::mem::take(&mut self.next_fetch_txs_wave)
     }
-
 
     /// Build the sparse CIP-0164 bitmap of manifest indices whose tx
     /// bodies are *not* locally available, ready to feed
@@ -619,7 +634,8 @@ impl LeiosState {
     /// `fx` -- effects output.
     fn prune_chain_progress(&mut self, min_keep: u64, fx: &mut Vec<LeiosEffect>) {
         self.eb_tx_hashes.retain(|_, (s, _)| *s >= min_keep);
-        self.postponed_eb_tx_requests.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
+        self.next_fetch_txs_wave.retain(|p| p.get_slot().is_some_and(|s| s >= min_keep));
+        self.leios_fetch_txs_waves_count.retain(|p,_cnt| p.get_slot().is_some_and(|s| s >= min_keep));
         self.pending_eb_tx_fetches
             .retain(|_, (slot, _)| *slot >= min_keep);
         self.endorsed_unvalidated_ebs.retain(|_, s| *s >= min_keep);
@@ -1035,6 +1051,12 @@ impl LeiosState {
         bitmap: BTreeMap<u16, u64>,
         now: Instant,
     ) -> Vec<LeiosEffect> {
+        tracing::info!(node_id = %self.node_id, %point, "max_waves: {}", self.max_leios_fetch_txs_waves);
+        if self.max_leios_fetch_txs_waves == 0 {
+            // Shortcut -- the check is implemented later again.
+            return Vec::new();
+        }
+
         // EB-processing filter (t22): drop tx-offer processing for a filtered EB.
         if !self.should_process_eb(&point) {
             tracing::debug!(node_id = %self.node_id, %point, peer = peer.0, "t22: filtered EB-txs offer (checksum-threshold)");
@@ -1046,7 +1068,7 @@ impl LeiosState {
             return Vec::new();
         }
         self.candidates.note_eb_txs_offered(point.clone(), peer);
-        self.initiate_eb_txs_fetch(&point, bitmap, now)
+        self.initiate_first_eb_txs_fetch(&point, bitmap, now)
     }
 
     /// Initiate fetch restarting, if all previous attempts were unsuccessful: maybe some peers
@@ -1057,7 +1079,7 @@ impl LeiosState {
     /// * take all postponed fetches using `take_postponed_eb_tx_requests`,
     /// * recalculate new `bitmap`s (which are unavailable at this level)
     /// * return control/information back onto shared consensus level using this function.
-    pub fn retry_postponed_eb_txs_fetches(
+    pub fn initiate_next_leios_fetch_txs_wave(
         &mut self,
         point: &Point,
         bitmap: BTreeMap<u16, u64>,
@@ -1065,8 +1087,22 @@ impl LeiosState {
     ) -> Vec<LeiosEffect> {
         info!("leios_store: restarting fetch for {point}");
 
-        let mut fx = Vec::new();
+        match self.leios_fetch_txs_waves_count.get(point) {
+            None => {
+                tracing::error!("leios_store: next leios fetch txs wave initiated without first wave; point {point}");
+                return Vec::new();
+            }
+            Some(cnt) if *cnt >= self.max_leios_fetch_txs_waves => {
+                tracing::info!("leios_store: point {point}, cnt {} >= max_leios_fetch_txs_waves {}", cnt, self.max_leios_fetch_txs_waves);
+                return Vec::new();
+            },
+            Some(_cnt) => {
+                info!("leios_store: point {point}, cnt {}", _cnt);
+            },
+        };
+        self.leios_fetch_txs_waves_count.get_mut(point).map(|cnt| *cnt += 1);
 
+        let mut fx = Vec::new();
         self.candidates.clear_eb_txs_attempts(&point);
         fx.append(&mut (self.initiate_eb_txs_fetch(point, bitmap, now)));
 
@@ -1075,9 +1111,30 @@ impl LeiosState {
 
     /// Initiate EB Tx fetch for `point`. Requires `bitmap` of requested transactions
     /// (should be computed before call).
-    /// This function is either called from `on_eb_tx_offered`, or independently, from on_slot
-    /// (in case of repeated tx fetch attempts).
-    pub fn initiate_eb_txs_fetch(
+    /// This function is called from `on_eb_tx_offered`
+    pub fn initiate_first_eb_txs_fetch(
+        &mut self,
+        point: &Point,
+        bitmap: BTreeMap<u16, u64>,
+        now: Instant,
+    ) -> Vec<LeiosEffect> {
+        if self.max_leios_fetch_txs_waves == 0 || bitmap.is_empty() {
+            return Vec::new();
+        }
+        else if self.leios_fetch_txs_waves_count.contains_key(point) {
+            tracing::error!("initiate_first_eb_txs_fetch: already started, point {point}");
+            //return Vec::new();
+        }
+        else {
+            self.leios_fetch_txs_waves_count.insert(point.clone(), 1);
+        }
+
+        self.initiate_eb_txs_fetch(point, bitmap, now)
+    }
+
+    /// Initiate EB Tx fetch for `point`. Requires `bitmap` of requested transactions
+    /// (should be computed before call).
+    fn initiate_eb_txs_fetch(
         &mut self,
         point: &Point,
         bitmap: BTreeMap<u16, u64>,
@@ -1415,7 +1472,7 @@ impl LeiosState {
         bitmap: BTreeMap<u16, u64>,
     ) -> Vec<LeiosEffect> {
         if bitmap.is_empty() {
-            self.postponed_eb_tx_requests.remove(&point);
+            self.next_fetch_txs_wave.remove(&point);
             return Vec::new();
         }
         let candidates = self.candidates.eb_txs_candidates(&point);
@@ -1429,7 +1486,8 @@ impl LeiosState {
             // requests for the points again.
             // This repeated processing may happen only for L_hdr*3 + L_vote slots, since
             // after this number of slots the election (voting) process will have no sense.
-            self.postponed_eb_tx_requests.insert(point);
+            info!("leios_store: all Peers for {point} processed; postponing next wave");
+            self.next_fetch_txs_wave.insert(point);
             return Vec::new();
         }
         if !self.candidates.start_eb_txs_fetch(point.clone(), &peers) {
@@ -1585,6 +1643,10 @@ mod tests {
     use super::*;
     use crate::mempool::{TxBody, TxId};
 
+    /// Default max EB-tx fetch waves for tests: any positive value keeps the
+    /// EB-tx fetch flow enabled (a zero wave count would short-circuit it).
+    const TEST_MAX_FETCH_WAVES: usize = 7;
+
     fn pipeline() -> PipelineConfig {
         PipelineConfig {
             delta_hdr: 1,
@@ -1597,7 +1659,7 @@ mod tests {
     #[test]
     fn apply_control_stores_leios_domain_slice() {
         use crate::behaviour::tree::control::{ControlSignal, VotePolicy};
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         assert_eq!(state.control.leios.vote, VotePolicy::Honest);
         let mut cs = ControlSignal::default();
         cs.leios.vote = VotePolicy::Abstain(NoVoteReason::Declined);
@@ -1679,7 +1741,7 @@ mod tests {
         // election, created at announcement via the chain-tip path, must
         // start body-validated so the node votes rather than abstaining
         // with EBValidating.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         // Body validates first — no election exists yet.
         state.on_validated_eb(point(10, 1));
@@ -1705,7 +1767,7 @@ mod tests {
 
     #[test]
     fn pv_vote_emitted_when_seated() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         state.on_validated_eb(point(10, 1));
@@ -1743,7 +1805,7 @@ mod tests {
         //     re-firing `EligibleToVote` for the whole window.
         let mut voting = cfg(1); // seated voter — would normally PV-vote
         voting.evaluate_votes = false;
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), voting, pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), voting, pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // Deliberately do NOT call `tip_for` — leave ChainTipContext
@@ -1766,7 +1828,7 @@ mod tests {
 
     #[test]
     fn no_vote_when_no_seats_and_no_npv() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         state.on_validated_eb(point(10, 1));
@@ -1801,7 +1863,7 @@ mod tests {
             expected_total_weight: 600,
             quorum_weight_fraction: 0.75,
         });
-        let mut state = LeiosState::new("n0".into(), elections, voting, pipeline());
+        let mut state = LeiosState::new("n0".into(), elections, voting, pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         state.on_validated_eb(point(10, 1));
@@ -1845,7 +1907,7 @@ mod tests {
             expected_total_weight: 600,
             quorum_weight_fraction: 0.75,
         });
-        let mut state = LeiosState::new("n0".into(), elections, voting, pipeline());
+        let mut state = LeiosState::new("n0".into(), elections, voting, pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         state.on_validated_eb(point(10, 1));
@@ -1867,7 +1929,7 @@ mod tests {
 
     #[test]
     fn on_eb_offered_dedups_via_in_flight() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let now = Instant::now();
         let peer = PeerId(1);
         let fx = state.on_eb_offered(point(10, 1), peer, now);
@@ -1885,7 +1947,7 @@ mod tests {
 
     #[test]
     fn on_eb_received_emits_required_effects() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let manifest = vec![tx_id(0xA0), tx_id(0xA1)];
         let fx = state.on_eb_received(None, point(10, 1), Some((None, manifest.clone())));
         assert_eq!(fx.len(), 3);
@@ -1903,7 +1965,7 @@ mod tests {
 
     #[test]
     fn on_eb_received_validate_only_when_no_manifest() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let fx = state.on_eb_received(None, point(10, 1), None);
         assert_eq!(fx.len(), 1);
         assert!(matches!(fx[0], LeiosEffect::ValidateEb { .. }));
@@ -1925,7 +1987,7 @@ mod tests {
     #[test]
     fn tx_filter_threshold_100_processes_eb_offer() {
         // checksum percentile is always < 100, so threshold 100 always processes.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         with_tx_filter(&mut state, 100, 100, false);
         let fx = state.on_eb_offered(point(10, 1), PeerId(1), Instant::now());
         assert_eq!(fx.len(), 1);
@@ -1936,7 +1998,7 @@ mod tests {
     fn tx_filter_threshold_0_drops_eb_offer() {
         // checksum percentile is always >= 0, so threshold 0 never processes —
         // the offer is dropped despite the honest path having a candidate peer.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         with_tx_filter(&mut state, 0, 0, false);
         let fx = state.on_eb_offered(point(10, 1), PeerId(1), Instant::now());
         assert!(fx.is_empty());
@@ -1944,7 +2006,7 @@ mod tests {
 
     #[test]
     fn tx_filter_threshold_0_drops_eb_txs_offer() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         with_tx_filter(&mut state, 0, 0, false);
         let mut bitmap = BTreeMap::new();
         bitmap.insert(0u16, 1u64);
@@ -1955,7 +2017,7 @@ mod tests {
     #[test]
     fn tx_filter_hide_eb_tx_drops_received_processing() {
         // hide_eb_tx + filtered (threshold 0) => on_eb_received produces nothing.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         with_tx_filter(&mut state, 0, 0, true);
         let fx = state.on_eb_received(None, point(10, 1), Some((None, vec![tx_id(0xA0)])));
         assert!(fx.is_empty());
@@ -1965,7 +2027,7 @@ mod tests {
     fn tx_filter_without_hide_still_processes_received() {
         // Without hide_eb_tx, on_eb_received is unaffected by the filter
         // (the filter only gates offer/txs-offer fetching, not validation).
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         with_tx_filter(&mut state, 0, 0, false);
         let fx = state.on_eb_received(None, point(10, 1), None);
         assert_eq!(fx.len(), 1);
@@ -1974,7 +2036,7 @@ mod tests {
 
     #[test]
     fn quorum_emits_telemetry() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         let body_a = ValidatedVote {
@@ -1992,7 +2054,7 @@ mod tests {
 
     #[test]
     fn slot_tick_prunes_stale_eb_tx_state_via_chain_progress() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.eb_tx_hashes.insert(h(1), (10, vec![tx_id(0xAA)]));
         state
             .pending_eb_tx_fetches
@@ -2014,7 +2076,7 @@ mod tests {
 
     #[test]
     fn match_eb_tx_response_returns_in_manifest_order() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         // Manifest: [hashA, hashB, hashC] at slot 10.
         let ha = tx_id(0xA0);
         let hb = tx_id(0xA1);
@@ -2041,7 +2103,7 @@ mod tests {
 
     #[test]
     fn match_eb_tx_response_drops_unmatched_bodies() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let ha = tx_id(0xA0);
         state.eb_tx_hashes.insert(h(1), (10, vec![ha.clone()]));
         let bogus = tx_id(0xFF);
@@ -2058,7 +2120,7 @@ mod tests {
 
     #[test]
     fn on_eb_txs_offered_gates_per_slot() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let now = Instant::now();
         let peer = PeerId(1);
         let mut bitmap = BTreeMap::new();
@@ -2077,14 +2139,14 @@ mod tests {
 
     #[test]
     fn on_eb_txs_offered_origin_point_is_noop() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let fx = state.on_eb_txs_offered(Point::Origin, PeerId(1), BTreeMap::new(), Instant::now());
         assert!(fx.is_empty());
     }
 
     #[test]
     fn on_eb_txs_received_clears_gate_for_subsequent_fetch() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let now = Instant::now();
         let mut bitmap = BTreeMap::new();
         bitmap.insert(0u16, 0b1u64);
@@ -2117,7 +2179,7 @@ mod tests {
             expected_total_weight: 100,
             quorum_weight_fraction: 0.75,
         });
-        let mut state = LeiosState::new("n0".into(), elections, cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections, cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // "voter-a" is index 0 in the sorted registry.
@@ -2136,7 +2198,7 @@ mod tests {
     #[test]
     fn on_votes_received_skips_unknown_voter() {
         // Empty registry → no index resolves; the vote is dropped.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let vote = Vote {
             announcing_rb_hash: h(1),
             voter_id: 7,
@@ -2148,7 +2210,7 @@ mod tests {
 
     #[test]
     fn on_votes_received_empty_is_noop() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let fx = state.on_votes_received(Vec::new());
         assert!(fx.is_empty());
     }
@@ -2158,7 +2220,7 @@ mod tests {
         // Elections are created at announcement (`announce_from_rb`),
         // not at body validation. `on_validated_eb` only flips the
         // body-validated flag on the matching election.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         // No election yet → on_validated_eb creates nothing.
         state.on_validated_eb(point(10, 1));
@@ -2174,14 +2236,14 @@ mod tests {
 
     #[test]
     fn on_validated_eb_origin_is_noop() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_validated_eb(Point::Origin);
         assert_eq!(state.elections.count(), 0);
     }
 
     #[test]
     fn retry_eb_tx_fetch_with_bitmap_emits_fetch() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         // The retry path consults eb_txs_candidates, so we need at
         // least one peer that hasn't been attempted.
         state
@@ -2207,14 +2269,14 @@ mod tests {
 
     #[test]
     fn retry_eb_tx_fetch_empty_bitmap_is_noop() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let fx = state.retry_eb_tx_fetch(point(10, 1), BTreeMap::new());
         assert!(fx.is_empty());
     }
 
     #[test]
     fn match_eb_tx_response_reports_remaining_bitmap() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let ha = tx_id(0xA0);
         let hb = tx_id(0xA1);
         state.eb_tx_hashes.insert(h(1), (10, vec![ha.clone(), hb]));
@@ -2248,7 +2310,7 @@ mod tests {
 
     #[test]
     fn match_eb_tx_response_clears_pending_when_complete() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let ha = tx_id(0xA0);
         state.eb_tx_hashes.insert(h(1), (10, vec![ha.clone()]));
         let mut requested = BTreeMap::new();
@@ -2264,7 +2326,7 @@ mod tests {
 
     #[test]
     fn match_eb_tx_response_unknown_manifest_passes_bodies_through() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let outcome = state.match_eb_tx_response(
             &point(10, 1),
             &[(TxBody::new_with_vec(b"some-body".to_vec()), tx_id(0xAA))],
@@ -2279,7 +2341,7 @@ mod tests {
 
     #[test]
     fn match_eb_tx_response_origin_point_returns_empty() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         let outcome = state.match_eb_tx_response(&Point::Origin, &[]);
         assert!(outcome.matched_bodies.is_empty());
         assert_eq!(outcome.requested, 0);
@@ -2302,7 +2364,7 @@ mod tests {
             expected_total_weight: 100,
             quorum_weight_fraction: 0.75,
         });
-        let mut state = LeiosState::new("n0".into(), elections, cfg(0), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections, cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
 
@@ -2343,7 +2405,7 @@ mod tests {
         // Default ChainTipContext has no rb_header_arrival_slot — predicate
         // returns NoChainTip before any other check (distinct from the
         // WrongEB announcement-mismatch case).
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         let fx = state.on_slot(13, &tx_all);
@@ -2355,7 +2417,7 @@ mod tests {
 
     #[test]
     fn no_vote_wrong_eb_when_chain_tip_announces_other_eb() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // Chain tip RB references h(2), not the EB we're voting on.
@@ -2370,7 +2432,7 @@ mod tests {
 
     #[test]
     fn no_vote_late_rb_header() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // delta_hdr=1, so RB header must arrive before slot 11.  Set
@@ -2387,7 +2449,7 @@ mod tests {
 
     #[test]
     fn no_vote_missing_tx() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         tip_for(&mut state, 10, h(1));
@@ -2414,7 +2476,7 @@ mod tests {
         // Chain-progress prune: anything at slot < tip_rb_slot is dead
         // under the strict parent-only cert rule.  With tip_rb_slot=8,
         // slot-5 entries drop and slot-8 entries stay.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let peer = crate::peer::PeerId(1);
         state.candidates.note_eb_offered(point(5, 0xAA), peer);
         state.candidates.note_eb_offered(point(8, 0xBB), peer);
@@ -2444,7 +2506,7 @@ mod tests {
         // Before adopting any RB (`tip_rb_slot = None`), no prune fires
         // — incoming EB / vote offers may belong to the chain we're
         // about to adopt.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let peer = crate::peer::PeerId(1);
         state.candidates.note_eb_offered(point(5, 0xAA), peer);
         let _ = state.on_slot(1000, &tx_all);
@@ -2456,7 +2518,7 @@ mod tests {
         // CIP-0164: when RB-header equivocation has been detected at
         // the EB's slot, the voter abstains — regardless of which EB
         // the chain tip ultimately picks.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // Chain tip references this EB and the header arrived on time;
@@ -2480,7 +2542,7 @@ mod tests {
         // cleanest way to set up the late-arrival corner case — the
         // public `announce` path can't reach it because the phase
         // machine would already filter the EB out.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         tip_for(&mut state, 10, h(1));
@@ -2497,7 +2559,7 @@ mod tests {
         // late.  Other NoVote reasons (WrongEB, LateRBHeader, MissingTX)
         // are transient and intentionally re-fire next slot so a slow
         // chain-tip update or a delayed TX still gets a chance to vote.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         tip_for(&mut state, 10, h(1));
@@ -2523,7 +2585,7 @@ mod tests {
         // WrongEB / LateRBHeader / MissingTX leave the election unvoted
         // so EligibleToVote re-fires every slot of the Voting window —
         // gives the chain tip / mempool a chance to catch up.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         state.on_slot(10, &tx_all);
         state.elections.announce_from_rb(h(1), 10, h(1));
         // No chain tip → NoChainTip.
@@ -2539,7 +2601,7 @@ mod tests {
 
     #[test]
     fn missing_eb_tx_bitmap_empty_when_manifest_unknown() {
-        let state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let mempool = crate::mempool::MempoolState::new(1024);
         let bitmap = state.missing_eb_tx_bitmap(&h(0xAA), &mempool);
         assert!(bitmap.is_empty());
@@ -2547,7 +2609,7 @@ mod tests {
 
     #[test]
     fn missing_eb_tx_bitmap_returns_indices_not_in_mempool() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let manifest = vec![tx_id(1), tx_id(2), tx_id(3), tx_id(4)];
         state.eb_tx_hashes.insert(h(0xAB), (50, manifest));
 
@@ -2563,7 +2625,7 @@ mod tests {
 
     #[test]
     fn missing_eb_tx_bitmap_empty_when_all_held() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let manifest = vec![tx_id(5), tx_id(6)];
         state.eb_tx_hashes.insert(h(0xCD), (50, manifest));
 
@@ -2581,7 +2643,7 @@ mod tests {
     fn control_vote_abstain_forces_no_vote() {
         // The BT control signal's vote-abstain policy (lazy-voter) overrides
         // the honest predicate, exactly as the old decide_vote hook did.
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline());
+        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let mut cs = ControlSignal::default();
         cs.leios.vote = VotePolicy::Abstain(NoVoteReason::WrongEB);
         state.apply_control(&cs);

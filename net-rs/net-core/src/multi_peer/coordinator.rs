@@ -3624,7 +3624,7 @@ mod tests {
 
         struct StubResolver(HashMap<TxId, TxBody>);
         impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, tx_id: &TxId) -> Option<TxBody> {
+            fn resolve_body(&self, _slot: u64, tx_id: &TxId) -> Option<TxBody> {
                 self.0.get(tx_id).cloned()
             }
         }
