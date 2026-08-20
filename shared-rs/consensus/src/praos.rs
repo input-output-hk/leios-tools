@@ -556,10 +556,18 @@ impl PraosState {
     }
 
     /// Block number to assign to the next self-produced block.
+    ///
+    /// With no adopted real block (forging from genesis), the first block is
+    /// number **0** — genesis is "before block 0", so its child is 0, matching
+    /// the Cardano/ouroboros convention (a real node forges its genesis child as
+    /// `BlockNo 0`). Numbering the genesis child 1 makes a real node reject our
+    /// header chain with `UnexpectedBlockNo (BlockNo 0) (BlockNo 1)` and drop the
+    /// connection, so our blocks never diffuse. Once we have adopted a real tip,
+    /// the next block is `tip.block_no + 1`.
     pub fn next_block_number(&self) -> u64 {
         self.adopted_tip_hash
             .and_then(|h| self.chain_tree.block_number(&h))
-            .map_or(1, |bn| bn + 1)
+            .map_or(0, |bn| bn + 1)
     }
 
     /// `(point, block_no)` of the adopted tip, if any.  Used by the I/O
@@ -2648,7 +2656,8 @@ mod tests {
     fn new_state_is_empty() {
         let s = fresh();
         assert_eq!(s.tip_hash(), None);
-        assert_eq!(s.next_block_number(), 1);
+        // Genesis child is block 0 (genesis is "before block 0").
+        assert_eq!(s.next_block_number(), 0);
         assert_eq!(s.local_tip(), None);
     }
 
