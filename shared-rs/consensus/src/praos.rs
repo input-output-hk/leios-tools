@@ -564,6 +564,22 @@ impl PraosState {
     /// header chain with `UnexpectedBlockNo (BlockNo 0) (BlockNo 1)` and drop the
     /// connection, so our blocks never diffuse. Once we have adopted a real tip,
     /// the next block is `tip.block_no + 1`.
+    ///
+    /// Bootstrap semantics (verified against Cardano sources, not this codebase):
+    /// **genesis is NOT a block** — the chain's Origin point has no block number
+    /// ("The origin does not have block number 0, it has no block number"; "the
+    /// genesis, which is not a block"), and the first *real* block has `BlockNo 0`
+    /// (cardano-db-sync PR #435, IntersectMBO). Nodes do NOT each mint their own
+    /// block 0 from the genesis config; block 0 is **forged by whichever pool wins
+    /// the VRF slot-leader lottery** and then diffused and **adopted via chain
+    /// selection** by everyone else (Ouroboros: only a slot's elected leader signs
+    /// that slot's block). So a mixed-start devnet correctly has a fork race at
+    /// height 0 — this node must run chain selection from Origin and adopt the
+    /// canonical early chain, NOT bootstrap an independent genesis fork. Forging a
+    /// block here is only legitimate when this node actually won the slot's VRF
+    /// election; the number it gets still follows the rule above.
+    /// Refs: cardano-db-sync PR #435; docs.cardano.org Ouroboros overview;
+    /// ouroboros-consensus report (Origin/point + chain selection).
     pub fn next_block_number(&self) -> u64 {
         self.adopted_tip_hash
             .and_then(|h| self.chain_tree.block_number(&h))
