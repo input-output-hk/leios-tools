@@ -1314,12 +1314,15 @@ mod tests {
         // Populate chain store.
         let (store, _rx) = ChainStore::new(100);
         let header_1 = make_header(1);
-        for slot in 1..=3 {
+        // Genesis-rooted chain: block_no 0,1,2,3 over slots 1..=4, so the
+        // earliest block (slot 1) is block 0 and Origin is a valid intersection.
+        // Earliest served block stays header_1; tip.block_no stays 3.
+        for slot in 1..=4 {
             store.append_block(
                 make_point(slot),
                 make_header(slot),
                 make_body(slot, 50),
-                slot,
+                slot - 1,
             );
         }
 
@@ -1375,7 +1378,8 @@ mod tests {
         let (store, _rx) = ChainStore::new(100);
         // [era_tag=7, #6.24(h'AABB')] — valid CBOR, era tag at byte 1.
         let authentic = WrappedHeader::opaque(vec![0x82, 0x07, 0xD8, 0x18, 0x42, 0xAA, 0xBB]);
-        store.append_block(make_point(1), authentic.clone(), make_body(1, 50), 1);
+        // block_no 0: genesis-rooted, so Origin is a valid intersection.
+        store.append_block(make_point(1), authentic.clone(), make_body(1, 50), 0);
 
         let server_handle = tokio::spawn(serve_chainsync(
             server_send,

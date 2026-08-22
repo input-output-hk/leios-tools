@@ -209,9 +209,25 @@ impl ChainStore {
             },
         };
 
+        // Whether our chain actually roots at genesis, i.e. our earliest stored
+        // block is the genesis child (block 0 / prev = genesis). A node that
+        // joined mid-chain and never adopted block 0 (or evicted it) is anchored
+        // above genesis: offering Origin as an intersection would then roll our
+        // first block (e.g. block 2) forward where the client expects block 0,
+        // which the client rejects with UnexpectedBlockNo. In that case we do NOT
+        // claim Origin — we answer IntersectNotFound (the client syncs elsewhere).
+        // Contiguous chain of `len` blocks ending at `block_no` has its earliest
+        // block at `block_no - (len - 1)`; it roots at genesis iff that is 0, i.e.
+        // `block_no + 1 == len`. (block_no-based, not header parsing, so it holds
+        // for opaque headers too.) Empty chain: nothing to mis-serve.
+        let len = inner.blocks.len() as u64;
+        let roots_at_genesis = len == 0 || inner.block_no + 1 == len;
         for candidate in points {
             if *candidate == Point::Origin {
-                return Some((Point::Origin, tip));
+                if roots_at_genesis {
+                    return Some((Point::Origin, tip));
+                }
+                continue; // anchored above genesis — Origin is not a valid intersection
             }
             if inner.blocks.iter().any(|b| b.point == *candidate) {
                 return Some((candidate.clone(), tip));
@@ -647,15 +663,33 @@ mod tests {
     #[test]
     fn find_intersection_origin_fallback() {
         let (store, _rx) = ChainStore::new(100);
+        // Genesis-rooted chain (block_no 0,1,2): Origin IS a valid intersection.
         for slot in 1..=3 {
             let (p, h, b) = make_block(slot);
-            store.append_block(p, h, b, slot);
+            store.append_block(p, h, b, slot - 1);
         }
 
         let result = store.find_intersection(&[make_point(99), Point::Origin]);
         assert!(result.is_some());
         let (found, _) = result.unwrap();
         assert_eq!(found, Point::Origin);
+    }
+
+    #[test]
+    fn find_intersection_no_origin_when_anchored_above_genesis() {
+        let (store, _rx) = ChainStore::new(100);
+        // Chain anchored at block_no 2 (joined mid-chain, never adopted block 0).
+        // Origin is NOT a valid intersection: serving from it would roll block 2
+        // forward where the client expects block 0 (UnexpectedBlockNo).
+        for slot in 1..=3 {
+            let (p, h, b) = make_block(slot);
+            store.append_block(p, h, b, slot + 1); // block_no 2,3,4
+        }
+        assert_eq!(
+            store.find_intersection(&[make_point(99), Point::Origin]),
+            None,
+            "anchored-above-genesis chain must not claim Origin"
+        );
     }
 
     #[test]
