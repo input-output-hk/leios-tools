@@ -59,6 +59,14 @@ pub enum NextForCursor {
     Gone,
 }
 
+/// How many recently rolled-back / evicted blocks to retain for BlockFetch
+/// after they leave the live chain. A downstream peer that adopted one of our
+/// headers via ChainSync may BlockFetch its body a moment later — if we've since
+/// reorged past it, the live chain no longer holds it and answering `NoBlocks`
+/// for a block we announced is a protocol violation the peer resets on. Keeping
+/// the bodies briefly lets us still serve them. ~13KB/block ⇒ a few MB here.
+const ORPHAN_CACHE_CAP: usize = 512;
+
 struct ChainStoreInner {
     blocks: VecDeque<StoredBlock>,
     capacity: usize,
@@ -67,6 +75,31 @@ struct ChainStoreInner {
     /// Tip point after the most recent rollback truncation. Server handlers use
     /// this as the MsgRollBackward target (the true fork point).
     last_rollback_target: Option<Point>,
+    /// Bodies of blocks recently removed from the live chain (rolled back or
+    /// evicted), retained so BlockFetch can still serve a block we announced
+    /// before a reorg. Bounded to `ORPHAN_CACHE_CAP`, newest at the back.
+    orphan_bodies: VecDeque<StoredBlock>,
+    /// True when this node joined the chain ABOVE genesis (sync-at-tip / from a
+    /// point), so its store will only ever hold blocks starting at some N>0.
+    /// Such a store must never offer or serve `Origin` to a downstream: while
+    /// still empty at boot it would otherwise claim to root at genesis, hand a
+    /// follower an `Origin` cursor, then mis-serve its first mid-chain block as
+    /// genesis's successor — which the follower rejects with UnexpectedBlockNo,
+    /// tearing the connection down. Set once at boot from the sync method.
+    anchored_above_genesis: bool,
+}
+
+impl ChainStoreInner {
+    /// Retain `removed` blocks (dropped from the live chain) in the orphan
+    /// cache for later BlockFetch, trimming oldest entries past the cap.
+    fn retain_orphans(&mut self, removed: impl IntoIterator<Item = StoredBlock>) {
+        for b in removed {
+            self.orphan_bodies.push_back(b);
+        }
+        while self.orphan_bodies.len() > ORPHAN_CACHE_CAP {
+            self.orphan_bodies.pop_front();
+        }
+    }
 }
 
 /// Thread-safe in-memory chain state.
@@ -92,10 +125,19 @@ impl ChainStore {
                 capacity,
                 block_no: 0,
                 last_rollback_target: None,
+                orphan_bodies: VecDeque::new(),
+                anchored_above_genesis: false,
             }),
             notify: notify_sender,
         });
         (store, notify_receiver)
+    }
+
+    /// Record that this node joined the chain above genesis (sync-at-tip / from
+    /// a point). A store so marked never offers or serves `Origin` to a
+    /// downstream follower — see the `anchored_above_genesis` field docs.
+    pub fn set_anchored_above_genesis(&self, anchored: bool) {
+        self.inner.lock().unwrap().anchored_above_genesis = anchored;
     }
 
     /// Append a block to the chain. Evicts the oldest block if over capacity.
@@ -119,7 +161,9 @@ impl ChainStore {
             body,
         });
         while inner.blocks.len() > inner.capacity {
-            inner.blocks.pop_front();
+            if let Some(evicted) = inner.blocks.pop_front() {
+                inner.retain_orphans([evicted]);
+            }
         }
         let count = inner.block_no;
         drop(inner);
@@ -133,15 +177,18 @@ impl ChainStore {
     pub fn rollback_to(&self, point: &Point) -> Point {
         let mut inner = self.inner.lock().unwrap();
         if *point == Point::Origin {
-            inner.blocks.clear();
+            let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
+            inner.retain_orphans(removed);
             inner.last_rollback_target = Some(Point::Origin);
             drop(inner);
             let _ = self.notify.send(0);
             return Point::Origin;
         }
-        // Find the position of the target point and truncate after it.
+        // Find the position of the target point and truncate after it, retaining
+        // the removed suffix (blocks we may have already announced) for BlockFetch.
         if let Some(pos) = inner.blocks.iter().position(|b| b.point == *point) {
-            inner.blocks.truncate(pos + 1);
+            let removed: Vec<StoredBlock> = inner.blocks.drain(pos + 1..).collect();
+            inner.retain_orphans(removed);
         }
         let tip_point = inner
             .blocks
@@ -159,7 +206,8 @@ impl ChainStore {
     pub fn rollback(&self, depth: usize) -> Point {
         let mut inner = self.inner.lock().unwrap();
         let new_len = inner.blocks.len().saturating_sub(depth);
-        inner.blocks.truncate(new_len);
+        let removed: Vec<StoredBlock> = inner.blocks.drain(new_len..).collect();
+        inner.retain_orphans(removed);
         let tip_point = inner
             .blocks
             .back()
@@ -220,8 +268,12 @@ impl ChainStore {
         // block at `block_no - (len - 1)`; it roots at genesis iff that is 0, i.e.
         // `block_no + 1 == len`. (block_no-based, not header parsing, so it holds
         // for opaque headers too.) Empty chain: nothing to mis-serve.
+        // A store that joined above genesis never roots at genesis, even while
+        // still empty at boot — offering Origin then would hand a follower a
+        // cursor we later mis-serve (see `anchored_above_genesis`).
         let len = inner.blocks.len() as u64;
-        let roots_at_genesis = len == 0 || inner.block_no + 1 == len;
+        let roots_at_genesis =
+            !inner.anchored_above_genesis && (len == 0 || inner.block_no + 1 == len);
         for candidate in points {
             if *candidate == Point::Origin {
                 if roots_at_genesis {
@@ -274,6 +326,18 @@ impl ChainStore {
                 None => return NextForCursor::Gone,
             },
         };
+        // Serving the front block (`after == 0`) means the follower is at
+        // Origin. A node that joined above genesis (sync-at-tip) must never do
+        // this: its front block is some N>0, and handing it to an Origin
+        // follower is rejected with UnexpectedBlockNo. A follower can hold an
+        // Origin cursor from when our store was still empty at boot, so guard
+        // the serve too (find_intersection stops OFFERING Origin) and await
+        // instead — the follower re-intersects at a real point once we hold one
+        // it shares. (A genesis-rooted node that merely evicted its early blocks
+        // is NOT anchored and keeps serving from the front, as before.)
+        if after == 0 && inner.anchored_above_genesis {
+            return NextForCursor::AtTip;
+        }
         match inner.blocks.get(after) {
             Some(b) => NextForCursor::Next(b.clone()),
             None => NextForCursor::AtTip,
@@ -312,17 +376,16 @@ impl ChainStore {
     /// Get blocks in a range (inclusive on both endpoints).
     pub fn get_range(&self, from: &Point, to: &Point) -> Vec<StoredBlock> {
         let inner = self.inner.lock().unwrap();
-        // Find `to` in the store. If not present (peer rolled back past
-        // that fork tip), return up to the chain tip — the common prefix
-        // blocks are still useful to the client.
-        let end = inner
-            .blocks
-            .iter()
-            .position(|b| b.point == *to)
-            .unwrap_or_else(|| inner.blocks.len().saturating_sub(1));
-        if inner.blocks.is_empty() {
-            return Vec::new();
-        }
+        // BlockFetch must serve exactly the requested tip, never a substitute.
+        // If `to` is not on the live chain (we reorged past it, or it was
+        // evicted), return empty so the caller serves the retained body via
+        // `get_orphans` instead. The old behaviour — streaming up to the
+        // current tip — hands the peer a block whose hash doesn't match the
+        // header it asked for, which it treats as a violation and resets on.
+        let end = match inner.blocks.iter().position(|b| b.point == *to) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
         // If `from` is on this chain, slice from there. Otherwise return the
         // whole prefix up to `end` — the client may be on a fork whose `from`
         // we don't know, and giving it the chain prefix lets it walk back
@@ -334,6 +397,24 @@ impl ChainStore {
             .filter(|&s| s <= end)
             .unwrap_or(0);
         inner.blocks.range(start..=end).cloned().collect()
+    }
+
+    /// BlockFetch fallback: serve blocks that have left the live chain (rolled
+    /// back or evicted) but are still in the orphan cache. Matches the requested
+    /// endpoints by point; for the common single-block request (`from == to`)
+    /// this returns that one body. Returns them oldest-first (chain order).
+    ///
+    /// This is what lets us honour a BlockFetch for a header we announced via
+    /// ChainSync and then reorged past: without it we would answer `NoBlocks`,
+    /// which the downstream treats as a protocol violation and resets on.
+    pub fn get_orphans(&self, from: &Point, to: &Point) -> Vec<StoredBlock> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .orphan_bodies
+            .iter()
+            .filter(|b| b.point == *from || b.point == *to)
+            .cloned()
+            .collect()
     }
 
     /// Produce ChainSync intersection candidates from the local chain,
@@ -439,6 +520,43 @@ mod tests {
         let tip = store.tip();
         assert_eq!(tip.point, p2);
         assert_eq!(tip.block_no, 2);
+    }
+
+    #[test]
+    fn rolled_back_block_still_servable_from_orphan_cache() {
+        // Announce-then-reorg: a block leaves the live chain via rollback but a
+        // downstream that saw its header must still be able to BlockFetch it,
+        // else we'd answer NoBlocks (a protocol violation the peer resets on).
+        let (store, _rx) = ChainStore::new(100);
+        let (p1, h1, b1) = make_block(1);
+        let (p2, h2, b2) = make_block(2);
+        store.append_block(p1.clone(), h1, b1, 1);
+        store.append_block(p2.clone(), h2, b2.clone(), 2);
+
+        // Reorg past block 2.
+        store.rollback_to(&p1);
+        assert!(store.get_range(&p2, &p2).is_empty(), "live chain dropped it");
+
+        // But the orphan cache still serves its body (single-block request).
+        let served = store.get_orphans(&p2, &p2);
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].point, p2);
+        assert_eq!(served[0].body.raw, b2.raw);
+    }
+
+    #[test]
+    fn evicted_block_retained_in_orphan_cache() {
+        // Capacity-eviction also feeds the orphan cache (helps a slow follower).
+        let (store, _rx) = ChainStore::new(2);
+        let (p1, h1, b1) = make_block(1);
+        let (p2, h2, b2) = make_block(2);
+        let (p3, h3, b3) = make_block(3);
+        store.append_block(p1.clone(), h1, b1, 1);
+        store.append_block(p2, h2, b2, 2);
+        store.append_block(p3, h3, b3, 3); // evicts p1
+
+        assert!(store.get_range(&p1, &p1).is_empty(), "p1 evicted from live");
+        assert_eq!(store.get_orphans(&p1, &p1).len(), 1, "p1 retained for fetch");
     }
 
     #[test]
@@ -693,6 +811,49 @@ mod tests {
     }
 
     #[test]
+    fn anchored_store_never_offers_or_serves_origin_when_empty() {
+        // Regression (boot relay race / UnexpectedBlockNo): a sync-at-tip node's
+        // store is EMPTY when a downstream first intersects. Without the anchored
+        // flag it would claim Origin (empty ⇒ "roots at genesis"), hand the
+        // follower an Origin cursor, then — once it injects its first mid-chain
+        // block N>0 — serve that as genesis's successor, which the follower
+        // rejects with UnexpectedBlockNo and resets the connection.
+        let (store, _rx) = ChainStore::new(100);
+        store.set_anchored_above_genesis(true);
+
+        // Empty anchored store: Origin is NOT offered as an intersection.
+        assert_eq!(
+            store.find_intersection(&[make_point(50), Point::Origin]),
+            None,
+            "empty anchored store must not offer Origin"
+        );
+        // And an Origin/None cursor is never served the front block.
+        assert!(matches!(
+            store.next_after_cursor(&None),
+            NextForCursor::AtTip
+        ));
+
+        // After injecting a mid-chain block (N>0), still no Origin mis-serve —
+        // the follower must re-intersect at a real point it shares with us.
+        let (p, h, b) = make_block(356);
+        store.append_block(p, h, b, 356);
+        assert!(
+            matches!(store.next_after_cursor(&None), NextForCursor::AtTip),
+            "anchored store must not serve its first mid-chain block to an Origin cursor"
+        );
+        assert_eq!(
+            store.find_intersection(&[Point::Origin]),
+            None,
+            "anchored store never claims Origin even once populated mid-chain"
+        );
+        // A follower that intersects at the real block WE hold is served forward.
+        assert_eq!(
+            store.find_intersection(&[make_point(356)]).map(|(p, _)| p),
+            Some(make_point(356))
+        );
+    }
+
+    #[test]
     fn find_intersection_no_match() {
         let (store, _rx) = ChainStore::new(100);
         for slot in 1..=3 {
@@ -738,18 +899,18 @@ mod tests {
     }
 
     #[test]
-    fn get_range_unknown_to_returns_available_blocks() {
+    fn get_range_unknown_to_returns_empty() {
         let (store, _rx) = ChainStore::new(100);
         for slot in 1..=3 {
             let (p, h, b) = make_block(slot);
             store.append_block(p, h, b, slot);
         }
 
-        // Both from and to are unknown — returns all available blocks
-        // (the peer rolled back past the requested tip but still has
-        // the common prefix).
+        // `to` is not on the live chain: BlockFetch must not substitute a
+        // different tip. Return empty here — the caller serves the requested
+        // body from the orphan cache (get_orphans) if it was reorged past.
         let range = store.get_range(&make_point(99), &make_point(100));
-        assert_eq!(range.len(), 3);
+        assert!(range.is_empty());
     }
 
     #[test]

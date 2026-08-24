@@ -1829,6 +1829,14 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         None => config.chain_store_capacity,
     };
     let (chain_store, _chain_rx) = ChainStore::new(chain_store_cap);
+    // A node that joins above genesis (sync-at-tip / from a point) must never
+    // offer or serve Origin to a downstream — its store holds only blocks N>0,
+    // and serving the first one to an Origin follower trips UnexpectedBlockNo.
+    // Only a genesis sync builds a genesis-rooted chain worth serving from Origin.
+    chain_store.set_anchored_above_genesis(!matches!(
+        config.sync_method,
+        super::SyncMethodConfig::Genesis
+    ));
 
     let leios_store = if config.leios_enabled {
         let (store, _leios_rx) = LeiosStore::new_with_retention(
