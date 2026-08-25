@@ -580,6 +580,20 @@ impl Coordinator {
             }
 
             PeerEvent::IntersectionFound { point, initial, block_no } => {
+                // The join point decides whether our serving store roots at
+                // genesis. `sync_method` alone can't tell: "sync to the tip" at a
+                // FRESH network resolves to Origin (we join AT genesis), while on a
+                // running network it resolves to a real block (we join ABOVE it).
+                // The static default (anchored = sync_method != Genesis) is the
+                // safe pre-intersection guess; correct it here from the resolved
+                // initial intersection. Joining at Origin ⇒ genesis-rooted ⇒ we
+                // MUST serve Origin so downstream peers can sync our chain from the
+                // start — otherwise a genesis-joined node refuses to serve its own
+                // chain and its blocks never propagate (slow / sporadic adoption).
+                if initial {
+                    self.chain_store
+                        .set_anchored_above_genesis(point != Point::Origin);
+                }
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
                     Some(peer.fragment.len())
