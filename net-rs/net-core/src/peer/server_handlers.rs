@@ -1156,6 +1156,23 @@ pub async fn serve_leios_fetch(
                     // CIP-0164: server should disconnect if it doesn't have the requested EB.
                     break;
                 };
+                // Log what we are about to put on the wire. A Haskell peer
+                // recomputes the EB's size from the decoded manifest and calls
+                // `error` on a mismatch, which tears down the WHOLE mux
+                // connection — so a single bad body costs every in-flight
+                // request too. Observed: "MsgLeiosBlock size mismatch: (1,2740)"
+                // — it decoded an empty manifest from a body we believe is 2740
+                // bytes. Record the length and CBOR prefix so the next
+                // occurrence says whether we served the wrong bytes or the
+                // framing is being read differently.
+                tracing::info!(
+                    peer = peer.0,
+                    %point,
+                    body_bytes = block.len(),
+                    cbor_prefix = %block.iter().take(4)
+                        .map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
+                    "leios_fetch: serving EB body"
+                );
                 if runner.send(&LfMsg::MsgLeiosBlock { block }).await.is_err() {
                     break;
                 }
