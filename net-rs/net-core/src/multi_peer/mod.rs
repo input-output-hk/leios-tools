@@ -34,6 +34,7 @@ pub use types::{NetworkCommand, NetworkEvent};
 use crate::mux::scheduler::{SchedulerType, TrafficClass};
 use crate::mux::ProtocolId;
 use crate::peer::PeerId;
+use crate::store::chain_store::ChainStore;
 use crate::store::leios_store::{LeiosStore, TxBodyResolver};
 
 /// Per-peer RTT measurement observer.  Invoked from the coordinator
@@ -170,6 +171,11 @@ pub struct CoordinatorHandle {
     /// Exposed so the application can read `LeiosStore::stats()` directly for
     /// per-slot memory telemetry rather than going through a command round-trip.
     pub leios_store: Option<Arc<LeiosStore>>,
+    /// Shared handle to the chain store. Exposed so a forging application can
+    /// read `ChainStore::chain_sync_consumers()` — how many peers are following
+    /// our chain, and therefore whether a block we forge can reach anyone at
+    /// all — without a command round-trip.
+    pub chain_store: Arc<ChainStore>,
     /// Per-peer chain-fragment sizes (point counts), maintained by the
     /// coordinator. Read this for per-slot memory telemetry on the
     /// multi-peer `ChainFragment` suspect — sum across peers gives total

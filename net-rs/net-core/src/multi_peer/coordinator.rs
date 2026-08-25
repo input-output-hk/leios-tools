@@ -1876,6 +1876,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         None
     };
 
+    let handle_chain_store = chain_store.clone();
     let coordinator = Coordinator::new(
         config,
         peer_event_sender,
@@ -1893,6 +1894,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         events: net_event_receiver,
         commands: net_cmd_sender,
         leios_store,
+        chain_store: handle_chain_store,
         fragment_sizes,
     }
 }

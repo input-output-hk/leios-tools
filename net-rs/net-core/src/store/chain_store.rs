@@ -468,6 +468,19 @@ impl ChainStore {
         self.notify.subscribe()
     }
 
+    /// How many peers are currently running a ChainSync **server** session
+    /// against us — i.e. how many peers could actually receive a block we
+    /// forge. `serve_chain_sync` holds one subscription per served peer, so
+    /// this is that count.
+    ///
+    /// Block diffusion is pull-based: a block reaches the network only because
+    /// some peer is following our chain. With no consumer, forging produces a
+    /// block nobody can fetch — it is orphaned, and anything we build on it
+    /// goes with it.
+    pub fn chain_sync_consumers(&self) -> usize {
+        self.notify.receiver_count()
+    }
+
     /// Get the total number of blocks that have been appended (including evicted).
     pub fn block_count(&self) -> u64 {
         self.inner.lock().unwrap().block_no

@@ -74,16 +74,30 @@ pub struct NotificationEntry {
     pub notification: LeiosNotification,
 }
 
-/// Key for block lookups.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Key for block lookups. `Ord` so retransmit bookkeeping can hold these in a
+/// `BTreeMap` and iterate oldest-slot-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct BlockKey {
     slot: u64,
     hash: [u8; 32],
 }
 
+/// Retransmit bookkeeping for an EB WE produced: when we first offered it,
+/// how many times we have re-offered, and whether any peer has fetched it.
+#[derive(Debug, Clone, Copy)]
+struct OwnOffer {
+    first_offered_slot: u64,
+    retries: u8,
+    fetched: bool,
+}
+
 struct LeiosStoreInner {
     /// Endorser blocks keyed by (slot, hash).
     blocks: HashMap<BlockKey, Vec<u8>>,
+    /// Retransmit state for locally produced EB offers, keyed like `blocks`.
+    /// Only our own EBs are tracked — re-offering a peer's EB back into the
+    /// network is not ours to do.
+    own_offers: BTreeMap<BlockKey, OwnOffer>,
     /// Transaction bodies per EB, keyed by manifest index. Sparse — a
     /// receiver accumulating partial bitmap responses populates only the
     /// indices it has seen so far. The producer populates `0..N` in one
@@ -220,6 +234,7 @@ impl LeiosStore {
         let store = Arc::new(Self {
             inner: Mutex::new(LeiosStoreInner {
                 blocks: HashMap::new(),
+                own_offers: BTreeMap::new(),
                 block_txs: HashMap::new(),
                 eb_tx_hashes: HashMap::new(),
                 votes: HashMap::new(),
@@ -259,11 +274,25 @@ impl LeiosStore {
             u32::MAX
         });
         let mut inner = self.inner.lock().unwrap();
-        let was_new = inner
-            .blocks
-            .insert(BlockKey { slot, hash }, block)
-            .is_none();
+        let key = BlockKey { slot, hash };
+        let was_new = inner.blocks.insert(key, block).is_none();
         inner.max_slot = inner.max_slot.max(slot);
+        // Start retransmit bookkeeping for an EB of our own. A `BlockOffer` is
+        // sent once per peer and `push_notification` deliberately drops any
+        // re-advertisement, so a peer whose fetch decision does not act on that
+        // single offer never requests the body — and an EB nobody fetches can
+        // never be voted on, let alone certified.
+        if source.is_none() && was_new {
+            let first_offered_slot = inner.max_slot;
+            inner.own_offers.insert(
+                key,
+                OwnOffer {
+                    first_offered_slot,
+                    retries: 0,
+                    fetched: false,
+                },
+            );
+        }
         Self::push_notification(
             &mut inner,
             source,
@@ -396,9 +425,100 @@ impl LeiosStore {
 
     /// Look up an endorser block by (slot, hash).
     pub fn get_block(&self, slot: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let key = BlockKey { slot, hash: *hash };
+        // Serving the body is our acknowledgement that the offer landed: stop
+        // retransmitting it (see `reoffer_unfetched`).
+        if let Some(own) = inner.own_offers.get_mut(&key) {
+            own.fetched = true;
+        }
         inner.blocks.get(&key).cloned()
+    }
+
+    /// Re-offer any EB of ours that no peer has fetched yet.
+    ///
+    /// A `BlockOffer` reaches each peer exactly once — `push_notification`
+    /// drops re-advertisements to keep wire traffic down — and the consumer
+    /// only requests the body if its fetch decision acts on that offer while
+    /// it is live. When it does not, the EB is never requested, never
+    /// validated, never voted on, and so never certified: measured on the
+    /// proto-devnet, the Haskell peers accepted the announcement and the offer
+    /// for 9 of 15 net-rs EBs and then sent no `MsgLeiosBlockRequest` at all,
+    /// with successes scattered through the run rather than stopping at a
+    /// cliff — the signature of a race, not an exhausted fetch budget.
+    ///
+    /// So retransmit, on the same principle as any unacknowledged send: re-push
+    /// the offer every `RETRY_INTERVAL_SLOTS` until a peer actually fetches the
+    /// body, at most `MAX_RETRIES` times. Serving the body counts as the
+    /// acknowledgement (`get_block`). Bounded on both axes, and entries age out
+    /// with the retention window, so a peer that never fetches costs a few
+    /// extra notifications rather than unbounded traffic.
+    ///
+    /// Only our OWN EBs are retransmitted; relaying someone else's is not ours
+    /// to do.
+    pub fn reoffer_unfetched(&self, current_slot: u64) {
+        /// Slots between retransmits. Comfortably longer than a fetch
+        /// round-trip on a local cluster, short enough to land several retries
+        /// inside the EB's voting window.
+        const RETRY_INTERVAL_SLOTS: u64 = 3;
+        /// Retransmits per EB, after the original offer.
+        const MAX_RETRIES: u8 = 3;
+
+        let mut inner = self.inner.lock().unwrap();
+        let cutoff = inner.max_slot.saturating_sub(inner.retention_slots);
+        // Forget anything aged out of retention, fetched or not: its body is
+        // gone from `blocks`, so re-offering it would advertise data we can no
+        // longer serve.
+        inner
+            .own_offers
+            .retain(|key, own| key.slot > cutoff && !own.fetched && own.retries < MAX_RETRIES);
+
+        let due: Vec<(BlockKey, u32)> = inner
+            .own_offers
+            .iter()
+            .filter(|(key, own)| {
+                let next_due = own.first_offered_slot
+                    + RETRY_INTERVAL_SLOTS * u64::from(own.retries + 1);
+                current_slot >= next_due && inner.blocks.contains_key(key)
+            })
+            .map(|(key, _)| {
+                let size = inner
+                    .blocks
+                    .get(key)
+                    .map(|b| u32::try_from(b.len()).unwrap_or(u32::MAX))
+                    .unwrap_or(0);
+                (*key, size)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for (key, eb_size) in due {
+            if let Some(own) = inner.own_offers.get_mut(&key) {
+                own.retries = own.retries.saturating_add(1);
+            }
+            let point = Point::Specific {
+                slot: key.slot,
+                hash: key.hash,
+            };
+            tracing::debug!(
+                slot = key.slot,
+                eb_size,
+                "re-offering EB no peer has fetched"
+            );
+            // `was_new = true` forces past the re-advertisement drop in
+            // `push_notification`: that guard exists to suppress redundant
+            // offers, and this offer is the opposite — the previous one
+            // demonstrably did not produce a fetch.
+            inner
+                .notifications
+                .push_back(NotificationEntry {
+                    sources: Vec::new(),
+                    notification: LeiosNotification::BlockOffer { point, eb_size },
+                });
+        }
+        Self::evict_old(&mut inner);
+        self.bump_version(&mut inner);
     }
 
     /// Record the ordered tx-hash list of an EB's manifest. Pairs with a
@@ -1671,5 +1791,84 @@ mod tests {
             vec![vec![0xA1, 0xA1], vec![0xB2, 0xB2]],
             "both distinct announcements diffuse; none deduplicated"
         );
+    }
+
+    /// An EB nobody fetches is re-offered, up to the retry cap; one that IS
+    /// fetched stops immediately. This is the difference between a peer that
+    /// missed a single offer eventually requesting the body and never
+    /// requesting it at all.
+    #[test]
+    fn unfetched_own_eb_is_reoffered_until_fetched_then_stops() {
+        let (store, _rx) = LeiosStore::new(64);
+        let hash = [7u8; 32];
+        let point = Point::Specific { slot: 10, hash };
+        store.inject_block(point.clone(), vec![0xAB; 128], None);
+
+        let count_offers = |store: &LeiosStore| {
+            let inner = store.inner.lock().unwrap();
+            inner
+                .notifications
+                .iter()
+                .filter(|e| matches!(&e.notification,
+                    LeiosNotification::BlockOffer { point: p, .. }
+                        if matches!(p, Point::Specific { slot, .. } if *slot == 10)))
+                .count()
+        };
+        assert_eq!(count_offers(&store), 1, "the original offer");
+
+        // Too soon: the retry interval has not elapsed.
+        store.reoffer_unfetched(11);
+        assert_eq!(count_offers(&store), 1, "must not retransmit early");
+
+        // Due at first_offered_slot + 3.
+        store.reoffer_unfetched(13);
+        assert_eq!(count_offers(&store), 2);
+        store.reoffer_unfetched(16);
+        assert_eq!(count_offers(&store), 3);
+
+        // A peer fetches it — that is the acknowledgement, so retransmits stop
+        // even though the cap has not been reached.
+        assert!(store.get_block(10, &hash).is_some());
+        store.reoffer_unfetched(19);
+        store.reoffer_unfetched(22);
+        assert_eq!(count_offers(&store), 3, "fetched EB must not be re-offered");
+    }
+
+    /// Retransmits are capped, so a peer that never fetches costs a bounded
+    /// number of extra notifications rather than an unbounded stream.
+    #[test]
+    fn reoffers_are_capped() {
+        let (store, _rx) = LeiosStore::new(64);
+        let point = Point::Specific { slot: 5, hash: [1u8; 32] };
+        store.inject_block(point, vec![0u8; 32], None);
+        for slot in 6..60 {
+            store.reoffer_unfetched(slot);
+        }
+        let inner = store.inner.lock().unwrap();
+        let offers = inner
+            .notifications
+            .iter()
+            .filter(|e| matches!(&e.notification, LeiosNotification::BlockOffer { .. }))
+            .count();
+        assert_eq!(offers, 4, "original offer + at most 3 retransmits");
+    }
+
+    /// A peer's EB is not ours to re-advertise.
+    #[test]
+    fn peer_ebs_are_never_reoffered() {
+        let (store, _rx) = LeiosStore::new(64);
+        let point = Point::Specific { slot: 8, hash: [2u8; 32] };
+        store.inject_block(point, vec![0u8; 32], Some(PeerId(1)));
+        for slot in 9..30 {
+            store.reoffer_unfetched(slot);
+        }
+        let inner = store.inner.lock().unwrap();
+        assert!(inner.own_offers.is_empty(), "no retransmit state for a peer's EB");
+        let offers = inner
+            .notifications
+            .iter()
+            .filter(|e| matches!(&e.notification, LeiosNotification::BlockOffer { .. }))
+            .count();
+        assert_eq!(offers, 1, "only the relayed offer");
     }
 }
