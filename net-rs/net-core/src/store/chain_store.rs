@@ -140,6 +140,21 @@ impl ChainStore {
         self.inner.lock().unwrap().anchored_above_genesis = anchored;
     }
 
+    /// Whether this store holds a servable chain yet. A node that joined above
+    /// genesis (sync-at-tip) intersects at the network tip immediately but does
+    /// not hold its first block until it has fetched + validated it — a window
+    /// of seconds at boot. During that window its `tip()` is `Origin`/genesis,
+    /// and answering a downstream's ChainSync intersection then advertises
+    /// tip=Genesis, which a downstream at a real tip rejects as `ForkTooDeep`
+    /// and cold-backs-off for minutes (orphaning every block we forge meanwhile
+    /// — see `serve_chainsync`). So an anchored store is "seeded" only once it
+    /// holds at least one block. A genesis-rooted node (`anchored = false`) is
+    /// legitimately at Origin from the start and is always seeded.
+    pub fn is_seeded(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        !inner.anchored_above_genesis || !inner.blocks.is_empty()
+    }
+
     /// Append a block to the chain. Evicts the oldest block if over capacity.
     /// `block_no` is the caller-provided chain height (not an internal counter).
     /// Returns `false` if the point is already stored (no-op).

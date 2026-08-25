@@ -101,6 +101,28 @@ pub async fn serve_chainsync(
                     candidates = points.len(),
                     "chainsync: downstream sent MsgFindIntersect (wants to sync chain from us)"
                 );
+                // Do not answer while our store is still empty at boot. A
+                // sync-at-tip node intersects at the network tip instantly but
+                // holds no block until it has fetched + validated its first one
+                // (seconds later). Answering now returns IntersectNotFound with
+                // tip=Genesis (our empty-store tip); a downstream at a real tip
+                // rejects that as ForkTooDeep and cold-backs-off for minutes,
+                // orphaning every block we forge in the gap (see is_seeded).
+                // Park the follower until we hold a real chain, then answer with
+                // a shared, recent intersection. A genesis-rooted node is always
+                // seeded, so it never waits.
+                if !store.is_seeded() {
+                    tracing::info!(
+                        peer = peer.0,
+                        "chainsync: store not seeded yet (syncing to tip); parking downstream intersect until we hold a chain"
+                    );
+                    while !store.is_seeded() {
+                        if subscription.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    tracing::info!(peer = peer.0, "chainsync: store seeded; answering parked intersect");
+                }
                 match store.find_intersection(&points) {
                     Some((point, tip)) => {
                         read_point = Some(point.clone());
@@ -1391,6 +1413,66 @@ mod tests {
         // Clean up.
         let _ = chainsync::done(&mut client).await;
         server_handle.await.ok();
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test]
+    async fn chainsync_server_parks_intersect_until_seeded() {
+        // Regression: a sync-at-tip node (anchored above genesis) whose store is
+        // still empty at boot must NOT answer a downstream's intersection yet —
+        // answering would advertise tip=Genesis, which a downstream at a real tip
+        // rejects as ForkTooDeep and then cold-backs-off for minutes, orphaning
+        // every block we forge in the gap. The server must park the intersect
+        // until the store holds a chain, then answer with the shared point.
+        let cs_proto = ProtocolConfig {
+            id: chainsync::PROTOCOL_ID,
+            traffic_class: TrafficClass::Priority,
+            ingress_limit: chainsync::INGRESS_LIMIT,
+            egress_queue_size: 16,
+        };
+        let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&cs_proto);
+
+        // Empty store, marked anchored-above-genesis (sync-at-tip pre-seed).
+        let (store, _rx) = ChainStore::new(100);
+        store.set_anchored_above_genesis(true);
+        assert!(!store.is_seeded(), "empty anchored store is not seeded");
+
+        let server_handle = tokio::spawn(serve_chainsync(
+            server_send,
+            server_recv,
+            store.clone(),
+            PeerId(0),
+            None,
+            crate::peer::new_downstream_flag(),
+        ));
+
+        // Client asks to intersect at a real point (+ Origin fallback).
+        let client_task = tokio::spawn(async move {
+            let mut client = Runner::<ChainSync>::new(Role::Client, client_send, client_recv);
+            chainsync::find_intersection(&mut client, vec![make_point(5), Point::Origin]).await
+        });
+
+        // While the store is empty the server must stay silent (parked).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !client_task.is_finished(),
+            "intersect must be parked while the store is unseeded (else ForkTooDeep)"
+        );
+
+        // Seed the store with the candidate block → wakes the parked intersect.
+        store.append_block(make_point(5), make_header(5), make_body(5, 50), 4);
+
+        // Now the parked intersect resolves to the shared real point — never Origin.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
+            .await
+            .expect("parked intersect must answer once seeded")
+            .expect("client task join");
+        let (point, _tip) = result.unwrap().unwrap();
+        assert_eq!(point, make_point(5), "must intersect at the shared point, not Origin");
+
+        server_handle.abort();
         mux_a.abort();
         mux_b.abort();
     }
