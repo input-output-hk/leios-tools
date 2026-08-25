@@ -147,6 +147,13 @@ pub enum PraosEffect {
         point: Point,
         body: Vec<u8>,
         prev_hash: Option<[u8; 32]>,
+        /// True when this is a block WE forged, rather than one received from
+        /// a peer. A simulated validator charges CPU cost for validating a
+        /// peer's block, but must not charge it for our own: we just built it
+        /// from a validated ledger state, and a real node adopts its own block
+        /// immediately. Paying that cost delays publishing the block we are
+        /// racing to diffuse — a handicap no other node on the network pays.
+        self_produced: bool,
     },
     /// Submit a rollback to the ledger validator
     /// (`LedgerCommand::Rollback`).
@@ -2372,10 +2379,12 @@ impl PraosState {
                 }
             }
         }
+        let self_produced = self.self_produced.contains(&point);
         fx.push(PraosEffect::ValidatorApply {
             point: point.clone(),
             body,
             prev_hash,
+            self_produced,
         });
         self.queued_validator_tip = Some(new_hash);
         self.adopted_tip_hash = Some(new_hash);
@@ -2984,10 +2993,15 @@ mod tests {
                 point,
                 body,
                 prev_hash,
+                self_produced,
             } => {
                 assert_eq!(*point, pt(100, 1));
                 assert_eq!(body, &vec![0xBB]);
                 assert_eq!(*prev_hash, None);
+                // The flag a simulated validator uses to skip charging CPU
+                // cost for a block we forged: getting it wrong here delays
+                // publishing our own block and loses the diffusion race.
+                assert!(self_produced, "our own block must be flagged self-produced");
             }
             other => panic!("expected ValidatorApply, got {other:?}"),
         }
