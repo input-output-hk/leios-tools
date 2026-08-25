@@ -1564,7 +1564,19 @@ impl Coordinator {
                 let ip = peer_addr.ip();
 
                 // Check per-IP connection limit.
-                {
+                //
+                // Loopback is exempt. The cap exists to stop one remote address
+                // from exhausting our connection slots; a peer on 127.0.0.1 is
+                // already on this machine, where an attacker has far better
+                // options than the accept loop. Meanwhile every local test
+                // cluster puts ALL its peers on loopback, so the cap fires on
+                // exactly the topology it was never meant to police: on the
+                // proto-devnet its three Haskell nodes plus reconnects exceed
+                // the default of 3, and the refused peer then sits in
+                // ouroboros-network's cold-peer backoff for ~13 minutes —
+                // during which the blocks we forge reach nobody and are
+                // orphaned wholesale.
+                if !ip.is_loopback() {
                     let counts = ip_counts.lock().expect("ip_counts lock poisoned");
                     if counts.get(&ip).copied().unwrap_or(0) >= max_connections_per_ip {
                         tracing::warn!("per-IP limit reached for {ip}, dropping connection");
