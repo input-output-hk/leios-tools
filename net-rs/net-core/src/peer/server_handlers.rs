@@ -346,7 +346,24 @@ pub async fn serve_blockfetch(
                     %to,
                     "blockfetch: downstream requested range (wants blocks from us)"
                 );
-                let blocks = store.get_range(&from, &to);
+                let mut blocks = store.get_range(&from, &to);
+                if blocks.is_empty() {
+                    // The live chain no longer holds the requested block — we
+                    // likely announced it via ChainSync and then reorged past
+                    // it. Serve the retained body so we don't answer NoBlocks
+                    // for a header we advertised (which resets the peer).
+                    let orphans = store.get_orphans(&from, &to);
+                    if !orphans.is_empty() {
+                        tracing::info!(
+                            peer = peer.0,
+                            %from,
+                            %to,
+                            count = orphans.len(),
+                            "blockfetch: serving reorged-past block(s) from orphan cache"
+                        );
+                        blocks = orphans;
+                    }
+                }
                 if !blocks.is_empty() {
                     let _ = runner.send(&BfMsg::MsgStartBatch).await;
                     for block in &blocks {
