@@ -181,4 +181,33 @@ pub struct CoordinatorHandle {
     /// multi-peer `ChainFragment` suspect — sum across peers gives total
     /// retained announcements; max gives the worst-case single peer.
     pub fragment_sizes: Arc<Mutex<HashMap<PeerId, usize>>>,
+    /// Per-peer downstream-promotion flags. A peer reaches `Hot` when it sends
+    /// `MsgFindIntersect` on our ChainSync **server** — i.e. when it actually
+    /// starts pulling our chain. Read this before forging: block diffusion is
+    /// pull-based, so with no hot downstream a forged block reaches nobody.
+    ///
+    /// Distinct from "a server session exists": our own outbound duplex
+    /// connection spawns a session immediately, so session counts read as
+    /// several consumers while the peers' ChainSync clients are still in
+    /// reconnect backoff.
+    pub downstream_flags: Arc<Mutex<HashMap<PeerId, crate::peer::DownstreamFlag>>>,
+}
+
+impl CoordinatorHandle {
+    /// Number of peers currently pulling our chain (downstream state `Hot`).
+    pub fn hot_downstream_count(&self) -> usize {
+        use crate::peer::DownstreamState;
+        use std::sync::atomic::Ordering;
+        self.downstream_flags
+            .lock()
+            .map(|m| {
+                m.values()
+                    .filter(|f| {
+                        matches!(DownstreamState::from_u8(f.load(Ordering::Relaxed)),
+                                 DownstreamState::Hot)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
 }

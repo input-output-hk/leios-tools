@@ -264,6 +264,11 @@ struct Coordinator {
     /// memory usage for per-slot telemetry without going through the
     /// command channel.
     fragment_sizes: Arc<Mutex<HashMap<PeerId, usize>>>,
+    /// Per-peer downstream-promotion flags, shared with `CoordinatorHandle` so
+
+    /// the application can count peers that are actually pulling our chain.
+
+    downstream_flags: Arc<Mutex<HashMap<PeerId, crate::peer::DownstreamFlag>>>,
     /// Completed inbound duplex connections from the accept loop. The third
     /// tuple element is the RAII guard holding the per-IP slot reservation;
     /// it is stored in the new `PeerState` once the connection is added.
@@ -332,6 +337,7 @@ impl Coordinator {
             chain_store,
             leios_store,
             fragment_sizes: Arc::new(Mutex::new(HashMap::new())),
+            downstream_flags: Arc::new(Mutex::new(HashMap::new())),
             inbound_connections: None,
             accept_task: None,
             ip_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -560,6 +566,16 @@ impl Coordinator {
                     return;
                 };
                 peer.mux_stats = Some(mux_stats);
+                // Publish the flag so a forging application can tell whether
+                // any peer is actually PULLING our chain. A server session
+                // existing is not enough: our own outbound duplex connection
+                // spawns one immediately, long before the peer's ChainSync
+                // client attaches, so counting sessions says "3 consumers"
+                // while nobody is listening.
+                self.downstream_flags
+                    .lock()
+                    .expect("downstream_flags mutex poisoned")
+                    .insert(peer_id, downstream.clone());
                 peer.downstream = Some(downstream);
                 peer.peer_sharing = peer_sharing;
                 // Record when the connection came up. The backoff is reset at
@@ -1273,6 +1289,10 @@ impl Coordinator {
                 );
             }
         }
+        self.downstream_flags
+            .lock()
+            .expect("downstream_flags mutex poisoned")
+            .remove(&peer_id);
         if let Some(peer) = self.peers.remove(&peer_id) {
             peer.task_handle.abort();
             if let Ok(mut map) = self.fragment_sizes.lock() {
@@ -1887,6 +1907,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         leios_store.clone(),
     );
     let fragment_sizes = coordinator.fragment_sizes.clone();
+    let downstream_flags = coordinator.downstream_flags.clone();
 
     tokio::spawn(coordinator.run());
 
@@ -1896,6 +1917,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         leios_store,
         chain_store: handle_chain_store,
         fragment_sizes,
+        downstream_flags,
     }
 }
 
