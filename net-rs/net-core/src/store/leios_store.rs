@@ -493,6 +493,12 @@ impl LeiosStore {
         if due.is_empty() {
             return;
         }
+        // Visible at info: whether this retransmit path fires at all is the
+        // difference between "the one-shot offer was the problem" and "it was
+        // not", and a debug-level line answers neither on a node running at
+        // info.
+        let mut reoffered = 0usize;
+        let still_unfetched = inner.own_offers.len();
         for (key, eb_size) in due {
             if let Some(own) = inner.own_offers.get_mut(&key) {
                 own.retries = own.retries.saturating_add(1);
@@ -506,6 +512,7 @@ impl LeiosStore {
                 eb_size,
                 "re-offering EB no peer has fetched"
             );
+            reoffered += 1;
             // `was_new = true` forces past the re-advertisement drop in
             // `push_notification`: that guard exists to suppress redundant
             // offers, and this offer is the opposite — the previous one
@@ -517,6 +524,11 @@ impl LeiosStore {
                     notification: LeiosNotification::BlockOffer { point, eb_size },
                 });
         }
+        tracing::info!(
+            reoffered,
+            still_unfetched,
+            "re-offered EB bodies no peer has fetched"
+        );
         Self::evict_old(&mut inner);
         self.bump_version(&mut inner);
     }
