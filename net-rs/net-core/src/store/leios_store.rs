@@ -533,29 +533,28 @@ impl LeiosStore {
         self.bump_version(&mut inner);
     }
 
-    /// Record the ordered tx-hash list of an EB's manifest. Pairs with a
-    /// `TxBodyResolver` so receivers can serve `MsgLeiosBlockTxsRequest`
-    /// without keeping the bodies in this store. Also pushes a
-    /// `BlockTxsOffer` notification so this node advertises tx availability
-    /// to downstream peers — that's how epidemic flooding extends beyond
-    /// the original producer.
-    pub fn record_eb_manifest(&self, point: Point, tx_hashes: Vec<TxId>, source: Option<PeerId>) {
+    /// Record the ordered tx-hash list of an EB's manifest (for our own
+    /// voting, and for serving via the `TxBodyResolver` when we actually
+    /// hold the bodies).
+    ///
+    /// This does NOT emit a `BlockTxsOffer`. Recording a manifest means we
+    /// know an EB's tx *hashes*, not that we hold its tx *bodies* — for a
+    /// relayed EB whose txs never entered our mempool (e.g. a peer's
+    /// overflow EB), the resolver can't produce them. Advertising txs we
+    /// can't serve makes peers request them, miss, and (per CIP-0164) get
+    /// disconnected — which collaterally drops their in-flight votes on our
+    /// OWN EBs, the exact cause of lost EB certifications. Offers are emitted
+    /// only by `inject_block_txs*`, which store the bodies, so we never
+    /// advertise what we can't serve. `_source` is retained for API
+    /// stability.
+    pub fn record_eb_manifest(&self, point: Point, tx_hashes: Vec<TxId>, _source: Option<PeerId>) {
         let (slot, hash) = match &point {
             Point::Specific { slot, hash } => (*slot, *hash),
             Point::Origin => return,
         };
         let mut inner = self.inner.lock().unwrap();
-        let was_new = inner
-            .eb_tx_hashes
-            .insert(BlockKey { slot, hash }, tx_hashes)
-            .is_none();
+        inner.eb_tx_hashes.insert(BlockKey { slot, hash }, tx_hashes);
         inner.max_slot = inner.max_slot.max(slot);
-        Self::push_notification(
-            &mut inner,
-            source,
-            LeiosNotification::BlockTxsOffer { point },
-            was_new,
-        );
         self.bump_version(&mut inner);
     }
 
@@ -796,15 +795,16 @@ impl LeiosStore {
             inner.notifications_pruned_count += 1;
         }
 
-        // Capacity backstop on `blocks` (independent of slot window).
+        // Capacity backstop on `blocks` (independent of slot window). Evict the
+        // OLDEST blocks first. `blocks` is a HashMap, whose `keys()` iterate in
+        // arbitrary order — taking the first N would drop random (possibly
+        // just-offered) EBs. Sort by BlockKey (slot, then hash) so we shed the
+        // lowest slots, matching the slot-window prune direction.
         if inner.blocks.len() > inner.capacity {
-            let to_remove: Vec<BlockKey> = inner
-                .blocks
-                .keys()
-                .take(inner.blocks.len() - inner.capacity)
-                .cloned()
-                .collect();
-            for key in to_remove {
+            let excess = inner.blocks.len() - inner.capacity;
+            let mut keys: Vec<BlockKey> = inner.blocks.keys().cloned().collect();
+            keys.sort_unstable(); // ascending BlockKey == oldest slot first
+            for key in keys.into_iter().take(excess) {
                 inner.blocks.remove(&key);
                 inner.block_txs.remove(&key);
                 info!("leios_store: removing old block_txs {}/{}", key.slot, hex_prefix(&key.hash));
@@ -1331,9 +1331,10 @@ mod tests {
             hash: [0x55; 32],
         };
         store.inject_block(point.clone(), vec![0xCC; 30], Some(PeerId(3)));
-        store.record_eb_manifest(
+        // BlockTxsOffer now comes only from a path that stores bodies.
+        store.inject_block_txs_full(
             point.clone(),
-            vec![TxId::new_with_array([0xDD; 32])],
+            vec![TxBody::new_with_vec(vec![0xDD])],
             Some(PeerId(4)),
         );
 
@@ -1350,9 +1351,11 @@ mod tests {
     }
 
     #[test]
-    fn record_eb_manifest_dedups_by_point_across_sources() {
-        // Same EB's manifest advertised by two peers must dedup into a
-        // single BlockTxsOffer entry with both peers as sources.
+    fn record_eb_manifest_does_not_offer_txs() {
+        // Recording a manifest means we know an EB's tx *hashes*, not that we
+        // hold its tx *bodies* — so it must NOT advertise a BlockTxsOffer, or
+        // we'd offer txs we can't serve (miss -> peer disconnect). Offers come
+        // only from inject_block_txs*, which store the bodies.
         let (store, _rx) = LeiosStore::new(100);
         let point = Point::Specific {
             slot: 9,
@@ -1363,15 +1366,18 @@ mod tests {
             vec![TxId::new_with_array([0x11; 32])],
             Some(PeerId(5)),
         );
-        store.record_eb_manifest(
-            point.clone(),
-            vec![TxId::new_with_array([0x11; 32])],
-            Some(PeerId(6)),
-        );
-
         let entries = store.notifications_after(&mut 0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sources, vec![PeerId(5), PeerId(6)]);
+        assert!(
+            entries
+                .iter()
+                .all(|e| !matches!(e.notification, LeiosNotification::BlockTxsOffer { .. })),
+            "record_eb_manifest must not emit a BlockTxsOffer"
+        );
+        // The manifest is still recorded for our own use (voting / resolver).
+        assert_eq!(
+            store.get_eb_manifest(9, &[0x99; 32]),
+            Some(vec![TxId::new_with_array([0x11; 32])])
+        );
     }
 
     #[test]
