@@ -602,6 +602,28 @@ impl LeiosState {
         crate::bitmap::from_indices(&missing)
     }
 
+    /// Points of EBs whose manifest is cached (`on_eb_received` ran) and
+    /// whose election is still live — i.e. the EBs a voter may still need
+    /// txs for.  The wrapper's per-slot loop uses this to *proactively*
+    /// drive an EB-txs fetch, instead of only reacting to a
+    /// `LeiosBlockTxsOffered` that may never arrive: an EB whose body
+    /// diffused (so the manifest is known) but for which no separate
+    /// txs-offer came would otherwise leave the voter stuck on
+    /// `MissingTX` forever.  The wrapper computes the missing-tx bitmap
+    /// (it owns the mempool) and calls [`Self::initiate_eb_txs_fetch`];
+    /// an empty bitmap (all txs present) is a no-op, and the per-slot
+    /// in-flight gate keeps repeats idempotent.
+    pub fn ebs_needing_tx_fetch(&self) -> Vec<Point> {
+        self.eb_tx_hashes
+            .iter()
+            .filter(|(hash, _)| self.elections.phase(hash).is_some())
+            .map(|(hash, (slot, _))| Point::Specific {
+                slot: *slot,
+                hash: *hash,
+            })
+            .collect()
+    }
+
     /// Replace the per-peer RTT oracle.
     pub fn set_rtt(&mut self, rtt: Box<dyn PeerRtt + Send + Sync>) {
         self.rtt = rtt;
