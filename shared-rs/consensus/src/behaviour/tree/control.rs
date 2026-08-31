@@ -26,6 +26,12 @@ pub struct ControlSignal {
     pub mempool: MempoolControl,
 }
 
+impl ControlSignal {
+    pub fn requires_tx_production(&self) -> bool {
+        self != &Self::default()
+    }
+}
+
 /// Praos-domain actuator inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PraosControl {
