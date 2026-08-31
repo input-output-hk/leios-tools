@@ -1156,7 +1156,11 @@ impl LeiosState {
 
     /// Initiate EB Tx fetch for `point`. Requires `bitmap` of requested transactions
     /// (should be computed before call).
-    fn initiate_eb_txs_fetch(
+    ///
+    /// `pub` because net-node's per-slot Leios reconciliation drives this
+    /// directly: it computes the outstanding-tx bitmap for each EB returned by
+    /// [`ebs_needing_tx_fetch`] (also `pub`) and initiates the fetch itself.
+    pub fn initiate_eb_txs_fetch(
         &mut self,
         point: &Point,
         bitmap: BTreeMap<u16, u64>,
