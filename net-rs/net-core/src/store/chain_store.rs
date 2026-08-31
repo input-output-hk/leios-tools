@@ -137,7 +137,17 @@ impl ChainStore {
     /// a point). A store so marked never offers or serves `Origin` to a
     /// downstream follower — see the `anchored_above_genesis` field docs.
     pub fn set_anchored_above_genesis(&self, anchored: bool) {
-        self.inner.lock().unwrap().anchored_above_genesis = anchored;
+        let count = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.anchored_above_genesis = anchored;
+            inner.blocks.len() as u64
+        };
+        // Flipping this flag can change `is_seeded()` (e.g. false->true when a
+        // node turns out to be genesis-rooted, `anchored = false`). A parked
+        // ChainSync server only re-checks `is_seeded()` on a watch notification,
+        // so wake it here — otherwise an already-parked `MsgFindIntersect` would
+        // wait forever.
+        let _ = self.notify.send(count);
     }
 
     /// Whether this store holds a servable chain yet. A node that joined above
@@ -414,20 +424,28 @@ impl ChainStore {
         inner.blocks.range(start..=end).cloned().collect()
     }
 
-    /// BlockFetch fallback: serve blocks that have left the live chain (rolled
-    /// back or evicted) but are still in the orphan cache. Matches the requested
-    /// endpoints by point; for the common single-block request (`from == to`)
-    /// this returns that one body. Returns them oldest-first (chain order).
+    /// BlockFetch fallback: serve a block that has left the live chain (rolled
+    /// back or evicted) but is still in the orphan cache. This exists for the
+    /// single-block reorged-past fetch (`from == to`) — honouring a BlockFetch
+    /// for a header we announced via ChainSync and then reorged past, so we do
+    /// not answer `NoBlocks` (which the downstream treats as a protocol
+    /// violation and resets on).
     ///
-    /// This is what lets us honour a BlockFetch for a header we announced via
-    /// ChainSync and then reorged past: without it we would answer `NoBlocks`,
-    /// which the downstream treats as a protocol violation and resets on.
+    /// BlockFetch is all-or-nothing: it must serve the exact requested sequence
+    /// or nothing. For a multi-block range (`from != to`) we return empty rather
+    /// than the endpoint blocks that happen to be cached — a partial/misaligned
+    /// range hands the peer a body whose hash doesn't match what it asked for.
+    /// (A future contiguous-range orphan fetch would need prev_hash verification
+    /// across the cache; the cache's purpose today is the single-block case.)
     pub fn get_orphans(&self, from: &Point, to: &Point) -> Vec<StoredBlock> {
+        if from != to {
+            return Vec::new();
+        }
         let inner = self.inner.lock().unwrap();
         inner
             .orphan_bodies
             .iter()
-            .filter(|b| b.point == *from || b.point == *to)
+            .filter(|b| b.point == *to)
             .cloned()
             .collect()
     }
