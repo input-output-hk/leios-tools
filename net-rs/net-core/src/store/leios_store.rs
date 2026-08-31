@@ -575,10 +575,6 @@ impl LeiosStore {
         peer_id: PeerId,
     ) -> Option<Vec<TxBody>> {
         let key = BlockKey { slot, hash: *hash };
-        let block_txs = {
-            let inner = self.inner.lock().unwrap();
-            inner.block_txs.get(&key).cloned()
-        };
         // Serve ONLY from stored bodies (`block_txs`): our own EBs — whose bodies
         // are pinned at produce time — and received EBs we have fully fetched.
         // We deliberately do NOT fall back to the mempool tx-body resolver: for a
@@ -587,13 +583,19 @@ impl LeiosStore {
         // mismatch that tears the mux connection down. Serve the COMPLETE
         // requested set in bitmap order, or `None` so the responder disconnects
         // (CIP-0164) — never a partial/misaligned or wrong-body response.
-        let Some(block_txs) = block_txs else {
-            return None;
+        //
+        // Select the requested indices under the lock and clone only those
+        // bodies (not the whole per-EB map) — the bitmap is usually a small
+        // subset. `total` is captured for the log without holding a clone.
+        let (selected, total): (Vec<TxBody>, usize) = {
+            let inner = self.inner.lock().unwrap();
+            let map = inner.block_txs.get(&key)?;
+            let selected = bitmap::iter_indices(bitmap)
+                .map(|i| map.get(&i).cloned())
+                .collect::<Option<Vec<TxBody>>>()?;
+            (selected, map.len())
         };
-        let selected: Vec<TxBody> = bitmap::iter_indices(bitmap)
-            .map(|i| block_txs.get(&i).cloned())
-            .collect::<Option<Vec<TxBody>>>()?;
-        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.len());
+        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), total);
         Some(selected)
     }
 
