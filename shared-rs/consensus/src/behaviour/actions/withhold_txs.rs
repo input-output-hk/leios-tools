@@ -19,13 +19,26 @@ pub struct WithholdTxs {
     /// * only if tx is produced by the current node (`true`)
     /// * for all txs in mempool (`false`)
     tx_producer_only: bool,
+
+    /// Withhold txs on the tx-submission protocol.
+    withhold_tx_submission: bool,
+
+    /// Withhold txs on the Leios fetch protocol.
+    withhold_leios_fetch: bool,
 }
 
 impl WithholdTxs {
-    pub fn new(delay_for_slots: u64, only_ours: bool) -> Self {
+    pub fn new(
+        delay_for_slots: u64,
+        only_ours: bool,
+        withhold_tx_submission: bool,
+        withhold_leios_fetch: bool,
+    ) -> Self {
         Self {
             withholding_slots: delay_for_slots,
             tx_producer_only: only_ours,
+            withhold_tx_submission,
+            withhold_leios_fetch,
         }
     }
 }
@@ -35,6 +48,8 @@ impl LeafAction<ConsensusCtx, ControlSignal> for WithholdTxs {
         out.mempool.tx_withholding_filter = TxWithholdingPolicy::WithholdTxs {
             withholding_slots: self.withholding_slots,
             tx_producer_only: self.tx_producer_only,
+            withhold_tx_submission: self.withhold_tx_submission,
+            withhold_leios_fetch: self.withhold_leios_fetch,
         };
         Status::Running
     }
@@ -49,6 +64,16 @@ impl LeafAction<ConsensusCtx, ControlSignal> for WithholdTxs {
             "tx_producer_only" => {
                 if let Some(b) = value.as_bool() {
                     self.tx_producer_only = b;
+                }
+            }
+            "withhold_tx_submission" => {
+                if let Some(b) = value.as_bool() {
+                    self.withhold_tx_submission = b;
+                }
+            }
+            "withhold_leios_fetch" => {
+                if let Some(b) = value.as_bool() {
+                    self.withhold_leios_fetch = b;
                 }
             }
             _ => {}
@@ -77,20 +102,22 @@ mod tests {
 
     #[test]
     fn installs_configured_tx_submission_withholding_filter() {
-        let (s, out) = run(&mut WithholdTxs::new(5, true));
+        let (s, out) = run(&mut WithholdTxs::new(5, true, true, false));
         assert_eq!(s, Status::Running);
         assert_eq!(
             out.mempool.tx_withholding_filter,
             TxWithholdingPolicy::WithholdTxs {
                 withholding_slots: 5,
                 tx_producer_only: true,
+                withhold_tx_submission: true,
+                withhold_leios_fetch: false,
             }
         );
     }
 
     #[test]
     fn touches_only_the_mempool_domain() {
-        let (_, out) = run(&mut WithholdTxs::new(3, false));
+        let (_, out) = run(&mut WithholdTxs::new(3, false, true, false));
         assert_eq!(out.praos, Default::default());
         assert_eq!(out.leios, Default::default());
     }

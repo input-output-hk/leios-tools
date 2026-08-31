@@ -80,9 +80,13 @@ pub fn build_action(
         ActionSpec::WithholdTxs {
             withholding_slots,
             tx_producer_only,
+            withhold_tx_submission,
+            withhold_leios_fetch,
         } => Box::new(catalogue::WithholdTxs::new(
             *withholding_slots,
             *tx_producer_only,
+            *withhold_tx_submission,
+            *withhold_leios_fetch,
         )),
         ActionSpec::DeepReorg { every_slots, depth } => {
             Box::new(catalogue::DeepReorg::new(*every_slots, *depth))
