@@ -345,17 +345,28 @@ impl CandidateTracker {
     
     /// EB-txs candidates excluding any peer we've already tried for
     /// this EB (used to advance the retry-after-partial-response flow).
+    ///
+    /// A peer that offered EB *transactions* (`note_eb_txs_offered`) is
+    /// the primary candidate, but a peer that offered the EB *body*
+    /// (`note_eb_offered`) also holds the referenced txs and can serve
+    /// them — so we fall back to (union in) the EB-body offerers. Without
+    /// this, an EB whose body diffused via `LeiosBlockOffered` but for
+    /// which no separate `LeiosBlockTxsOffered` ever arrived would have
+    /// no tx-fetch candidate at all: the voter knows the manifest, sees
+    /// the txs as absent, and can never vote (`MissingTX`).
     pub fn eb_txs_candidates(&self, point: &Point) -> Vec<PeerId> {
         let attempted = self.eb_txs_attempts.get(point);
-        self.eb_txs_offers
-            .get(point)
-            .map(|s| {
-                s.iter()
-                    .filter(|p| attempted.is_none_or(|a| !a.contains(p)))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut peers: BTreeSet<PeerId> = BTreeSet::new();
+        if let Some(s) = self.eb_txs_offers.get(point) {
+            peers.extend(s.iter().copied());
+        }
+        if let Some(s) = self.eb_offers.get(point) {
+            peers.extend(s.iter().copied());
+        }
+        peers
+            .into_iter()
+            .filter(|p| attempted.is_none_or(|a| !a.contains(p)))
+            .collect()
     }
 
     // -- In-flight fetch dedup ----------------------------------------------

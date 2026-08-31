@@ -18,7 +18,8 @@
 
 use std::fmt;
 
-use blst::min_sig::{PublicKey, SecretKey, Signature};
+use blst::min_sig::{AggregatePublicKey, AggregateSignature, PublicKey, SecretKey, Signature};
+use blst::BLST_ERROR;
 use leios_crypto_benchmarks::bls_vote::{
     check_pop, gen_cert_fa_pure, gen_sig, make_pop, verify_cert_fa_pure, verify_sig,
 };
@@ -177,6 +178,153 @@ pub fn verify_certificate(
     Ok(verify_cert_fa_pure(&refs, &eid_bytes(slot), eb_hash, &agg))
 }
 
+// ---------------------------------------------------------------------------
+// The deployed cardano-node construction
+// ---------------------------------------------------------------------------
+//
+// The functions above follow IOG's `leios_crypto_benchmarks` reference: DST
+// `b"Leios"`, the election id as blst's augmentation, and the EB hash as the
+// message. The node actually deployed on the Leios testnets signs votes
+// through `cardano-base`'s BLS12381 DSIGN instance instead
+// (`Cardano.Crypto.DSIGN.BLS12381.Internal`), which differs in all three:
+//
+// ```haskell
+// -- ouroboros-consensus  LeiosDemoTypes.signLeiosVote
+// voteSignature = signDSIGN leiosSignContext announcingRbHash sk
+// -- cardano-base  Cardano.Crypto.DSIGN.BLS12381.Internal
+// minSigPoPDST = BLS12381SignContext (Just "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_") Nothing
+// ```
+//
+//   * DST is the IETF minimal-signature-size proof-of-possession tag, not `b"Leios"`;
+//   * there is NO augmentation — the election is identified by the message itself;
+//   * the message is the **announcing RB hash**, not the EB hash.
+//
+// A vote built the reference way is therefore rejected by every real node, and
+// a certificate aggregating one fails the ledger's `verifyLeiosCert` with
+// `InvalidSignature`. Both constructions are kept: the reference one for the
+// simulator and for CIP-conformance work, and the pair below for talking to a
+// live network.
+
+/// The domain-separation tag a deployed cardano-node signs Leios votes under:
+/// `cardano-base`'s `minSigPoPDST`, the IETF minimal-signature-size
+/// proof-of-possession tag. There is no augmentation in this scheme.
+pub const CARDANO_VOTE_DST: &[u8] = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_";
+
+/// The bytes actually signed for an announcing RB hash.
+///
+/// `signDSIGN` signs `getSignableRepresentation msg`, and `RbHash`'s instance
+/// is `toStrictByteString . encodeRbHash` — a **CBOR byte string**, not the raw
+/// hash:
+///
+/// ```haskell
+/// encodeRbHash (MkRbHash bytes) = CBOR.encodeBytes bytes
+/// instance SignableRepresentation RbHash where
+///   getSignableRepresentation point = toStrictByteString $ encodeRbHash point
+/// ```
+///
+/// For a 32-byte hash that is the one-byte-length form `0x58 0x20 ‖ hash`, 34
+/// bytes in total. Signing the bare 32 bytes produces a signature no node
+/// accepts — the two-byte header is not cosmetic.
+fn rb_hash_signable(announcing_rb_hash: &[u8; 32]) -> [u8; 34] {
+    let mut msg = [0u8; 34];
+    msg[0] = 0x58; // CBOR major type 2 (byte string), one-byte length follows
+    msg[1] = 32; // the length
+    msg[2..].copy_from_slice(announcing_rb_hash);
+    msg
+}
+
+/// Sign a Leios vote the way a deployed cardano-node does: the announcing RB
+/// hash under [`CARDANO_VOTE_DST`], with no augmentation.
+///
+/// Internal: the public entry point is [`VoteSigner::sign_rb_vote`].
+pub(crate) fn sign_rb_vote(sk: &SecretKey, announcing_rb_hash: &[u8; 32]) -> [u8; SIGNATURE_SIZE] {
+    sk.sign(&rb_hash_signable(announcing_rb_hash), CARDANO_VOTE_DST, &[])
+        .to_bytes()
+}
+
+/// Verify a deployed-node Leios vote: `announcing_rb_hash` signed under
+/// [`CARDANO_VOTE_DST`] by the voter's registered key. Returns `Ok(false)` for
+/// a valid-but-wrong signature; `Err` if the key or signature does not decode.
+pub fn verify_rb_vote_bytes(
+    pubkey: &[u8; PUBLIC_KEY_SIZE],
+    announcing_rb_hash: &[u8; 32],
+    sig: &[u8; SIGNATURE_SIZE],
+) -> Result<bool, BlsError> {
+    let pk = public_key_from_bytes(pubkey)?;
+    let signature =
+        Signature::from_bytes(sig).map_err(|e| BlsError(format!("invalid signature: {e:?}")))?;
+    // `true`/`true`: group-check both the signature and the key. These arrive
+    // from the network, so neither is trusted to be on the curve.
+    Ok(
+        signature.verify(
+            true,
+            &rb_hash_signable(announcing_rb_hash),
+            CARDANO_VOTE_DST,
+            &[],
+            &pk,
+            true,
+        ) == BLST_ERROR::BLST_SUCCESS,
+    )
+}
+
+/// Aggregate deployed-node vote signatures into the 48-byte G1 aggregate that
+/// rides in a `leios_certificate`. Plain G1 point addition, matching
+/// `aggregateSigsDSIGN`. Errors on an empty set or a signature that does not
+/// decode.
+pub fn aggregate_rb_votes(sigs: &[[u8; SIGNATURE_SIZE]]) -> Result<[u8; SIGNATURE_SIZE], BlsError> {
+    if sigs.is_empty() {
+        return Err(BlsError("cannot aggregate zero signatures".into()));
+    }
+    let parsed: Vec<Signature> = sigs
+        .iter()
+        .map(|s| {
+            Signature::from_bytes(s).map_err(|e| BlsError(format!("invalid signature: {e:?}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&Signature> = parsed.iter().collect();
+    AggregateSignature::aggregate(&refs, true)
+        .map(|agg| agg.to_signature().to_bytes())
+        .map_err(|e| BlsError(format!("aggregation failed: {e:?}")))
+}
+
+/// Verify a `leios_certificate`'s aggregate against the signing members' keys,
+/// the way the ledger's `verifyLeiosCert` does: aggregate the verification
+/// keys, then check the aggregate signature over `announcing_rb_hash` under
+/// [`CARDANO_VOTE_DST`].
+///
+/// `pubkeys` must be exactly the members whose votes were aggregated — the ones
+/// the certificate's signers bitfield names. Their proofs of possession are
+/// assumed already checked (at committee selection), as in the ledger.
+pub fn verify_rb_certificate(
+    pubkeys: &[[u8; PUBLIC_KEY_SIZE]],
+    announcing_rb_hash: &[u8; 32],
+    aggregate: &[u8; SIGNATURE_SIZE],
+) -> Result<bool, BlsError> {
+    if pubkeys.is_empty() {
+        return Err(BlsError("cannot verify against zero keys".into()));
+    }
+    let pks: Vec<PublicKey> = pubkeys
+        .iter()
+        .map(public_key_from_bytes)
+        .collect::<Result<_, _>>()?;
+    let refs: Vec<&PublicKey> = pks.iter().collect();
+    let agg_pk = AggregatePublicKey::aggregate(&refs, true)
+        .map_err(|e| BlsError(format!("key aggregation failed: {e:?}")))?
+        .to_public_key();
+    let sig = Signature::from_bytes(aggregate)
+        .map_err(|e| BlsError(format!("invalid aggregate signature: {e:?}")))?;
+    Ok(
+        sig.verify(
+            true,
+            &rb_hash_signable(announcing_rb_hash),
+            CARDANO_VOTE_DST,
+            &[],
+            &agg_pk,
+            true,
+        ) == BLST_ERROR::BLST_SUCCESS,
+    )
+}
+
 /// Generate a proof of possession for a secret key: the two-signature PoP the
 /// Leios registration uses (reference `bls_vote::make_pop`). Returns
 /// `(mu1, mu2)` as 48-byte G1 signatures.
@@ -245,9 +393,18 @@ impl VoteSigner {
         public_key_of(&self.sk)
     }
 
-    /// Sign a vote for endorser block `eb_hash` at election `slot`.
+    /// Sign a vote for endorser block `eb_hash` at election `slot`, using the
+    /// `leios_crypto_benchmarks` reference construction. A live network will
+    /// not accept this — see [`sign_rb_vote`](Self::sign_rb_vote).
     pub fn sign_vote(&self, eb_hash: &[u8; 32], slot: u64) -> [u8; SIGNATURE_SIZE] {
         sign_vote(&self.sk, eb_hash, slot)
+    }
+
+    /// Sign a vote the way a deployed cardano-node does: over the announcing
+    /// RB hash, under [`CARDANO_VOTE_DST`], with no augmentation. This is the
+    /// signature a real network verifies and aggregates into a certificate.
+    pub fn sign_rb_vote(&self, announcing_rb_hash: &[u8; 32]) -> [u8; SIGNATURE_SIZE] {
+        sign_rb_vote(&self.sk, announcing_rb_hash)
     }
 
     /// Generate this key's proof of possession `(mu1, mu2)`.
@@ -413,6 +570,72 @@ mod tests {
         assert_eq!(
             verify_proof_of_possession_bytes(&other.public_key(), &mu1, &mu2),
             Ok(false)
+        );
+    }
+
+    /// The deployed-node construction, end to end: sign the announcing RB
+    /// hash, aggregate a quorum, verify the aggregate against the signers'
+    /// keys — exactly the shape `verifyLeiosCert` checks on chain.
+    #[test]
+    fn cardano_rb_vote_and_certificate_round_trip() {
+        let rb = [0x5au8; 32];
+        let signers: Vec<VoteSigner> =
+            (0..4).map(|i| VoteSigner::generate(&[i as u8 + 1; 32])).collect();
+        let sigs: Vec<[u8; SIGNATURE_SIZE]> =
+            signers.iter().map(|s| s.sign_rb_vote(&rb)).collect();
+        let keys: Vec<[u8; PUBLIC_KEY_SIZE]> =
+            signers.iter().map(|s| s.public_key()).collect();
+
+        for (sig, key) in sigs.iter().zip(&keys) {
+            assert_eq!(verify_rb_vote_bytes(key, &rb, sig), Ok(true));
+        }
+
+        let agg = aggregate_rb_votes(&sigs).expect("aggregate");
+        assert_eq!(verify_rb_certificate(&keys, &rb, &agg), Ok(true));
+
+        // A different RB hash, or a key set that is not exactly the signers,
+        // must fail — the two ways a producer gets a certificate wrong.
+        assert_eq!(verify_rb_certificate(&keys, &[0x99u8; 32], &agg), Ok(false));
+        assert_eq!(verify_rb_certificate(&keys[..3], &rb, &agg), Ok(false));
+    }
+
+    /// The two constructions are NOT interchangeable. This is the bug that
+    /// made every certificate net-rs published get rejected on chain, so pin
+    /// it: a reference-construction vote must not verify as a deployed-node
+    /// one, and vice versa.
+    #[test]
+    fn reference_and_cardano_constructions_are_distinct() {
+        let rb = [0x5au8; 32];
+        let signer = VoteSigner::generate(&[9u8; 32]);
+        let pk = signer.public_key();
+
+        // Same signer, same 32-byte message, different DST/augmentation.
+        let reference = signer.sign_vote(&rb, 0);
+        let cardano = signer.sign_rb_vote(&rb);
+        assert_ne!(reference, cardano);
+
+        assert_eq!(verify_rb_vote_bytes(&pk, &rb, &reference), Ok(false));
+        assert_eq!(verify_vote_bytes(&pk, &rb, 0, &cardano), Ok(false));
+    }
+
+    /// The DST is a wire constant: it is what a real node hashes the message
+    /// under, so a typo here silently invalidates every vote we cast.
+    /// The signed bytes are a CBOR byte string, not the bare hash. Pin the
+    /// exact 34-byte encoding: this two-byte header is the difference between
+    /// a vote the network counts and one it silently drops.
+    #[test]
+    fn rb_hash_signable_is_a_cbor_byte_string() {
+        let msg = rb_hash_signable(&[0xabu8; 32]);
+        assert_eq!(msg.len(), 34);
+        assert_eq!(&msg[..2], &[0x58, 0x20]);
+        assert_eq!(&msg[2..], &[0xabu8; 32]);
+    }
+
+    #[test]
+    fn cardano_dst_matches_cardano_base_min_sig_pop() {
+        assert_eq!(
+            CARDANO_VOTE_DST,
+            b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_POP_"
         );
     }
 }

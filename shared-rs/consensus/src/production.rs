@@ -105,7 +105,15 @@ impl BodyPath {
         if mempool.total_bytes > rb_body_max_bytes {
             // Overflow: fill the RB body first (skipped under cert per
             // CIP-0164), then announce the residual via a fresh EB.
-            let inline = if endorsement_present {
+            //
+            // `rb_body_max_bytes == 0` means "no inline body": put EVERYTHING in
+            // the EB, forging an empty RB body. `drain_up_to` always takes >=1 tx
+            // even at a 0 cap (correct for normal RB production), so a 0 cap is
+            // gated here instead. This keeps the knob monotonic (smaller cap =>
+            // fewer inline txs; 0 => none) and lets a producer route its whole
+            // mempool through the EB path (used to exercise EB-only tx delivery
+            // without any tx also landing in the validated RB body).
+            let inline = if endorsement_present || rb_body_max_bytes == 0 {
                 Vec::new()
             } else {
                 mempool.drain_up_to(rb_body_max_bytes)
@@ -214,6 +222,21 @@ mod tests {
         assert!(body.manifest.is_empty());
         assert_eq!(state.total_bytes, 0);
         assert_eq!(state.txs.len(), 0);
+    }
+
+    #[test]
+    fn zero_rb_cap_forges_empty_body_all_to_eb() {
+        // rb_body_max_bytes == 0 means "no inline body": every tx goes to the
+        // EB, the RB body is empty. (drain_up_to always takes >=1 even at cap 0,
+        // so BodyPath::decide gates the 0 case explicitly.)
+        let mut state = MempoolState::new(100);
+        let leios = empty_leios();
+        populate(&mut state, &[(1, 200), (2, 200), (3, 200)]);
+        let body = BodyPath::decide(&mut state, 0, EB_CAP, &leios, false);
+        assert!(body.inline.is_empty(), "0 cap => empty inline body");
+        assert_eq!(body.manifest.len(), 3, "all txs go to the EB manifest");
+        // Nothing drained to the body; all txs remain pending the EB commit.
+        assert_eq!(state.txs.len(), 3);
     }
 
     #[test]

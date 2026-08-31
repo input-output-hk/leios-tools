@@ -76,16 +76,22 @@ pub fn decode_overflow_eb(point: &Point, blob: &[u8]) -> Option<(Option<EbKey>, 
 }
 
 /// Encode an endorser-block manifest as the prototype
-/// `endorser_block = { tx_hash => tx_size }` map. Sizes are `0` (the produce
-/// path doesn't track per-tx sizes); the hash order is preserved for bitmap
-/// indexing. Pure over the manifest so the caller can hash the bytes to derive
-/// the EB key before committing the mempool drain.
-pub fn encode_overflow_eb(manifest: &[TxId]) -> Vec<u8> {
+/// `endorser_block = { tx_hash => tx_size }` map. `size_of` resolves each tx
+/// hash to its byte size; the hash order is preserved for bitmap indexing.
+/// Pure over the manifest so the caller can hash the bytes to derive the EB
+/// key before committing the mempool drain.
+///
+/// The per-tx size MUST be the real body byte size: a downstream (Haskell)
+/// Leios node sums these into its fetch byte-budget accounting, and a `0`
+/// where real bytes are then delivered underflows that counter — wrapping it
+/// to ~2^32 and permanently stalling all Leios fetch/certification on that
+/// node. Emitting the true size is what lets a peer certify our EBs.
+pub fn encode_overflow_eb(manifest: &[TxId], size_of: impl Fn(&TxId) -> u32) -> Vec<u8> {
     let mut data = Vec::new();
     let mut enc = minicbor::Encoder::new(&mut data);
     let _ = enc.map(manifest.len() as u64);
     for h in manifest {
-        let _ = enc.bytes(h.get_bytes()).and_then(|e| e.u32(0));
+        let _ = enc.bytes(h.get_bytes()).and_then(|e| e.u32(size_of(h)));
     }
     data
 }
@@ -106,8 +112,8 @@ mod tests {
             TxId::new_with_array([0x10u8; 32]),
             TxId::new_with_array([0x20u8; 32]),
         ];
-        let a = encode_overflow_eb(&manifest);
-        let b = encode_overflow_eb(&manifest);
+        let a = encode_overflow_eb(&manifest, |_| 0);
+        let b = encode_overflow_eb(&manifest, |_| 0);
         assert_eq!(a, b);
         assert_eq!(blake2b_256(&a), blake2b_256(&b));
     }
@@ -118,7 +124,7 @@ mod tests {
             TxId::new_with_array([0x10u8; 32]),
             TxId::new_with_array([0x20u8; 32]),
         ];
-        let data = encode_overflow_eb(&manifest);
+        let data = encode_overflow_eb(&manifest, |_| 0);
         let (_eb_key, hashes) = decode_overflow_eb(&BLANK_POINT, &data).expect("decode");
         assert_eq!(hashes, manifest);
     }
@@ -144,7 +150,7 @@ mod tests {
             TxId::new_with_array([0xAAu8; 32]),
             TxId::new_with_array([0xBBu8; 32]),
         ];
-        let data = encode_overflow_eb(&manifest);
+        let data = encode_overflow_eb(&manifest, |_| 0);
         // Decode the manifest map: { hash => size }, hashes in order.
         let mut dec = minicbor::Decoder::new(&data);
         let n = dec.map().unwrap().unwrap();

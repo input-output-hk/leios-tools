@@ -147,6 +147,13 @@ pub enum PraosEffect {
         point: Point,
         body: Vec<u8>,
         prev_hash: Option<[u8; 32]>,
+        /// True when this is a block WE forged, rather than one received from
+        /// a peer. A simulated validator charges CPU cost for validating a
+        /// peer's block, but must not charge it for our own: we just built it
+        /// from a validated ledger state, and a real node adopts its own block
+        /// immediately. Paying that cost delays publishing the block we are
+        /// racing to diffuse — a handicap no other node on the network pays.
+        self_produced: bool,
     },
     /// Submit a rollback to the ledger validator
     /// (`LedgerCommand::Rollback`).
@@ -388,6 +395,15 @@ pub struct PraosState {
     /// our sync frontier during catch-up). Used to classify whether a block
     /// is immutable (older than `tip - k`) for the EB-fetch trigger.
     pub highest_tip_block_no: u64,
+
+    /// Highest block number of any peer *header* we have rolled forward — the
+    /// accurate sync frontier. Unlike `highest_tip_block_no` (which tracks the
+    /// wire `Tip.block_no`, reported as 0/Origin during a peer's early blocks),
+    /// this is set from every rolled-forward `header_block_no`, so it reflects
+    /// how far the network has actually progressed as seen by us. The forge
+    /// gate (`is_caught_up`) uses this so we don't mint stale low blocks (0/1)
+    /// during initial sync when the wire tip under-reports the real height.
+    pub seen_header_frontier: u64,
 }
 
 impl PraosState {
@@ -444,6 +460,7 @@ impl PraosState {
             rtt,
             control: crate::behaviour::tree::control::ControlSignal::default(),
             highest_tip_block_no: 0,
+            seen_header_frontier: 0,
         }
     }
 
@@ -556,10 +573,34 @@ impl PraosState {
     }
 
     /// Block number to assign to the next self-produced block.
+    ///
+    /// With no adopted real block (forging from genesis), the first block is
+    /// number **0** — genesis is "before block 0", so its child is 0, matching
+    /// the Cardano/ouroboros convention (a real node forges its genesis child as
+    /// `BlockNo 0`). Numbering the genesis child 1 makes a real node reject our
+    /// header chain with `UnexpectedBlockNo (BlockNo 0) (BlockNo 1)` and drop the
+    /// connection, so our blocks never diffuse. Once we have adopted a real tip,
+    /// the next block is `tip.block_no + 1`.
+    ///
+    /// Bootstrap semantics (verified against Cardano sources, not this codebase):
+    /// **genesis is NOT a block** — the chain's Origin point has no block number
+    /// ("The origin does not have block number 0, it has no block number"; "the
+    /// genesis, which is not a block"), and the first *real* block has `BlockNo 0`
+    /// (cardano-db-sync PR #435, IntersectMBO). Nodes do NOT each mint their own
+    /// block 0 from the genesis config; block 0 is **forged by whichever pool wins
+    /// the VRF slot-leader lottery** and then diffused and **adopted via chain
+    /// selection** by everyone else (Ouroboros: only a slot's elected leader signs
+    /// that slot's block). So a mixed-start devnet correctly has a fork race at
+    /// height 0 — this node must run chain selection from Origin and adopt the
+    /// canonical early chain, NOT bootstrap an independent genesis fork. Forging a
+    /// block here is only legitimate when this node actually won the slot's VRF
+    /// election; the number it gets still follows the rule above.
+    /// Refs: cardano-db-sync PR #435; docs.cardano.org Ouroboros overview;
+    /// ouroboros-consensus report (Origin/point + chain selection).
     pub fn next_block_number(&self) -> u64 {
         self.adopted_tip_hash
             .and_then(|h| self.chain_tree.block_number(&h))
-            .map_or(1, |bn| bn + 1)
+            .map_or(0, |bn| bn + 1)
     }
 
     /// `(point, block_no)` of the adopted tip, if any.  Used by the I/O
@@ -761,6 +802,10 @@ impl PraosState {
         // `tip_block_no` is the producer's actual tip — needed to tell whether
         // a block is immutable (`tip - k`) for the EB-fetch trigger.
         self.highest_tip_block_no = self.highest_tip_block_no.max(tip_block_no);
+        // Accurate sync frontier: every rolled-forward header counts, even when
+        // the wire tip is Origin/0 (a peer's early blocks). Set before the
+        // early-return below so block-0/1 headers still advance it.
+        self.seen_header_frontier = self.seen_header_frontier.max(header_block_no);
 
         // The announced header may be an ancestor of `tip` while a peer
         // catches up.  Use whichever pair matches.
@@ -2334,10 +2379,12 @@ impl PraosState {
                 }
             }
         }
+        let self_produced = self.self_produced.contains(&point);
         fx.push(PraosEffect::ValidatorApply {
             point: point.clone(),
             body,
             prev_hash,
+            self_produced,
         });
         self.queued_validator_tip = Some(new_hash);
         self.adopted_tip_hash = Some(new_hash);
@@ -2648,7 +2695,8 @@ mod tests {
     fn new_state_is_empty() {
         let s = fresh();
         assert_eq!(s.tip_hash(), None);
-        assert_eq!(s.next_block_number(), 1);
+        // Genesis child is block 0 (genesis is "before block 0").
+        assert_eq!(s.next_block_number(), 0);
         assert_eq!(s.local_tip(), None);
     }
 
@@ -2945,10 +2993,15 @@ mod tests {
                 point,
                 body,
                 prev_hash,
+                self_produced,
             } => {
                 assert_eq!(*point, pt(100, 1));
                 assert_eq!(body, &vec![0xBB]);
                 assert_eq!(*prev_hash, None);
+                // The flag a simulated validator uses to skip charging CPU
+                // cost for a block we forged: getting it wrong here delays
+                // publishing our own block and loses the diffusion race.
+                assert!(self_produced, "our own block must be flagged self-produced");
             }
             other => panic!("expected ValidatorApply, got {other:?}"),
         }

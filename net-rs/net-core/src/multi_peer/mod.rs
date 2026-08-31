@@ -34,6 +34,7 @@ pub use types::{NetworkCommand, NetworkEvent};
 use crate::mux::scheduler::{SchedulerType, TrafficClass};
 use crate::mux::ProtocolId;
 use crate::peer::PeerId;
+use crate::store::chain_store::ChainStore;
 use crate::store::leios_store::{LeiosStore, TxBodyResolver};
 
 /// Per-peer RTT measurement observer.  Invoked from the coordinator
@@ -170,9 +171,43 @@ pub struct CoordinatorHandle {
     /// Exposed so the application can read `LeiosStore::stats()` directly for
     /// per-slot memory telemetry rather than going through a command round-trip.
     pub leios_store: Option<Arc<LeiosStore>>,
+    /// Shared handle to the chain store. Exposed so a forging application can
+    /// read `ChainStore::chain_sync_consumers()` — how many peers are following
+    /// our chain, and therefore whether a block we forge can reach anyone at
+    /// all — without a command round-trip.
+    pub chain_store: Arc<ChainStore>,
     /// Per-peer chain-fragment sizes (point counts), maintained by the
     /// coordinator. Read this for per-slot memory telemetry on the
     /// multi-peer `ChainFragment` suspect — sum across peers gives total
     /// retained announcements; max gives the worst-case single peer.
     pub fragment_sizes: Arc<Mutex<HashMap<PeerId, usize>>>,
+    /// Per-peer downstream-promotion flags. A peer reaches `Hot` when it sends
+    /// `MsgFindIntersect` on our ChainSync **server** — i.e. when it actually
+    /// starts pulling our chain. Read this before forging: block diffusion is
+    /// pull-based, so with no hot downstream a forged block reaches nobody.
+    ///
+    /// Distinct from "a server session exists": our own outbound duplex
+    /// connection spawns a session immediately, so session counts read as
+    /// several consumers while the peers' ChainSync clients are still in
+    /// reconnect backoff.
+    pub downstream_flags: Arc<Mutex<HashMap<PeerId, crate::peer::DownstreamFlag>>>,
+}
+
+impl CoordinatorHandle {
+    /// Number of peers currently pulling our chain (downstream state `Hot`).
+    pub fn hot_downstream_count(&self) -> usize {
+        use crate::peer::DownstreamState;
+        use std::sync::atomic::Ordering;
+        self.downstream_flags
+            .lock()
+            .map(|m| {
+                m.values()
+                    .filter(|f| {
+                        matches!(DownstreamState::from_u8(f.load(Ordering::Relaxed)),
+                                 DownstreamState::Hot)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
 }

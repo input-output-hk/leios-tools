@@ -264,6 +264,11 @@ struct Coordinator {
     /// memory usage for per-slot telemetry without going through the
     /// command channel.
     fragment_sizes: Arc<Mutex<HashMap<PeerId, usize>>>,
+    /// Per-peer downstream-promotion flags, shared with `CoordinatorHandle` so
+
+    /// the application can count peers that are actually pulling our chain.
+
+    downstream_flags: Arc<Mutex<HashMap<PeerId, crate::peer::DownstreamFlag>>>,
     /// Completed inbound duplex connections from the accept loop. The third
     /// tuple element is the RAII guard holding the per-IP slot reservation;
     /// it is stored in the new `PeerState` once the connection is added.
@@ -332,6 +337,7 @@ impl Coordinator {
             chain_store,
             leios_store,
             fragment_sizes: Arc::new(Mutex::new(HashMap::new())),
+            downstream_flags: Arc::new(Mutex::new(HashMap::new())),
             inbound_connections: None,
             accept_task: None,
             ip_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -560,6 +566,16 @@ impl Coordinator {
                     return;
                 };
                 peer.mux_stats = Some(mux_stats);
+                // Publish the flag so a forging application can tell whether
+                // any peer is actually PULLING our chain. A server session
+                // existing is not enough: our own outbound duplex connection
+                // spawns one immediately, long before the peer's ChainSync
+                // client attaches, so counting sessions says "3 consumers"
+                // while nobody is listening.
+                self.downstream_flags
+                    .lock()
+                    .expect("downstream_flags mutex poisoned")
+                    .insert(peer_id, downstream.clone());
                 peer.downstream = Some(downstream);
                 peer.peer_sharing = peer_sharing;
                 // Record when the connection came up. The backoff is reset at
@@ -580,6 +596,20 @@ impl Coordinator {
             }
 
             PeerEvent::IntersectionFound { point, initial, block_no } => {
+                // The join point decides whether our serving store roots at
+                // genesis. `sync_method` alone can't tell: "sync to the tip" at a
+                // FRESH network resolves to Origin (we join AT genesis), while on a
+                // running network it resolves to a real block (we join ABOVE it).
+                // The static default (anchored = sync_method != Genesis) is the
+                // safe pre-intersection guess; correct it here from the resolved
+                // initial intersection. Joining at Origin ⇒ genesis-rooted ⇒ we
+                // MUST serve Origin so downstream peers can sync our chain from the
+                // start — otherwise a genesis-joined node refuses to serve its own
+                // chain and its blocks never propagate (slow / sporadic adoption).
+                if initial {
+                    self.chain_store
+                        .set_anchored_above_genesis(point != Point::Origin);
+                }
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
                     Some(peer.fragment.len())
@@ -1259,6 +1289,10 @@ impl Coordinator {
                 );
             }
         }
+        self.downstream_flags
+            .lock()
+            .expect("downstream_flags mutex poisoned")
+            .remove(&peer_id);
         if let Some(peer) = self.peers.remove(&peer_id) {
             peer.task_handle.abort();
             if let Ok(mut map) = self.fragment_sizes.lock() {
@@ -1550,7 +1584,19 @@ impl Coordinator {
                 let ip = peer_addr.ip();
 
                 // Check per-IP connection limit.
-                {
+                //
+                // Loopback is exempt. The cap exists to stop one remote address
+                // from exhausting our connection slots; a peer on 127.0.0.1 is
+                // already on this machine, where an attacker has far better
+                // options than the accept loop. Meanwhile every local test
+                // cluster puts ALL its peers on loopback, so the cap fires on
+                // exactly the topology it was never meant to police: on the
+                // proto-devnet its three Haskell nodes plus reconnects exceed
+                // the default of 3, and the refused peer then sits in
+                // ouroboros-network's cold-peer backoff for ~13 minutes —
+                // during which the blocks we forge reach nobody and are
+                // orphaned wholesale.
+                if !ip.is_loopback() {
                     let counts = ip_counts.lock().expect("ip_counts lock poisoned");
                     if counts.get(&ip).copied().unwrap_or(0) >= max_connections_per_ip {
                         tracing::warn!("per-IP limit reached for {ip}, dropping connection");
@@ -1829,6 +1875,14 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         None => config.chain_store_capacity,
     };
     let (chain_store, _chain_rx) = ChainStore::new(chain_store_cap);
+    // A node that joins above genesis (sync-at-tip / from a point) must never
+    // offer or serve Origin to a downstream — its store holds only blocks N>0,
+    // and serving the first one to an Origin follower trips UnexpectedBlockNo.
+    // Only a genesis sync builds a genesis-rooted chain worth serving from Origin.
+    chain_store.set_anchored_above_genesis(!matches!(
+        config.sync_method,
+        super::SyncMethodConfig::Genesis
+    ));
 
     let leios_store = if config.leios_enabled {
         let (store, _leios_rx) = LeiosStore::new_with_retention(
@@ -1842,6 +1896,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         None
     };
 
+    let handle_chain_store = chain_store.clone();
     let coordinator = Coordinator::new(
         config,
         peer_event_sender,
@@ -1852,6 +1907,7 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         leios_store.clone(),
     );
     let fragment_sizes = coordinator.fragment_sizes.clone();
+    let downstream_flags = coordinator.downstream_flags.clone();
 
     tokio::spawn(coordinator.run());
 
@@ -1859,7 +1915,9 @@ pub fn spawn_coordinator(config: CoordinatorConfig) -> CoordinatorHandle {
         events: net_event_receiver,
         commands: net_cmd_sender,
         leios_store,
+        chain_store: handle_chain_store,
         fragment_sizes,
+        downstream_flags,
     }
 }
 
@@ -3615,37 +3673,25 @@ mod tests {
         drop(net_event_receiver);
     }
 
-    /// After `RecordLeiosEbManifest`, the LeiosStore should be able to
-    /// serve `get_block_txs` by resolving each requested hash through
-    /// the configured `TxBodyResolver`.
+    /// After `RecordLeiosEbManifest` with no stored bodies, the EB must NOT be
+    /// servable: `get_block_txs` serves from `block_txs` only and never resolves
+    /// the manifest against the mempool `TxBodyResolver` (resolver-guessed bodies
+    /// for a received EB mismatch on the wire and tear the mux down).
     #[tokio::test]
-    async fn record_leios_eb_manifest_enables_resolver_backed_serve() {
-        use crate::store::leios_store::TxBodyResolver;
-
-        struct StubResolver(HashMap<TxId, TxBody>);
-        impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, _slot: u64, tx_id: &TxId) -> Option<TxBody> {
-                self.0.get(tx_id).cloned()
-            }
-        }
-
+    async fn record_leios_eb_manifest_alone_is_not_servable() {
+        // Recording an EB manifest WITHOUT stored bodies must NOT make the EB
+        // servable: serving is from `block_txs` only, never by resolving the
+        // manifest against the mempool (that served wrong bodies for received
+        // EBs and tore the mux down).
         let h0 = [0x01u8; 32];
         let h1 = [0x02u8; 32];
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(
-            [
-                (TxId::new_with_array(h0), TxBody::new_with_vec(vec![10u8])),
-                (TxId::new_with_array(h1), TxBody::new_with_vec(vec![20u8])),
-            ]
-            .into_iter()
-            .collect(),
-        ));
 
         let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
         let (net_event_sender, _net_event_receiver) = mpsc::channel(NETWORK_EVENTS_CAPACITY);
         let (net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
         let config = CoordinatorConfig::default();
         let (chain_store, _chain_rx) = ChainStore::new(100);
-        let (leios_store, _leios_rx) = LeiosStore::new_with_resolver(100, Some(resolver.clone()));
+        let (leios_store, _leios_rx) = LeiosStore::new(100);
         let coordinator = Coordinator::new(
             config,
             peer_event_sender,
@@ -3672,24 +3718,25 @@ mod tests {
             .await
             .expect("command should accept");
 
-        // Poll until the manifest is stored.
+        // Poll until the coordinator has actually recorded the manifest (a
+        // positive signal that processing completed — no fixed sleep, which
+        // flakes on loaded CI), then confirm the EB is still NOT servable: we
+        // hold the manifest but no bodies.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1]);
-        let mut got = None;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            if let Some(stored) = leios_store.get_block_txs(4, &eb_hash, &bitmap, PeerId(10)) {
-                if !stored.is_empty() {
-                    got = Some(stored);
-                    break;
-                }
+        let mut recorded = false;
+        for _ in 0..100 {
+            if leios_store.get_eb_manifest(4, &eb_hash).is_some() {
+                recorded = true;
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            got,
-            Some(vec![
-                TxBody::new_with_vec(vec![10u8]),
-                TxBody::new_with_vec(vec![20u8])
-            ])
+        assert!(recorded, "coordinator should have recorded the manifest within 1s");
+        assert!(
+            leios_store
+                .get_block_txs(4, &eb_hash, &bitmap, PeerId(10))
+                .is_none(),
+            "manifest without bodies must not be servable"
         );
 
         net_cmd_sender
@@ -3807,14 +3854,19 @@ mod tests {
             )
             .await;
 
-        // Bodies are merged at the right positions.
-        let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1, 2]);
+        // The fetched bodies are merged at their manifest positions (0 and 2).
+        // Requesting exactly those two serves them from block_txs, ascending —
+        // confirming the reinjection landed at the right positions.
+        let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 2]);
         let got = leios_store
             .get_block_txs(12, &eb_hash, &bitmap, PeerId(41))
-            .expect("store should know about EB");
-        // Index 1 is missing (we never fetched it); union returns just
-        // 0 and 2 in ascending order.
+            .expect("store should serve the fetched-and-merged bodies");
         assert_eq!(got, vec![body0.clone(), body2.clone()]);
+        // Index 1 was never fetched, so a request that includes it is unservable.
+        let bitmap_all = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1, 2]);
+        assert!(leios_store
+            .get_block_txs(12, &eb_hash, &bitmap_all, PeerId(41))
+            .is_none());
 
         // The application also gets the original event with all bodies.
         match net_event_receiver.try_recv().expect("event emitted") {

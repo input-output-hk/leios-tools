@@ -1,10 +1,16 @@
 //! Sparse `BTreeMap<u16, u64>` bitmap used by `MsgLeiosBlockTxsRequest`.
 //!
 //! Per CIP-0164: each entry maps a 16-bit segment index to a 64-bit
-//! mask, and the offset of the mask's first bit is `64 * segment`.
-//! Transaction `i` is selected iff bit `i % 64` of `bitmap[i / 64]`
-//! is set.  Empty bitmap selects nothing; use [`select_all`] for "every
-//! tx".
+//! mask, and the offset of the mask's **first bit** is `64 * segment`.
+//! The "first bit" is the **most-significant** bit (bit 63): transaction
+//! `i` is selected iff bit `63 - (i % 64)` of `bitmap[i / 64]` is set —
+//! i.e. bits are numbered **MSB-first** within each 64-bit segment, so
+//! the lowest tx index in a segment occupies the high bit. This matches
+//! the Haskell reference node on the wire (an earlier LSB-first reading
+//! here silently mis-served every `MsgLeiosBlockTxsRequest`: a request
+//! for txs `0..8` arrives as mask `0xFF00_0000_0000_0000`, which the
+//! LSB reading decoded as indices `56..63`). Empty bitmap selects
+//! nothing; use [`select_all`] for "every tx".
 //!
 //! Lives in shared-consensus because the trait surface
 //! ([`crate::fetch::EbTxsFetchPolicy::pick`] and friends) already speaks
@@ -14,17 +20,24 @@
 
 use std::collections::BTreeMap;
 
-/// Bit `i` of the segment mask corresponds to absolute index `64*seg + i`.
+/// Number of bits per segment. Absolute index `64*seg + i` maps to
+/// segment `seg`, bit `63 - i` (MSB-first — see the module docs).
 const SEGMENT_BITS: u32 = 64;
+
+/// The segment bit that carries absolute `index` (MSB-first within the
+/// segment: index `64*seg` is bit 63, `64*seg + 63` is bit 0).
+#[inline]
+fn seg_bit(index: u32) -> u32 {
+    (SEGMENT_BITS - 1) - (index % SEGMENT_BITS)
+}
 
 /// Build a sparse bitmap with the given indices set.
 pub fn from_indices(indices: &[u32]) -> BTreeMap<u16, u64> {
     let mut bitmap: BTreeMap<u16, u64> = BTreeMap::new();
     for &index in indices {
         let segment = (index / SEGMENT_BITS) as u16;
-        let bit = index % SEGMENT_BITS;
         let entry = bitmap.entry(segment).or_insert(0);
-        *entry |= 1u64 << bit;
+        *entry |= 1u64 << seg_bit(index);
     }
     bitmap
 }
@@ -38,7 +51,9 @@ pub fn select_all(count: u32) -> BTreeMap<u16, u64> {
         bitmap.insert(seg as u16, u64::MAX);
     }
     if remainder > 0 {
-        let mask = (1u64 << remainder) - 1;
+        // MSB-first: the first `remainder` indices are the top `remainder`
+        // bits. e.g. remainder 8 -> 0xFF00_0000_0000_0000.
+        let mask = !((1u64 << (SEGMENT_BITS - remainder)) - 1);
         bitmap.insert(full_segments as u16, mask);
     }
     bitmap
@@ -47,10 +62,9 @@ pub fn select_all(count: u32) -> BTreeMap<u16, u64> {
 /// True iff `index` is selected by the bitmap.
 pub fn contains(bitmap: &BTreeMap<u16, u64>, index: u32) -> bool {
     let segment = (index / SEGMENT_BITS) as u16;
-    let bit = index % SEGMENT_BITS;
     bitmap
         .get(&segment)
-        .map(|mask| mask & (1u64 << bit) != 0)
+        .map(|mask| mask & (1u64 << seg_bit(index)) != 0)
         .unwrap_or(false)
 }
 
@@ -58,9 +72,11 @@ pub fn contains(bitmap: &BTreeMap<u16, u64>, index: u32) -> bool {
 pub fn iter_indices(bitmap: &BTreeMap<u16, u64>) -> impl Iterator<Item = u32> + '_ {
     bitmap.iter().flat_map(|(&segment, &mask)| {
         let base = segment as u32 * SEGMENT_BITS;
-        (0..SEGMENT_BITS).filter_map(move |bit| {
+        // MSB-first: bit 63 is index 0 of the segment. Walk bits high→low
+        // so the yielded absolute indices ascend.
+        (0..SEGMENT_BITS).rev().filter_map(move |bit| {
             if mask & (1u64 << bit) != 0 {
-                Some(base + bit)
+                Some(base + (SEGMENT_BITS - 1 - bit))
             } else {
                 None
             }
@@ -74,10 +90,12 @@ mod tests {
 
     #[test]
     fn from_indices_packs_bits_into_segments() {
+        // MSB-first: index 0 -> bit 63, index 1 -> bit 62, index 63 -> bit 0.
         let bitmap = from_indices(&[0, 1, 63, 64, 65, 200]);
-        assert_eq!(bitmap[&0], (1u64 << 0) | (1u64 << 1) | (1u64 << 63));
-        assert_eq!(bitmap[&1], (1u64 << 0) | (1u64 << 1));
-        assert_eq!(bitmap[&3], 1u64 << 8);
+        assert_eq!(bitmap[&0], (1u64 << 63) | (1u64 << 62) | (1u64 << 0));
+        assert_eq!(bitmap[&1], (1u64 << 63) | (1u64 << 62));
+        // index 200 -> segment 3, bit 63 - (200 % 64) = 63 - 8 = 55.
+        assert_eq!(bitmap[&3], 1u64 << 55);
         assert_eq!(bitmap.len(), 3);
     }
 
@@ -99,10 +117,11 @@ mod tests {
     }
 
     #[test]
-    fn select_all_partial_segment_uses_low_bits() {
+    fn select_all_partial_segment_uses_high_bits() {
+        // MSB-first: the first 3 indices occupy the top 3 bits.
         let bitmap = select_all(3);
         assert_eq!(bitmap.len(), 1);
-        assert_eq!(bitmap[&0], 0b111);
+        assert_eq!(bitmap[&0], (1u64 << 63) | (1u64 << 62) | (1u64 << 61));
     }
 
     #[test]
@@ -118,7 +137,8 @@ mod tests {
         assert_eq!(bitmap.len(), 3);
         assert_eq!(bitmap[&0], u64::MAX);
         assert_eq!(bitmap[&1], u64::MAX);
-        assert_eq!(bitmap[&2], 0b11);
+        // MSB-first: the 2 remaining indices are the top 2 bits.
+        assert_eq!(bitmap[&2], (1u64 << 63) | (1u64 << 62));
     }
 
     #[test]

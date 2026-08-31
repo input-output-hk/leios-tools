@@ -74,16 +74,30 @@ pub struct NotificationEntry {
     pub notification: LeiosNotification,
 }
 
-/// Key for block lookups.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Key for block lookups. `Ord` so retransmit bookkeeping can hold these in a
+/// `BTreeMap` and iterate oldest-slot-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct BlockKey {
     slot: u64,
     hash: [u8; 32],
 }
 
+/// Retransmit bookkeeping for an EB WE produced: when we first offered it,
+/// how many times we have re-offered, and whether any peer has fetched it.
+#[derive(Debug, Clone, Copy)]
+struct OwnOffer {
+    first_offered_slot: u64,
+    retries: u8,
+    fetched: bool,
+}
+
 struct LeiosStoreInner {
     /// Endorser blocks keyed by (slot, hash).
     blocks: HashMap<BlockKey, Vec<u8>>,
+    /// Retransmit state for locally produced EB offers, keyed like `blocks`.
+    /// Only our own EBs are tracked — re-offering a peer's EB back into the
+    /// network is not ours to do.
+    own_offers: BTreeMap<BlockKey, OwnOffer>,
     /// Transaction bodies per EB, keyed by manifest index. Sparse — a
     /// receiver accumulating partial bitmap responses populates only the
     /// indices it has seen so far. The producer populates `0..N` in one
@@ -180,9 +194,13 @@ pub const MAX_NOTIFICATIONS: usize = 10_000;
 pub struct LeiosStore {
     inner: Mutex<LeiosStoreInner>,
     notify: watch::Sender<u64>,
-    /// Optional callback that resolves a tx body by its hash. Used to
-    /// serve EB tx requests for EBs whose manifest is cached locally
-    /// but whose full bodies aren't (i.e. receivers, not producers).
+    /// Optional callback that resolves a tx body by its hash. Retained as an
+    /// extension point: `get_block_txs` now serves EB txs ONLY from stored
+    /// `block_txs` (own EBs pinned at produce time, received EBs fully fetched),
+    /// because resolving a received EB's manifest against the mempool served
+    /// wrong bodies (`MsgLeiosBlockTxs` hash mismatch → connection tear-down). A
+    /// future hash-verified resolver could reuse this hook.
+    #[allow(dead_code)]
     tx_body_resolver: Option<Arc<dyn TxBodyResolver>>,
 }
 
@@ -216,6 +234,7 @@ impl LeiosStore {
         let store = Arc::new(Self {
             inner: Mutex::new(LeiosStoreInner {
                 blocks: HashMap::new(),
+                own_offers: BTreeMap::new(),
                 block_txs: HashMap::new(),
                 eb_tx_hashes: HashMap::new(),
                 votes: HashMap::new(),
@@ -255,11 +274,25 @@ impl LeiosStore {
             u32::MAX
         });
         let mut inner = self.inner.lock().unwrap();
-        let was_new = inner
-            .blocks
-            .insert(BlockKey { slot, hash }, block)
-            .is_none();
+        let key = BlockKey { slot, hash };
+        let was_new = inner.blocks.insert(key, block).is_none();
         inner.max_slot = inner.max_slot.max(slot);
+        // Start retransmit bookkeeping for an EB of our own. A `BlockOffer` is
+        // sent once per peer and `push_notification` deliberately drops any
+        // re-advertisement, so a peer whose fetch decision does not act on that
+        // single offer never requests the body — and an EB nobody fetches can
+        // never be voted on, let alone certified.
+        if source.is_none() && was_new {
+            let first_offered_slot = inner.max_slot;
+            inner.own_offers.insert(
+                key,
+                OwnOffer {
+                    first_offered_slot,
+                    retries: 0,
+                    fetched: false,
+                },
+            );
+        }
         Self::push_notification(
             &mut inner,
             source,
@@ -392,34 +425,136 @@ impl LeiosStore {
 
     /// Look up an endorser block by (slot, hash).
     pub fn get_block(&self, slot: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let key = BlockKey { slot, hash: *hash };
+        // Serving the body is our acknowledgement that the offer landed: stop
+        // retransmitting it (see `reoffer_unfetched`).
+        if let Some(own) = inner.own_offers.get_mut(&key) {
+            own.fetched = true;
+        }
         inner.blocks.get(&key).cloned()
     }
 
-    /// Record the ordered tx-hash list of an EB's manifest. Pairs with a
-    /// `TxBodyResolver` so receivers can serve `MsgLeiosBlockTxsRequest`
-    /// without keeping the bodies in this store. Also pushes a
-    /// `BlockTxsOffer` notification so this node advertises tx availability
-    /// to downstream peers — that's how epidemic flooding extends beyond
-    /// the original producer.
-    pub fn record_eb_manifest(&self, point: Point, tx_hashes: Vec<TxId>, source: Option<PeerId>) {
+    /// Re-offer any EB of ours that no peer has fetched yet.
+    ///
+    /// A `BlockOffer` reaches each peer exactly once — `push_notification`
+    /// drops re-advertisements to keep wire traffic down — and the consumer
+    /// only requests the body if its fetch decision acts on that offer while
+    /// it is live. When it does not, the EB is never requested, never
+    /// validated, never voted on, and so never certified: measured on the
+    /// proto-devnet, the Haskell peers accepted the announcement and the offer
+    /// for 9 of 15 net-rs EBs and then sent no `MsgLeiosBlockRequest` at all,
+    /// with successes scattered through the run rather than stopping at a
+    /// cliff — the signature of a race, not an exhausted fetch budget.
+    ///
+    /// So retransmit, on the same principle as any unacknowledged send: re-push
+    /// the offer every `RETRY_INTERVAL_SLOTS` until a peer actually fetches the
+    /// body, at most `MAX_RETRIES` times. Serving the body counts as the
+    /// acknowledgement (`get_block`). Bounded on both axes, and entries age out
+    /// with the retention window, so a peer that never fetches costs a few
+    /// extra notifications rather than unbounded traffic.
+    ///
+    /// Only our OWN EBs are retransmitted; relaying someone else's is not ours
+    /// to do.
+    pub fn reoffer_unfetched(&self, current_slot: u64) {
+        /// Slots between retransmits. Comfortably longer than a fetch
+        /// round-trip on a local cluster, short enough to land several retries
+        /// inside the EB's voting window.
+        const RETRY_INTERVAL_SLOTS: u64 = 3;
+        /// Retransmits per EB, after the original offer.
+        const MAX_RETRIES: u8 = 3;
+
+        let mut inner = self.inner.lock().unwrap();
+        let cutoff = inner.max_slot.saturating_sub(inner.retention_slots);
+        // Forget anything aged out of retention, fetched or not: its body is
+        // gone from `blocks`, so re-offering it would advertise data we can no
+        // longer serve.
+        inner
+            .own_offers
+            .retain(|key, own| key.slot > cutoff && !own.fetched && own.retries < MAX_RETRIES);
+
+        let due: Vec<(BlockKey, u32)> = inner
+            .own_offers
+            .iter()
+            .filter(|(key, own)| {
+                let next_due = own.first_offered_slot
+                    + RETRY_INTERVAL_SLOTS * u64::from(own.retries + 1);
+                current_slot >= next_due && inner.blocks.contains_key(key)
+            })
+            .map(|(key, _)| {
+                let size = inner
+                    .blocks
+                    .get(key)
+                    .map(|b| u32::try_from(b.len()).unwrap_or(u32::MAX))
+                    .unwrap_or(0);
+                (*key, size)
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        // Visible at info: whether this retransmit path fires at all is the
+        // difference between "the one-shot offer was the problem" and "it was
+        // not", and a debug-level line answers neither on a node running at
+        // info.
+        let mut reoffered = 0usize;
+        let still_unfetched = inner.own_offers.len();
+        for (key, eb_size) in due {
+            if let Some(own) = inner.own_offers.get_mut(&key) {
+                own.retries = own.retries.saturating_add(1);
+            }
+            let point = Point::Specific {
+                slot: key.slot,
+                hash: key.hash,
+            };
+            tracing::debug!(
+                slot = key.slot,
+                eb_size,
+                "re-offering EB no peer has fetched"
+            );
+            reoffered += 1;
+            // `was_new = true` forces past the re-advertisement drop in
+            // `push_notification`: that guard exists to suppress redundant
+            // offers, and this offer is the opposite — the previous one
+            // demonstrably did not produce a fetch.
+            inner
+                .notifications
+                .push_back(NotificationEntry {
+                    sources: Vec::new(),
+                    notification: LeiosNotification::BlockOffer { point, eb_size },
+                });
+        }
+        tracing::info!(
+            reoffered,
+            still_unfetched,
+            "re-offered EB bodies no peer has fetched"
+        );
+        Self::evict_old(&mut inner);
+        self.bump_version(&mut inner);
+    }
+
+    /// Record the ordered tx-hash list of an EB's manifest (for our own
+    /// voting, and for serving via the `TxBodyResolver` when we actually
+    /// hold the bodies).
+    ///
+    /// This does NOT emit a `BlockTxsOffer`. Recording a manifest means we
+    /// know an EB's tx *hashes*, not that we hold its tx *bodies* — for a
+    /// relayed EB whose txs never entered our mempool (e.g. a peer's
+    /// overflow EB), the resolver can't produce them. Advertising txs we
+    /// can't serve makes peers request them, miss, and (per CIP-0164) get
+    /// disconnected — which collaterally drops their in-flight votes on our
+    /// OWN EBs, the exact cause of lost EB certifications. Offers are emitted
+    /// only by `inject_block_txs*`, which store the bodies, so we never
+    /// advertise what we can't serve. `_source` is retained for API
+    /// stability.
+    pub fn record_eb_manifest(&self, point: Point, tx_hashes: Vec<TxId>, _source: Option<PeerId>) {
         let (slot, hash) = match &point {
             Point::Specific { slot, hash } => (*slot, *hash),
             Point::Origin => return,
         };
         let mut inner = self.inner.lock().unwrap();
-        let was_new = inner
-            .eb_tx_hashes
-            .insert(BlockKey { slot, hash }, tx_hashes)
-            .is_none();
+        inner.eb_tx_hashes.insert(BlockKey { slot, hash }, tx_hashes);
         inner.max_slot = inner.max_slot.max(slot);
-        Self::push_notification(
-            &mut inner,
-            source,
-            LeiosNotification::BlockTxsOffer { point },
-            was_new,
-        );
         self.bump_version(&mut inner);
     }
 
@@ -440,27 +575,27 @@ impl LeiosStore {
         peer_id: PeerId,
     ) -> Option<Vec<TxBody>> {
         let key = BlockKey { slot, hash: *hash };
-        let (block_txs, manifest) = {
+        // Serve ONLY from stored bodies (`block_txs`): our own EBs — whose bodies
+        // are pinned at produce time — and received EBs we have fully fetched.
+        // We deliberately do NOT fall back to the mempool tx-body resolver: for a
+        // RECEIVED EB we may hold the manifest but not the exact committed bodies,
+        // and serving resolver-guessed txs yields a `MsgLeiosBlockTxs` hash
+        // mismatch that tears the mux connection down. Serve the COMPLETE
+        // requested set in bitmap order, or `None` so the responder disconnects
+        // (CIP-0164) — never a partial/misaligned or wrong-body response.
+        //
+        // Select the requested indices under the lock and clone only those
+        // bodies (not the whole per-EB map) — the bitmap is usually a small
+        // subset. `total` is captured for the log without holding a clone.
+        let (selected, total): (Vec<TxBody>, usize) = {
             let inner = self.inner.lock().unwrap();
-            (
-                inner.block_txs.get(&key).cloned(),
-                inner.eb_tx_hashes.get(&key).cloned(),
-            )
+            let map = inner.block_txs.get(&key)?;
+            let selected = bitmap::iter_indices(bitmap)
+                .map(|i| map.get(&i).cloned())
+                .collect::<Option<Vec<TxBody>>>()?;
+            (selected, map.len())
         };
-        if block_txs.is_none() && manifest.is_none() {
-            return None;
-        }
-        let resolver = self.tx_body_resolver.as_ref();
-        let selected: Vec<TxBody> = bitmap::iter_indices(bitmap)
-            .filter_map(|i| {
-                if let Some(body) = block_txs.as_ref().and_then(|m| m.get(&i).cloned()) {
-                    return Some(body);
-                }
-                let h = manifest.as_ref()?.get(i as usize)?;
-                resolver?.resolve_body(slot, h)
-            })
-            .collect();
-        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), block_txs.map(|x| x.len()).unwrap_or_default());
+        info!("leios_store: getting block {slot}/{} txs {}/{}; to {peer_id}", hex_prefix(hash), selected.len(), total);
         Some(selected)
     }
 
@@ -662,15 +797,16 @@ impl LeiosStore {
             inner.notifications_pruned_count += 1;
         }
 
-        // Capacity backstop on `blocks` (independent of slot window).
+        // Capacity backstop on `blocks` (independent of slot window). Evict the
+        // OLDEST blocks first. `blocks` is a HashMap, whose `keys()` iterate in
+        // arbitrary order — taking the first N would drop random (possibly
+        // just-offered) EBs. Sort by BlockKey (slot, then hash) so we shed the
+        // lowest slots, matching the slot-window prune direction.
         if inner.blocks.len() > inner.capacity {
-            let to_remove: Vec<BlockKey> = inner
-                .blocks
-                .keys()
-                .take(inner.blocks.len() - inner.capacity)
-                .cloned()
-                .collect();
-            for key in to_remove {
+            let excess = inner.blocks.len() - inner.capacity;
+            let mut keys: Vec<BlockKey> = inner.blocks.keys().cloned().collect();
+            keys.sort_unstable(); // ascending BlockKey == oldest slot first
+            for key in keys.into_iter().take(excess) {
                 inner.blocks.remove(&key);
                 inner.block_txs.remove(&key);
                 info!("leios_store: removing old block_txs {}/{}", key.slot, hex_prefix(&key.hash));
@@ -856,7 +992,11 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_resolves_via_manifest_and_resolver() {
+    fn get_block_txs_manifest_only_returns_none() {
+        // A cached manifest WITHOUT stored bodies is not servable: we serve EB
+        // txs only from `block_txs` (own EBs pinned at produce time; received EBs
+        // fully fetched), never by resolving the manifest against the mempool —
+        // that served wrong bodies for received EBs and tore the mux down.
         let h0 = [0x10u8; 32];
         let h1 = [0x20u8; 32];
         let h2 = [0x30u8; 32];
@@ -879,39 +1019,9 @@ mod tests {
             None,
         );
 
-        // Bitmap selects indices 0 and 2.
+        // Manifest present but no block_txs → None (resolver is not consulted).
         let bitmap = bitmap::from_indices(&[0, 2]);
-        let got = store.get_block_txs(5, &eb_hash, &bitmap, PeerId(23)).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                TxBody::new_with_vec(vec![1u8]),
-                TxBody::new_with_vec(vec![3u8])
-            ]
-        );
-    }
-
-    #[test]
-    fn get_block_txs_resolver_partial_drops_unknown_bodies() {
-        let h0 = [0x40u8; 32];
-        let h1 = [0x50u8; 32];
-        // Only h0 is resolvable.
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(HashMap::from([(
-            tx_id_from_arr(h0),
-            TxBody::new_with_vec(vec![0xAA]),
-        )])));
-        let (store, _rx) = LeiosStore::new_with_resolver(100, Some(resolver));
-
-        let eb_hash = [0xCCu8; 32];
-        let point = Point::Specific {
-            slot: 7,
-            hash: eb_hash,
-        };
-        store.record_eb_manifest(point, vec![tx_id_from_arr(h0), tx_id_from_arr(h1)], None);
-
-        let bitmap = bitmap::from_indices(&[0, 1]);
-        let got = store.get_block_txs(7, &eb_hash, &bitmap, PeerId(31)).unwrap();
-        assert_eq!(got, vec![TxBody::new_with_vec(vec![0xAA])]);
+        assert!(store.get_block_txs(5, &eb_hash, &bitmap, PeerId(23)).is_none());
     }
 
     #[test]
@@ -957,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_ignores_out_of_range_bits() {
+    fn get_block_txs_returns_none_when_an_index_is_missing() {
         let (store, _rx) = LeiosStore::new(100);
         let hash = [0xAA; 32];
         let txs = vec![
@@ -967,10 +1077,12 @@ mod tests {
         let point = Point::Specific { slot: 5, hash };
         store.inject_block_txs_full(point, txs, None);
 
-        // Bit 99 is past the available 2 txs; should be silently dropped.
+        // Bit 99 is past the available 2 txs. We must NOT serve a partial set —
+        // a shorter/misaligned response is rejected downstream as a
+        // MsgLeiosBlockTxs mismatch and tears the mux down. An unservable index
+        // yields None so the responder disconnects (CIP-0164).
         let bitmap = bitmap::from_indices(&[0, 99]);
-        let got = store.get_block_txs(5, &hash, &bitmap, PeerId(17)).unwrap();
-        assert_eq!(got, vec![TxBody::new_with_vec(vec![1u8])]);
+        assert!(store.get_block_txs(5, &hash, &bitmap, PeerId(17)).is_none());
     }
 
     #[test]
@@ -1049,9 +1161,10 @@ mod tests {
     }
 
     #[test]
-    fn get_block_txs_unions_block_txs_with_manifest_resolver() {
-        // Sparse block_txs has indices 0 and 2; manifest+resolver covers
-        // index 1. The union must satisfy a request for all three.
+    fn get_block_txs_partial_block_txs_returns_none() {
+        // Sparse block_txs (indices 0 and 2) can't satisfy a request for 0,1,2:
+        // there is no manifest+resolver union anymore. A missing index -> None
+        // (the responder disconnects) rather than serving a misaligned set.
         let h0 = [0x10u8; 32];
         let h1 = [0x20u8; 32];
         let h2 = [0x30u8; 32];
@@ -1077,16 +1190,9 @@ mod tests {
         partial.insert(2u32, TxBody::new_with_vec(vec![0xD2]));
         store.inject_block_txs(point, partial, None);
 
+        // Index 1 is not in block_txs → the whole request is unservable.
         let bitmap = bitmap::from_indices(&[0, 1, 2]);
-        let got = store.get_block_txs(11, &eb_hash, &bitmap, PeerId(37)).unwrap();
-        assert_eq!(
-            got,
-            vec![
-                TxBody::new_with_vec(vec![0xD0]),
-                TxBody::new_with_vec(vec![0xD1]),
-                TxBody::new_with_vec(vec![0xD2])
-            ]
-        );
+        assert!(store.get_block_txs(11, &eb_hash, &bitmap, PeerId(37)).is_none());
     }
 
     #[test]
@@ -1227,9 +1333,10 @@ mod tests {
             hash: [0x55; 32],
         };
         store.inject_block(point.clone(), vec![0xCC; 30], Some(PeerId(3)));
-        store.record_eb_manifest(
+        // BlockTxsOffer now comes only from a path that stores bodies.
+        store.inject_block_txs_full(
             point.clone(),
-            vec![TxId::new_with_array([0xDD; 32])],
+            vec![TxBody::new_with_vec(vec![0xDD])],
             Some(PeerId(4)),
         );
 
@@ -1246,9 +1353,11 @@ mod tests {
     }
 
     #[test]
-    fn record_eb_manifest_dedups_by_point_across_sources() {
-        // Same EB's manifest advertised by two peers must dedup into a
-        // single BlockTxsOffer entry with both peers as sources.
+    fn record_eb_manifest_does_not_offer_txs() {
+        // Recording a manifest means we know an EB's tx *hashes*, not that we
+        // hold its tx *bodies* — so it must NOT advertise a BlockTxsOffer, or
+        // we'd offer txs we can't serve (miss -> peer disconnect). Offers come
+        // only from inject_block_txs*, which store the bodies.
         let (store, _rx) = LeiosStore::new(100);
         let point = Point::Specific {
             slot: 9,
@@ -1259,15 +1368,18 @@ mod tests {
             vec![TxId::new_with_array([0x11; 32])],
             Some(PeerId(5)),
         );
-        store.record_eb_manifest(
-            point.clone(),
-            vec![TxId::new_with_array([0x11; 32])],
-            Some(PeerId(6)),
-        );
-
         let entries = store.notifications_after(&mut 0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sources, vec![PeerId(5), PeerId(6)]);
+        assert!(
+            entries
+                .iter()
+                .all(|e| !matches!(e.notification, LeiosNotification::BlockTxsOffer { .. })),
+            "record_eb_manifest must not emit a BlockTxsOffer"
+        );
+        // The manifest is still recorded for our own use (voting / resolver).
+        assert_eq!(
+            store.get_eb_manifest(9, &[0x99; 32]),
+            Some(vec![TxId::new_with_array([0x11; 32])])
+        );
     }
 
     #[test]
@@ -1699,5 +1811,84 @@ mod tests {
             vec![vec![0xA1, 0xA1], vec![0xB2, 0xB2]],
             "both distinct announcements diffuse; none deduplicated"
         );
+    }
+
+    /// An EB nobody fetches is re-offered, up to the retry cap; one that IS
+    /// fetched stops immediately. This is the difference between a peer that
+    /// missed a single offer eventually requesting the body and never
+    /// requesting it at all.
+    #[test]
+    fn unfetched_own_eb_is_reoffered_until_fetched_then_stops() {
+        let (store, _rx) = LeiosStore::new(64);
+        let hash = [7u8; 32];
+        let point = Point::Specific { slot: 10, hash };
+        store.inject_block(point.clone(), vec![0xAB; 128], None);
+
+        let count_offers = |store: &LeiosStore| {
+            let inner = store.inner.lock().unwrap();
+            inner
+                .notifications
+                .iter()
+                .filter(|e| matches!(&e.notification,
+                    LeiosNotification::BlockOffer { point: p, .. }
+                        if matches!(p, Point::Specific { slot, .. } if *slot == 10)))
+                .count()
+        };
+        assert_eq!(count_offers(&store), 1, "the original offer");
+
+        // Too soon: the retry interval has not elapsed.
+        store.reoffer_unfetched(11);
+        assert_eq!(count_offers(&store), 1, "must not retransmit early");
+
+        // Due at first_offered_slot + 3.
+        store.reoffer_unfetched(13);
+        assert_eq!(count_offers(&store), 2);
+        store.reoffer_unfetched(16);
+        assert_eq!(count_offers(&store), 3);
+
+        // A peer fetches it — that is the acknowledgement, so retransmits stop
+        // even though the cap has not been reached.
+        assert!(store.get_block(10, &hash).is_some());
+        store.reoffer_unfetched(19);
+        store.reoffer_unfetched(22);
+        assert_eq!(count_offers(&store), 3, "fetched EB must not be re-offered");
+    }
+
+    /// Retransmits are capped, so a peer that never fetches costs a bounded
+    /// number of extra notifications rather than an unbounded stream.
+    #[test]
+    fn reoffers_are_capped() {
+        let (store, _rx) = LeiosStore::new(64);
+        let point = Point::Specific { slot: 5, hash: [1u8; 32] };
+        store.inject_block(point, vec![0u8; 32], None);
+        for slot in 6..60 {
+            store.reoffer_unfetched(slot);
+        }
+        let inner = store.inner.lock().unwrap();
+        let offers = inner
+            .notifications
+            .iter()
+            .filter(|e| matches!(&e.notification, LeiosNotification::BlockOffer { .. }))
+            .count();
+        assert_eq!(offers, 4, "original offer + at most 3 retransmits");
+    }
+
+    /// A peer's EB is not ours to re-advertise.
+    #[test]
+    fn peer_ebs_are_never_reoffered() {
+        let (store, _rx) = LeiosStore::new(64);
+        let point = Point::Specific { slot: 8, hash: [2u8; 32] };
+        store.inject_block(point, vec![0u8; 32], Some(PeerId(1)));
+        for slot in 9..30 {
+            store.reoffer_unfetched(slot);
+        }
+        let inner = store.inner.lock().unwrap();
+        assert!(inner.own_offers.is_empty(), "no retransmit state for a peer's EB");
+        let offers = inner
+            .notifications
+            .iter()
+            .filter(|e| matches!(&e.notification, LeiosNotification::BlockOffer { .. }))
+            .count();
+        assert_eq!(offers, 1, "only the relayed offer");
     }
 }

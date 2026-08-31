@@ -101,6 +101,28 @@ pub async fn serve_chainsync(
                     candidates = points.len(),
                     "chainsync: downstream sent MsgFindIntersect (wants to sync chain from us)"
                 );
+                // Do not answer while our store is still empty at boot. A
+                // sync-at-tip node intersects at the network tip instantly but
+                // holds no block until it has fetched + validated its first one
+                // (seconds later). Answering now returns IntersectNotFound with
+                // tip=Genesis (our empty-store tip); a downstream at a real tip
+                // rejects that as ForkTooDeep and cold-backs-off for minutes,
+                // orphaning every block we forge in the gap (see is_seeded).
+                // Park the follower until we hold a real chain, then answer with
+                // a shared, recent intersection. A genesis-rooted node is always
+                // seeded, so it never waits.
+                if !store.is_seeded() {
+                    tracing::info!(
+                        peer = peer.0,
+                        "chainsync: store not seeded yet (syncing to tip); parking downstream intersect until we hold a chain"
+                    );
+                    while !store.is_seeded() {
+                        if subscription.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    tracing::info!(peer = peer.0, "chainsync: store seeded; answering parked intersect");
+                }
                 match store.find_intersection(&points) {
                     Some((point, tip)) => {
                         read_point = Some(point.clone());
@@ -346,7 +368,24 @@ pub async fn serve_blockfetch(
                     %to,
                     "blockfetch: downstream requested range (wants blocks from us)"
                 );
-                let blocks = store.get_range(&from, &to);
+                let mut blocks = store.get_range(&from, &to);
+                if blocks.is_empty() {
+                    // The live chain no longer holds the requested block — we
+                    // likely announced it via ChainSync and then reorged past
+                    // it. Serve the retained body so we don't answer NoBlocks
+                    // for a header we advertised (which resets the peer).
+                    let orphans = store.get_orphans(&from, &to);
+                    if !orphans.is_empty() {
+                        tracing::info!(
+                            peer = peer.0,
+                            %from,
+                            %to,
+                            count = orphans.len(),
+                            "blockfetch: serving reorged-past block(s) from orphan cache"
+                        );
+                        blocks = orphans;
+                    }
+                }
                 if !blocks.is_empty() {
                     let _ = runner.send(&BfMsg::MsgStartBatch).await;
                     for block in &blocks {
@@ -1139,6 +1178,23 @@ pub async fn serve_leios_fetch(
                     // CIP-0164: server should disconnect if it doesn't have the requested EB.
                     break;
                 };
+                // Log what we are about to put on the wire. A Haskell peer
+                // recomputes the EB's size from the decoded manifest and calls
+                // `error` on a mismatch, which tears down the WHOLE mux
+                // connection — so a single bad body costs every in-flight
+                // request too. Observed: "MsgLeiosBlock size mismatch: (1,2740)"
+                // — it decoded an empty manifest from a body we believe is 2740
+                // bytes. Record the length and CBOR prefix so the next
+                // occurrence says whether we served the wrong bytes or the
+                // framing is being read differently.
+                tracing::info!(
+                    peer = peer.0,
+                    %point,
+                    body_bytes = block.len(),
+                    cbor_prefix = %block.iter().take(4)
+                        .map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
+                    "leios_fetch: serving EB body"
+                );
                 if runner.send(&LfMsg::MsgLeiosBlock { block }).await.is_err() {
                     break;
                 }
@@ -1314,12 +1370,15 @@ mod tests {
         // Populate chain store.
         let (store, _rx) = ChainStore::new(100);
         let header_1 = make_header(1);
-        for slot in 1..=3 {
+        // Genesis-rooted chain: block_no 0,1,2,3 over slots 1..=4, so the
+        // earliest block (slot 1) is block 0 and Origin is a valid intersection.
+        // Earliest served block stays header_1; tip.block_no stays 3.
+        for slot in 1..=4 {
             store.append_block(
                 make_point(slot),
                 make_header(slot),
                 make_body(slot, 50),
-                slot,
+                slot - 1,
             );
         }
 
@@ -1359,6 +1418,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chainsync_server_parks_intersect_until_seeded() {
+        // Regression: a sync-at-tip node (anchored above genesis) whose store is
+        // still empty at boot must NOT answer a downstream's intersection yet —
+        // answering would advertise tip=Genesis, which a downstream at a real tip
+        // rejects as ForkTooDeep and then cold-backs-off for minutes, orphaning
+        // every block we forge in the gap. The server must park the intersect
+        // until the store holds a chain, then answer with the shared point.
+        let cs_proto = ProtocolConfig {
+            id: chainsync::PROTOCOL_ID,
+            traffic_class: TrafficClass::Priority,
+            ingress_limit: chainsync::INGRESS_LIMIT,
+            egress_queue_size: 16,
+        };
+        let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&cs_proto);
+
+        // Empty store, marked anchored-above-genesis (sync-at-tip pre-seed).
+        let (store, _rx) = ChainStore::new(100);
+        store.set_anchored_above_genesis(true);
+        assert!(!store.is_seeded(), "empty anchored store is not seeded");
+
+        let server_handle = tokio::spawn(serve_chainsync(
+            server_send,
+            server_recv,
+            store.clone(),
+            PeerId(0),
+            None,
+            crate::peer::new_downstream_flag(),
+        ));
+
+        // Client asks to intersect at a real point (+ Origin fallback).
+        let client_task = tokio::spawn(async move {
+            let mut client = Runner::<ChainSync>::new(Role::Client, client_send, client_recv);
+            chainsync::find_intersection(&mut client, vec![make_point(5), Point::Origin]).await
+        });
+
+        // While the store is empty the server must stay silent (parked).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !client_task.is_finished(),
+            "intersect must be parked while the store is unseeded (else ForkTooDeep)"
+        );
+
+        // Seed the store with the candidate block → wakes the parked intersect.
+        store.append_block(make_point(5), make_header(5), make_body(5, 50), 4);
+
+        // Now the parked intersect resolves to the shared real point — never Origin.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
+            .await
+            .expect("parked intersect must answer once seeded")
+            .expect("client task join");
+        let (point, _tip) = result.unwrap().unwrap();
+        assert_eq!(point, make_point(5), "must intersect at the shared point, not Origin");
+
+        server_handle.abort();
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test]
     async fn chainsync_server_forwards_stored_header_verbatim() {
         // #18: serve_chainsync forwards the header stored in the chain
         // byte-for-byte. The stored header here is the authentic wire form
@@ -1375,7 +1494,8 @@ mod tests {
         let (store, _rx) = ChainStore::new(100);
         // [era_tag=7, #6.24(h'AABB')] — valid CBOR, era tag at byte 1.
         let authentic = WrappedHeader::opaque(vec![0x82, 0x07, 0xD8, 0x18, 0x42, 0xAA, 0xBB]);
-        store.append_block(make_point(1), authentic.clone(), make_body(1, 50), 1);
+        // block_no 0: genesis-rooted, so Origin is a valid intersection.
+        store.append_block(make_point(1), authentic.clone(), make_body(1, 50), 0);
 
         let server_handle = tokio::spawn(serve_chainsync(
             server_send,
@@ -2282,17 +2402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leios_fetch_serves_bitmap_via_manifest_and_resolver() {
-        use crate::store::leios_store::TxBodyResolver;
-        use std::sync::Arc;
-
-        struct StubResolver(std::collections::HashMap<TxId, TxBody>);
-        impl TxBodyResolver for StubResolver {
-            fn resolve_body(&self, _slot: u64, tx_id: &TxId) -> Option<TxBody> {
-                self.0.get(tx_id).cloned()
-            }
-        }
-
+    async fn leios_fetch_serves_bitmap_from_block_txs() {
         let lf_proto = ProtocolConfig {
             id: leios_fetch::PROTOCOL_ID,
             traffic_class: TrafficClass::Priority,
@@ -2303,26 +2413,22 @@ mod tests {
         let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
             mux_pair_for_protocol(&lf_proto);
 
-        let h0 = TxId::new_with_array([0xA0u8; 32]);
-        let h1 = TxId::new_with_array([0xA1u8; 32]);
-        let h2 = TxId::new_with_array([0xA2u8; 32]);
-        // Bodies are single valid CBOR values (1-byte bytestrings,
-        // 0x41 = bytes(1)) — txs pass through the codec as raw CBOR.
-        let resolver: Arc<dyn TxBodyResolver> = Arc::new(StubResolver(
-            [
-                (h0.clone(), TxBody::new_with_vec(vec![0x41, 0xB0])),
-                (h1.clone(), TxBody::new_with_vec(vec![0x41, 0xB1])),
-                (h2.clone(), TxBody::new_with_vec(vec![0x41, 0xB2])),
-            ]
-            .into_iter()
-            .collect(),
-        ));
-        // Receiver-style store: only the manifest is recorded; bodies
-        // come from the resolver.
-        let (store, _rx) = LeiosStore::new_with_resolver(100, Some(resolver));
+        // Serving is from stored `block_txs` only. Inject the EB's full ordered
+        // bodies at positions 0..N (producers pin these at produce time;
+        // receivers merge them as fetched). Bodies are single valid CBOR values
+        // (1-byte bytestrings, 0x41 = bytes(1)) — txs pass through as raw CBOR.
+        let (store, _rx) = LeiosStore::new(100);
         let hash = [0xEFu8; 32];
         let point = Point::Specific { slot: 33, hash };
-        store.record_eb_manifest(point.clone(), vec![h0, h1, h2], None);
+        store.inject_block_txs_full(
+            point.clone(),
+            vec![
+                TxBody::new_with_vec(vec![0x41, 0xB0]),
+                TxBody::new_with_vec(vec![0x41, 0xB1]),
+                TxBody::new_with_vec(vec![0x41, 0xB2]),
+            ],
+            None,
+        );
 
         let server_handle = tokio::spawn(serve_leios_fetch(
             server_send,
