@@ -67,8 +67,16 @@ pub struct PraosControl {
 ///   EB clears the availability gate despite referencing txs that were never in
 ///   any honest mempool. Probes soundness: does anything downstream reject an
 ///   available-but-fabricated EB, or does it reach quorum?
+/// - [`Hollow`](FakeEbKind::Hollow) — "Hollow EB": an empty manifest announced
+///   with a false declared size. The body is empty and servable; only the
+///   advertised `eb_size` lies. Probes whether the receiver gates or
+///   pre-allocates on the declared size before fetching the (empty) body.
+/// - [`Loaded`](FakeEbKind::Loaded) — "Loaded Tx EB": a manifest of real txs
+///   drawn from the node's configured attack magazine, pinned + served like
+///   Dummy. The payload (double-spend, theft, …) lives in the magazine bytes,
+///   not the node code.
 ///
-/// A third variant, "Mega Tx EB" (oversized manifest / declared size, for
+/// A further variant, "Mega Tx EB" (oversized manifest / declared size, for
 /// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
 /// in the leios-adversarial-tools repo, which houses the net-node actuation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -77,6 +85,16 @@ pub enum FakeEbKind {
     Phantom { n_txs: u32 },
     /// Dummy Tx EB — `n_txs` fabricated txs with servable bodies pinned.
     Dummy { n_txs: u32 },
+    /// Hollow EB — empty manifest (zero txs) announced with a false declared
+    /// size of `declared_bytes`. The EB body is empty and servable; only the
+    /// advertised size lies. Probes whether the receiver gates or pre-allocates
+    /// on the declared `eb_size` before fetching the (empty) body.
+    Hollow { declared_bytes: u64 },
+    /// Loaded Tx EB — manifest of `take` real txs drawn from the node's
+    /// configured attack magazine (`eb_magazine_path`), pinned + served like
+    /// Dummy. Actuation reads the magazine, so the payload (double-spend,
+    /// theft, …) lives in the magazine bytes, not the node code.
+    Loaded { take: u32 },
 }
 
 /// Leios-domain actuator inputs.

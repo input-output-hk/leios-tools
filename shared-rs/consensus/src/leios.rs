@@ -1538,6 +1538,16 @@ impl LeiosState {
         self.elections.eb_certifiable_slot(eb_hash)
     }
 
+    /// Diagnostic passthrough: `(quorum_reached, phase, announced_slot)` for the
+    /// election keyed by the announcing RB hash. See
+    /// [`crate::elections::Elections::eb_cert_status`].
+    pub fn eb_cert_status(
+        &self,
+        rb_hash: &[u8; 32],
+    ) -> Option<(bool, crate::pipeline::PipelinePhase, u64)> {
+        self.elections.eb_cert_status(rb_hash)
+    }
+
     /// The EB context `(eb_hash, eb_slot)` a vote's `announcing_rb_hash` refers
     /// to, if an election exists for it — what the vote's signer BLS-signed.
     /// Lets a receiver verify inbound votes that carry only the RB hash.

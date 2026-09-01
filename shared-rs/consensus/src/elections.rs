@@ -492,6 +492,15 @@ impl Elections {
             None
         }
     }
+
+    /// Diagnostic: the raw `(quorum_reached, phase, announced_slot)` of the
+    /// election keyed by `rb_hash`, whether or not it is certifiable. Lets the
+    /// producer log *why* `eb_certifiable_slot` returned `None` (not-yet-quorum
+    /// vs not-yet-CertEligible vs both) at a forge attempt.
+    pub fn eb_cert_status(&self, rb_hash: &[u8; 32]) -> Option<(bool, PipelinePhase, u64)> {
+        let e = self.elections.get(rb_hash)?;
+        Some((e.quorum_reached, e.phase, e.announced_slot))
+    }
 }
 
 #[cfg(test)]
