@@ -135,4 +135,27 @@ mod tests {
         assert_eq!(s, Status::Running);
         assert_eq!(out.praos.fake_eb, Some(FakeEbKind::Dummy { n_txs: 5 }));
     }
+
+    #[test]
+    fn hollow_sets_hollow_kind_with_declared_bytes() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let mut out = ControlSignal::default();
+        let s = HollowEb::new(100_000).contribute(&ctx(&env, &state), &mut out);
+        assert_eq!(s, Status::Running);
+        assert_eq!(
+            out.praos.fake_eb,
+            Some(FakeEbKind::Hollow { declared_bytes: 100_000 })
+        );
+    }
+
+    #[test]
+    fn loaded_sets_loaded_kind_with_take() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let mut out = ControlSignal::default();
+        let s = LoadedTxEb::new(7).contribute(&ctx(&env, &state), &mut out);
+        assert_eq!(s, Status::Running);
+        assert_eq!(out.praos.fake_eb, Some(FakeEbKind::Loaded { take: 7 }));
+    }
 }
