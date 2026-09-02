@@ -35,10 +35,16 @@ pub enum ActionSpec {
         non_voting_threshold: u8,
         hide_eb_tx_received: bool,
     },
-    #[serde(rename = "withhold-announcements")]
+    #[serde(rename = "withhold-txs")]
     WithholdTxs {
         withholding_slots: u64,
         tx_producer_only: bool,
+        /// Whether to withhold txs on the tx-submission protocol.
+        #[serde(default = "default_true")]
+        withhold_tx_submission: bool,
+        /// Whether to withhold txs on the Leios fetch protocol.
+        #[serde(default)]
+        withhold_leios_fetch: bool,
     },
     #[serde(rename = "deep-reorg")]
     DeepReorg { every_slots: u64, depth: u64 },
@@ -68,6 +74,23 @@ pub enum ActionSpec {
     DummyTxEb {
         #[serde(default = "default_fake_eb_txs")]
         n_txs: u32,
+    },
+    /// Hollow EB — empty manifest announced with a false declared size.
+    /// Probes whether the receiver gates/pre-allocates on the advertised
+    /// `eb_size` before fetching the (empty) body.
+    #[serde(rename = "hollow-eb")]
+    HollowEb {
+        #[serde(default = "default_hollow_bytes")]
+        declared_bytes: u64,
+    },
+    /// Loaded Tx EB — fabricated EB whose manifest is sourced from the node's
+    /// configured attack magazine (`eb_magazine_path`): `take` real, offline-
+    /// authored txs (e.g. double-spends or theft txs) pinned + served like
+    /// Dummy. The magazine decides the payload; the node stays threat-agnostic.
+    #[serde(rename = "loaded-tx-eb")]
+    LoadedTxEb {
+        #[serde(default = "default_fake_eb_txs")]
+        take: u32,
     },
     #[serde(rename = "announce-size-lie")]
     AnnounceSizeLie {
@@ -110,6 +133,14 @@ pub enum ActionSpec {
 
 fn default_fake_eb_txs() -> u32 {
     8
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_hollow_bytes() -> u64 {
+    100_000
 }
 
 fn default_tx_flood_rate() -> u32 {

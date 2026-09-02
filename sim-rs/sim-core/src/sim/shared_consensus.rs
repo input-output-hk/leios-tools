@@ -490,7 +490,19 @@ impl NodeImpl for SharedConsensus {
             evaluate_votes: true,
         };
 
-        let mut leios = LeiosState::new(config.name.clone(), elections, voting_config, pipeline);
+        // Max EB-tx fetch "waves" per point. The sim delivers EB txs via its
+        // own `Message` enum and never drives the shared-consensus EB-tx fetch
+        // retry loop, so this only needs to be a positive value (a zero would
+        // short-circuit that path). Value 1 matches the original implementation.
+        // TODO: should we have this value set up properly?
+        let max_leios_fetch_txs_waves = 1;
+        let mut leios = LeiosState::new(
+            config.name.clone(),
+            elections,
+            voting_config,
+            pipeline,
+            max_leios_fetch_txs_waves,
+        );
         let fp = sim_config.fetch_policy;
         leios.set_eb_policy(fp.eb.into_eb_policy());
         leios.set_eb_txs_policy(fp.eb_txs.into_eb_txs_policy());
@@ -2092,10 +2104,11 @@ impl SharedConsensus {
                 }
                 LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::QuorumReached { .. })
                 | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::ElectionExpired { .. })
-                | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosElectionInfo { .. }) => {
-                    // No 1:1 sim telemetry; sim's stat aggregator
-                    // derives equivalent signals from `votes_by_eb`
-                    // counts on the receive path.
+                | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosElectionInfo { .. })
+                | LeiosEffect::EmitTelemetry(LeiosTelemetryEvent::LeiosBlockInfo { .. }) => {
+                    // No 1:1 sim telemetry; sim's stat aggregator either
+                    // derives equivalent signals or already has the required
+                    // info on the receive path.
                 }
                 // Fetch effects stay no-op: sim drives RB/EB
                 // fetches directly through its `Message` enum, so

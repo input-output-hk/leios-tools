@@ -3673,9 +3673,10 @@ mod tests {
         drop(net_event_receiver);
     }
 
-    /// After `RecordLeiosEbManifest`, the LeiosStore should be able to
-    /// serve `get_block_txs` by resolving each requested hash through
-    /// the configured `TxBodyResolver`.
+    /// After `RecordLeiosEbManifest` with no stored bodies, the EB must NOT be
+    /// servable: `get_block_txs` serves from `block_txs` only and never resolves
+    /// the manifest against the mempool `TxBodyResolver` (resolver-guessed bodies
+    /// for a received EB mismatch on the wire and tear the mux down).
     #[tokio::test]
     async fn record_leios_eb_manifest_alone_is_not_servable() {
         // Recording an EB manifest WITHOUT stored bodies must NOT make the EB
@@ -3717,10 +3718,20 @@ mod tests {
             .await
             .expect("command should accept");
 
-        // Give the coordinator time to process the manifest, then confirm the EB
-        // is still NOT servable — we hold the manifest but no bodies.
+        // Poll until the coordinator has actually recorded the manifest (a
+        // positive signal that processing completed — no fixed sleep, which
+        // flakes on loaded CI), then confirm the EB is still NOT servable: we
+        // hold the manifest but no bodies.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0, 1]);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut recorded = false;
+        for _ in 0..100 {
+            if leios_store.get_eb_manifest(4, &eb_hash).is_some() {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(recorded, "coordinator should have recorded the manifest within 1s");
         assert!(
             leios_store
                 .get_block_txs(4, &eb_hash, &bitmap, PeerId(10))

@@ -6,7 +6,7 @@ use std::fmt;
 ///
 /// Monotonically increasing — not a network address. Two connections to
 /// the same address get different PeerIds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PeerId(pub u64);
 
 impl fmt::Display for PeerId {

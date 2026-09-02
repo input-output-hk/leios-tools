@@ -19,7 +19,7 @@ use crate::peer::PeerId;
 use crate::production::BodyPath;
 
 /// The full per-slot control signal emitted by a tick.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ControlSignal {
     pub praos: PraosControl,
     pub leios: LeiosControl,
@@ -33,7 +33,7 @@ impl ControlSignal {
 }
 
 /// Praos-domain actuator inputs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PraosControl {
     /// RB production strategy (`Normal` | `Suppress` | `Equivocate { ways }`).
     pub production: RbProductionStrategy,
@@ -44,6 +44,7 @@ pub struct PraosControl {
     /// Reset inbound peers this slot.
     pub drop_inbound: bool,
     /// Override the producer's body-path choice, if `Some`.
+    #[serde(skip)]
     pub body_path: Option<BodyPath>,
     /// Suppress the certificate on any CertRB this node would produce this slot
     /// (the `cert-suppressor` action): the adversary omits the cert for its
@@ -72,20 +73,38 @@ pub struct PraosControl {
 ///   EB clears the availability gate despite referencing txs that were never in
 ///   any honest mempool. Probes soundness: does anything downstream reject an
 ///   available-but-fabricated EB, or does it reach quorum?
+/// - [`Hollow`](FakeEbKind::Hollow) — "Hollow EB": an empty manifest announced
+///   with a false declared size. The body is empty and servable; only the
+///   advertised `eb_size` lies. Probes whether the receiver gates or
+///   pre-allocates on the declared size before fetching the (empty) body.
+/// - [`Loaded`](FakeEbKind::Loaded) — "Loaded Tx EB": a manifest of real txs
+///   drawn from the node's configured attack magazine, pinned + served like
+///   Dummy. The payload (double-spend, theft, …) lives in the magazine bytes,
+///   not the node code.
 ///
-/// A third variant, "Mega Tx EB" (oversized manifest / declared size, for
+/// A further variant, "Mega Tx EB" (oversized manifest / declared size, for
 /// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
 /// in the leios-adversarial-tools repo, which houses the net-node actuation).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FakeEbKind {
     /// Phantom Tx EB — `n_txs` unfetchable phantom txs; no bodies pinned.
     Phantom { n_txs: u32 },
     /// Dummy Tx EB — `n_txs` fabricated txs with servable bodies pinned.
     Dummy { n_txs: u32 },
+    /// Hollow EB — empty manifest (zero txs) announced with a false declared
+    /// size of `declared_bytes`. The EB body is empty and servable; only the
+    /// advertised size lies. Probes whether the receiver gates or pre-allocates
+    /// on the declared `eb_size` before fetching the (empty) body.
+    Hollow { declared_bytes: u64 },
+    /// Loaded Tx EB — manifest of `take` real txs drawn from the node's
+    /// configured attack magazine (`eb_magazine_path`), pinned + served like
+    /// Dummy. Actuation reads the magazine, so the payload (double-spend,
+    /// theft, …) lives in the magazine bytes, not the node code.
+    Loaded { take: u32 },
 }
 
 /// Leios-domain actuator inputs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeiosControl {
     /// CIP-0164 voting policy (`Honest` | `Abstain(reason)`).
     pub vote: VotePolicy,
@@ -136,7 +155,7 @@ pub struct LeiosControl {
 }
 
 /// Mempool-domain actuator inputs.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MempoolControl {
     /// EB/tx processing filter.
     pub tx_filter: TxFilterPolicy,
@@ -151,7 +170,7 @@ pub struct MempoolControl {
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VotePolicy {
     #[default]
     Honest,
@@ -159,7 +178,7 @@ pub enum VotePolicy {
 }
 
 /// Per-peer outbound rewriting requested by the tick.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutboundControl {
     #[default]
     None,
@@ -171,7 +190,7 @@ pub enum OutboundControl {
 }
 
 /// How to rewrite `eb_size` on outbound `MsgLeiosBlockOffer`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EbSizePolicy {
     #[default]
     Honest,
@@ -207,7 +226,7 @@ impl EbSizePolicy {
 }
 
 /// EB/tx processing filter (the t22 checksum-threshold policy).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TxFilterPolicy {
     #[default]
     None,
@@ -218,7 +237,7 @@ pub enum TxFilterPolicy {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TxWithholdingPolicy {
     #[default]
     None,
@@ -234,6 +253,11 @@ pub enum TxWithholdingPolicy {
 
         /// true if policy applies only to generated by current node
         tx_producer_only: bool,
+
+        /// specifies protocols to withhold
+        withhold_tx_submission: bool,
+
+        withhold_leios_fetch: bool,
     }
 }
 

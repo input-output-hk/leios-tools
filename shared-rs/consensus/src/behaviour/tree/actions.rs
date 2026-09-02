@@ -80,9 +80,13 @@ pub fn build_action(
         ActionSpec::WithholdTxs {
             withholding_slots,
             tx_producer_only,
+            withhold_tx_submission,
+            withhold_leios_fetch,
         } => Box::new(catalogue::WithholdTxs::new(
             *withholding_slots,
             *tx_producer_only,
+            *withhold_tx_submission,
+            *withhold_leios_fetch,
         )),
         ActionSpec::DeepReorg { every_slots, depth } => {
             Box::new(catalogue::DeepReorg::new(*every_slots, *depth))
@@ -101,6 +105,10 @@ pub fn build_action(
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
         ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
         ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
+        ActionSpec::HollowEb { declared_bytes } => {
+            Box::new(catalogue::HollowEb::new(*declared_bytes))
+        }
+        ActionSpec::LoadedTxEb { take } => Box::new(catalogue::LoadedTxEb::new(*take)),
         ActionSpec::AnnounceSizeLie {
             scale_num,
             scale_den,

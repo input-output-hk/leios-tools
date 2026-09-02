@@ -206,7 +206,7 @@ mod tests {
             retry_vote_in_window: true,
             evaluate_votes: true,
         };
-        crate::leios::LeiosState::new("test".into(), elections, voting, pipeline)
+            crate::leios::LeiosState::new("test".into(), elections, voting, pipeline, 7)
     }
 
     // EB cap big enough to never matter for these unit cases.
