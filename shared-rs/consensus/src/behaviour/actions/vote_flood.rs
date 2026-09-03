@@ -43,3 +43,45 @@ impl LeafAction<ConsensusCtx, ControlSignal> for VoteFlood {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
+
+    #[test]
+    fn sets_flood_count() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let ctx = TickCtx {
+            env: &env,
+            state: &state,
+            seed: 0,
+            action_params: None,
+        };
+        let mut out = ControlSignal::default();
+        let s = VoteFlood { count: 500 }.contribute(&ctx, &mut out);
+        assert_eq!(s, Status::Running);
+        assert_eq!(out.leios.vote_flood_count, 500);
+        // A zero count is clamped to a single vote.
+        let mut out2 = ControlSignal::default();
+        VoteFlood { count: 0 }.contribute(&ctx, &mut out2);
+        assert_eq!(out2.leios.vote_flood_count, 1);
+        // Honest default floods nothing.
+        assert_eq!(ControlSignal::default().leios.vote_flood_count, 0);
+    }
+
+    #[test]
+    fn set_param_retunes_count() {
+        let mut a = VoteFlood { count: 100 };
+        a.set_param("count", &toml::Value::Integer(500));
+        assert_eq!(a.count, 500);
+        // Negative count clamps to 0 (contribute then lifts to >= 1).
+        a.set_param("count", &toml::Value::Integer(-5));
+        assert_eq!(a.count, 0);
+        // Unknown fields are ignored.
+        a.set_param("count", &toml::Value::Integer(7));
+        a.set_param("slot_offset", &toml::Value::Integer(40));
+        assert_eq!(a.count, 7);
+    }
+}
