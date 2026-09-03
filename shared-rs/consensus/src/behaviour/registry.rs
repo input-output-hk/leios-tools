@@ -121,6 +121,13 @@ pub enum ActionSpec {
         #[serde(default)]
         slot_offset: i64,
     },
+    /// vote-flood — emit `count` votes over fabricated distinct RB hashes per
+    /// tick, bypassing the election gate (unbounded seenVotes/pointStates probe).
+    #[serde(rename = "vote-flood")]
+    VoteFlood {
+        #[serde(default = "default_flood_count")]
+        count: u32,
+    },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
     /// Flood the local tx generator at `rate` txs/sec (garbage or magazine).
