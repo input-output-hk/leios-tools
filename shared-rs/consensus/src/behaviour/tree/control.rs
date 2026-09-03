@@ -146,6 +146,12 @@ pub struct LeiosControl {
     /// the absent junk-detection + ≤ 2-per-election server discipline. Default
     /// `0` keeps `ControlSignal::default()` honest.
     pub announce_flood_count: u32,
+    /// vote-flood: emit this many votes over fabricated, distinct announcing-RB
+    /// hashes per tick, bypassing the honest election gate (voting needs no
+    /// stake — only a committee seat + BLS key). Probes unbounded
+    /// `seenVotes`/`pointStates` growth on receivers. `0` keeps
+    /// `ControlSignal::default()` honest.
+    pub vote_flood_count: u32,
 }
 
 /// Mempool-domain actuator inputs.
