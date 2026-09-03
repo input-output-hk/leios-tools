@@ -128,6 +128,17 @@ pub enum ActionSpec {
         #[serde(default = "default_flood_count")]
         count: u32,
     },
+    /// eb-burst (T23) — withhold `count` Dummy EBs (each an `n_txs`-tx closure)
+    /// over `withhold_slots`, then release the whole batch in one tick.
+    #[serde(rename = "eb-burst")]
+    EbBurst {
+        #[serde(default = "default_withhold_slots")]
+        withhold_slots: u32,
+        #[serde(default = "default_flood_count")]
+        count: u32,
+        #[serde(default = "default_fake_eb_txs")]
+        n_txs: u32,
+    },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
     /// Flood the local tx generator at `rate` txs/sec (garbage or magazine).
@@ -156,6 +167,10 @@ fn default_tx_flood_rate() -> u32 {
 
 fn default_flood_count() -> u32 {
     100
+}
+
+fn default_withhold_slots() -> u32 {
+    20
 }
 
 fn default_lazy_reason() -> NoVoteReason {
