@@ -129,6 +129,15 @@ pub fn build_action(
         ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
         ActionSpec::TxFlood { rate } => Box::new(catalogue::TxFlood { rate: *rate }),
         ActionSpec::VoteFlood { count } => Box::new(catalogue::VoteFlood { count: *count }),
+        ActionSpec::EbBurst {
+            withhold_slots,
+            count,
+            n_txs,
+        } => Box::new(catalogue::EbBurst {
+            withhold_slots: *withhold_slots,
+            count: *count,
+            n_txs: *n_txs,
+        }),
     }
 }
 
