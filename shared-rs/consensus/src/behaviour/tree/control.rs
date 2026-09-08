@@ -161,12 +161,17 @@ pub struct MempoolControl {
     pub tx_filter: TxFilterPolicy,
     pub tx_withholding_filter: TxWithholdingPolicy,
     /// `tx-flood` action: drive the local tx generator at this rate (txs/sec;
-    /// `0` = honest, no override). The net-node actuator applies it to the tx
+    /// `0` = honest, no override). The I/O wrapper applies it to the tx
     /// generator so the node injects far faster than the network drains,
     /// overflowing the mempool (evict-oldest) to displace honest txs. Integer
     /// to keep the control signal `Eq`; fractional precision is irrelevant for
     /// a flood.
     pub tx_flood_rate: u32,
+    /// `tx-flood` action, optional: slot at which the tx generator may begin
+    /// firing (a coordinated "fire at slot X" gate). `None` = fire immediately
+    /// at `tx_flood_rate`. The I/O wrapper forwards it to the generator's
+    /// `fire_at_slot`, which holds replay until `current_slot() >= X`.
+    pub fire_at_slot: Option<u64>,
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.
@@ -281,6 +286,8 @@ mod tests {
         assert_eq!(d.mempool.tx_filter, TxFilterPolicy::None);
         // tx-flood must default off, or the honest node would flood.
         assert_eq!(d.mempool.tx_flood_rate, 0);
+        // no coordinated fire-slot gate by default.
+        assert_eq!(d.mempool.fire_at_slot, None);
     }
 
     #[test]
