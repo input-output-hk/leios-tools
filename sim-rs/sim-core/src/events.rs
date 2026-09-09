@@ -323,10 +323,31 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
-    /// A vote bundle arrived that the recipient did not need: it already
-    /// held the bundle, or it finished verifying a copy of one it had
-    /// already accepted.  The bytes were always spent, and under the
-    /// transports that only recognise a redundant copy after verifying it
+    /// The announcement reached its recipient (distinct from sending it).
+    VTBundleAnnouncementReceived {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// The body request reached its recipient.
+    VTBundleRequestReceived {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// First successful validation of a received, relevant bundle at a Linear
+    /// node. Local generation, duplicates and obsolete votes do not emit this.
+    VTBundleAccepted {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+    },
+    /// A redundant arrival: the recipient already held the bundle, finished
+    /// verifying another copy, or finished validating votes for pruned EBs.
+    /// The bytes were always spent, and under the transports that only
+    /// recognise a redundant copy after verifying it
     /// the signature check was spent too.
     VTBundleDuplicate {
         id: VoteBundleId<Node>,
@@ -459,7 +480,10 @@ impl Event {
             Self::VTBundleSent { sender, .. }
             | Self::VTBundleAnnounced { sender, .. }
             | Self::VTBundleRequested { sender, .. } => Some(sender.id),
-            Self::VTBundleReceived { recipient, .. } => Some(recipient.id),
+            Self::VTBundleReceived { recipient, .. }
+            | Self::VTBundleAnnouncementReceived { recipient, .. }
+            | Self::VTBundleRequestReceived { recipient, .. }
+            | Self::VTBundleAccepted { recipient, .. } => Some(recipient.id),
             Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
             Self::EBQuorumReached { node, .. } => Some(node.id),
             Self::VoteGenerated { voter, .. } => Some(voter.id),
@@ -1039,6 +1063,44 @@ impl EventTracker {
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
             msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_announcement_received(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleAnnouncementReceived {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_request_received(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleRequestReceived {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_accepted(&self, id: VoteBundleId, sender: NodeId, recipient: NodeId) {
+        self.send(Event::VTBundleAccepted {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
         });
     }
 

@@ -294,7 +294,7 @@ impl NodeImpl for LinearLeiosNode {
             CpuTask::RBBlockValidated(rb) => self.finish_validating_rb(rb),
             CpuTask::EBHeaderValidated(from, eb) => self.finish_validating_eb_header(from, eb),
             CpuTask::EBBlockValidated(eb, seen) => self.finish_validating_eb(eb, seen),
-            CpuTask::VTBundleGenerated(votes, _) => self.finish_generating_vote_bundle(votes),
+            CpuTask::VTBundleGenerated(votes, eb) => self.finish_generating_vote_bundle(votes, &eb),
             CpuTask::VTBundleValidated(from, votes) => {
                 self.finish_validating_vote_bundle(from, votes)
             }
@@ -1506,7 +1506,7 @@ impl LinearLeiosNode {
         // CIP-0164 §Equivocation Detection: voting begins 3 * L_hdr after
         // the slot of the announcing RB, not after the EB was built.
         let equivocation_cutoff_time = self.sim_config.voting_window().gate_at(eb.slot);
-        if eb.producer != self.id && self.clock.now() < equivocation_cutoff_time {
+        if self.clock.now() < equivocation_cutoff_time {
             // If we haven't waited long enough to detect equivocations,
             // schedule voting later.
             self.queued.schedule_event(
@@ -1541,22 +1541,13 @@ impl LinearLeiosNode {
                     .count()
             }
             CommitteeSelectionAlgorithm::Everyone => 1,
-            // CIP-164 PR #1196: certificate weight is the voter's own
+            // CIP-0164 PRs #1196 / #1250: certificate weight is the voter's own
             // stake; the receiver sums these and compares against
             // `quorum_weight_fraction × total_active_stake`.
-            CommitteeSelectionAlgorithm::TopStakeFraction => {
+            CommitteeSelectionAlgorithm::TopStakeFraction
+            | CommitteeSelectionAlgorithm::TopStakeSeats => {
                 if self.sim_config.vote_eligible_nodes.contains(&self.id) {
                     self.sim_config.nodes[self.id.to_inner()].stake as usize
-                } else {
-                    0
-                }
-            }
-            // CIP-0164 seat-count committee: a seated pool holds exactly
-            // one seat and votes with weight 1.  The receiver compares
-            // the sum against `quorum_weight_fraction × seats filled`.
-            CommitteeSelectionAlgorithm::TopStakeSeats => {
-                if self.sim_config.vote_eligible_nodes.contains(&self.id) {
-                    1
                 } else {
                     0
                 }
@@ -1593,8 +1584,9 @@ impl LinearLeiosNode {
 
     fn should_vote_for(&self, eb: &EndorserBlock, seen: Timestamp) -> Result<(), NoVoteReason> {
         let eb_must_be_received_by = self.sim_config.voting_window().deadline_at(eb.slot);
-        if seen > eb_must_be_received_by {
-            // An EB must be received within L_vote slots of its creation.
+        if seen > eb_must_be_received_by || self.clock.now() > eb_must_be_received_by {
+            // Arrival alone is insufficient: validation must finish by
+            // t0 + 3 * L_hdr + L_vote, including CPU queueing.
             return Err(NoVoteReason::LateEB);
         }
         let Some((rb, header_seen)) = self.latest_rb() else {
@@ -1624,7 +1616,14 @@ impl LinearLeiosNode {
         Ok(())
     }
 
-    fn finish_generating_vote_bundle(&mut self, votes: VoteBundle) {
+    fn finish_generating_vote_bundle(&mut self, votes: VoteBundle, eb: &EndorserBlock) {
+        // Signing may have waited behind other CPU tasks after eligibility
+        // was checked. Do not publish a vote outside its voting window.
+        if self.clock.now() > self.sim_config.voting_window().deadline_at(eb.slot) {
+            self.tracker
+                .track_no_vote(eb.slot, 0, self.id, eb.id(), NoVoteReason::LateEB);
+            return;
+        }
         self.tracker.track_votes_generated(&votes);
         self.count_votes(&votes);
         let id = votes.id;
@@ -1731,6 +1730,12 @@ impl LinearLeiosNode {
     }
 
     fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId) {
+        self.tracker.track_votes_announcement_received(
+            id,
+            from,
+            self.id,
+            Message::AnnounceVotes(id).bytes_size(),
+        );
         let should_request = match self.leios.votes.get(&id) {
             None => true,
             Some(VoteBundleView::Requested) => {
@@ -1748,6 +1753,12 @@ impl LinearLeiosNode {
     }
 
     fn receive_request_votes(&mut self, from: NodeId, id: VoteBundleId) {
+        self.tracker.track_votes_request_received(
+            id,
+            from,
+            self.id,
+            Message::RequestVotes(id).bytes_size(),
+        );
         if let Some(VoteBundleView::Received { votes }) = self.leios.votes.get(&id) {
             self.tracker.track_votes_sent(votes, self.id, from);
             self.queued.send_to(from, Message::Votes(votes.clone()));
@@ -1825,7 +1836,18 @@ impl LinearLeiosNode {
             if !self.sim_config.vote_transport.forwards_duplicates() {
                 return;
             }
+        } else if votes
+            .ebs
+            .keys()
+            .all(|eb| self.leios.pruned_ebs.contains(eb))
+        {
+            // Pruning can remove the cached copy while another validation
+            // is queued. This obsolete arrival contributes no tally and
+            // must not be reported as a new acceptance. Preserve its relay
+            // behavior so this accounting correction does not change load.
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
         } else {
+            self.tracker.track_votes_accepted(id, from, self.id);
             self.count_votes(&votes);
         }
         self.diffuse_vote_bundle(id, Some(from));

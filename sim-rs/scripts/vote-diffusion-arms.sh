@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run the vote diffusion arms over one scenario and print the comparison.
 #
-# Every arm delivers the same votes; they differ only in what they spend to do
-# it. Summary output only, no trace files, so a run costs minutes and megabytes
+# Arms can differ in delivery, votes cast and quorum under CPU/network load.
+# Summary output only, no trace files, so a run costs minutes and megabytes
 # rather than hours and gigabytes.
 #
 #   ./scripts/vote-diffusion-arms.sh [-t topology] [-s slots] [-p extra.yaml]...

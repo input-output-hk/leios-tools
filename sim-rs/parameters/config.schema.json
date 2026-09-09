@@ -798,14 +798,14 @@
     },
     "committee-selection-algorithm": {
       "$ref": "#/definitions/CommitteeSelectionAlgorithm",
-      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake. 'top-stake-seats' seats the top committee-seat-count stake-holding pools, each voting with weight 1."
+      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake. 'top-stake-seats' seats the top committee-seat-count stake-holding pools, each voting with its active stake as weight (CIP-0164 PR #1250)."
     },
     "committee-stake-fraction-threshold": {
       "description": "Fraction of total stake eligible to vote when committee-selection-algorithm is 'top-stake-fraction'. Default 0.95.",
       "type": "number"
     },
     "committee-seat-count": {
-      "description": "Committee size in seats when committee-selection-algorithm is 'top-stake-seats'. The top N stake-holding pools by stake are seated, ties broken by pool identifier ascending, and each casts one vote of weight 1. A topology with fewer stake-holding pools than seats requested seats all of them and the quorum denominator shrinks to match. CIP-0164 recommends 900.",
+      "description": "Committee size in seats when committee-selection-algorithm is 'top-stake-seats'. The top N stake-holding pools by stake are seated, ties broken by pool identifier ascending, and each casts one vote weighted by its active stake. If fewer pools exist, all are seated. The quorum denominator remains total active stake, including stake outside the committee. CIP-0164 PR #1250 proposes 900.",
       "type": "integer",
       "minimum": 1
     }

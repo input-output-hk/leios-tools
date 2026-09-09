@@ -227,6 +227,7 @@ non-persistent-vote-generation-probability: 100.0
 #   wfa-ls             → quorum-weight-fraction × (PV + NPV)
 #   everyone           → quorum-weight-fraction × N nodes
 #   top-stake-fraction → quorum-weight-fraction × total active stake
+#   top-stake-seats    → quorum-weight-fraction × total active stake
 # Replaces the old `vote-threshold` knob; see CIP-164 PR #1196.
 quorum-weight-fraction: 0.6
 # vote-spec#"Generate vote"
@@ -268,12 +269,11 @@ vote-threshold: 300
 committee-selection-algorithm: "wfa-ls"
 # Fraction of total stake eligible to vote when using "top-stake-fraction".
 committee-stake-fraction-threshold: 0.95
-# Committee size in seats when using "top-stake-seats". CIP-0164 governs the
-# committee by seat count and recommends 900. The top `committee-seat-count`
-# stake-holding pools are seated, ties broken by pool identifier ascending,
-# and each seat votes with weight 1. A topology with fewer stake-holding
-# pools than seats requested seats every pool it has, and the quorum
-# denominator shrinks to match; that is the expected case, not an error.
+# Committee size for "top-stake-seats", following the open CIP-0164 PR #1250
+# (proposed value: 900). The top N stake-holding pools are seated, ties broken
+# by pool identifier ascending. Each vote carries its pool's active stake.
+# If fewer pools exist, all are seated. The quorum denominator is total
+# active stake, including stake outside the selected committee.
 committee-seat-count: 900
 
 # Request ordering for vote relay.  Read by the Haskell simulator only; this

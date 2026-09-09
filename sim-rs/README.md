@@ -63,6 +63,14 @@ This uses the sequential engine with 6 shards and `zero-latency-clusters`, typic
 > [!NOTE]
 > For instructions on running the simulation using Docker, please refer to the Docker Simulation section in the root README.md.
 
+## Vote diffusion experiments
+
+The [Linear Leios vote study](docs/vote-diffusion-study.md) compares
+announce/request and push transport, crosses fanout with deduplication order,
+and distinguishes everyone-votes load tests from the proposed stake-weighted
+fixed-size committee. It documents the corrected measurements, reproducible
+run matrix and limitations of the earlier results.
+
 ## Network partitions
 
 The simulator supports time-windowed network-layer partitions: a `partition-scenarios` parameter block cuts a set of directed edges at `start-time-s` and, if `stop-time-s` is set, heals them again. Scenarios are resolved against the topology at init (unknown node names are a hard error), and only edges that actually exist are cut — the true count is reported at runtime:

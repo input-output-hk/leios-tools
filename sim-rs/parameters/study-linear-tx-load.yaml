@@ -3,7 +3,8 @@
 # Layered over the ouroboros-leios study configuration
 # (analysis/sims/2026w18/experiments/config.yaml) it selects the Linear Leios
 # variant with transaction references, the CIP-0164 stage lengths, 12 MB
-# endorser blocks and a steady 6 tx/s of 1500-byte transactions from 60 s to
+# endorser blocks and a 6 ms interarrival gap (~167 tx/s) for 1500-byte
+# transactions from 60 s to
 # 960 s, so the vote traffic is measured under realistic block and transaction
 # load rather than on an idle network.  See scripts/vote-diffusion-study.sh.
 leios-variant: linear-with-tx-references

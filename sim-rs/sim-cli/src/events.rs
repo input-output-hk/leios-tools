@@ -58,6 +58,7 @@ pub struct EventMonitor {
     maximum_ib_age: u64,
     maximum_eb_age: u64,
     vote_threshold: u64,
+    vote_weight_is_stake: bool,
     events_source: LivenessMonitor,
     output_path: Option<PathBuf>,
     aggregate: bool,
@@ -92,6 +93,7 @@ impl EventMonitor {
             maximum_ib_age,
             maximum_eb_age: config.max_eb_age,
             vote_threshold: config.vote_threshold(),
+            vote_weight_is_stake: config.vote_weight_is_stake(),
             events_source: LivenessMonitor::new(config, events_source),
             output_path,
             aggregate: config.aggregate_events,
@@ -129,7 +131,14 @@ impl EventMonitor {
         let mut tx_messages = MessageStats::default();
         let mut ib_messages = MessageStats::default();
         let mut eb_messages = MessageStats::default();
-        let mut vote_messages = MessageStats::default();
+        let mut vote_messages = MessageStats {
+            accepted: matches!(
+                self.variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            )
+            .then_some(0),
+            ..MessageStats::default()
+        };
         let mut vote_wire = VoteWireStats::default();
         let mut no_vote_reasons: BTreeMap<NoVoteReason, u64> = BTreeMap::new();
         let mut txs_dropped_generated_backlog_full: u64 = 0;
@@ -550,6 +559,11 @@ impl EventMonitor {
                     vote_messages.received += 1;
                     vote_timing.bundle_received(&id, recipient.id, time);
                 }
+                Event::VTBundleAccepted { .. } => {
+                    *vote_messages.accepted.get_or_insert(0) += 1;
+                }
+                Event::VTBundleAnnouncementReceived { .. }
+                | Event::VTBundleRequestReceived { .. } => {}
                 Event::EBQuorumReached { id, node, .. } => {
                     vote_timing.record_quorum(id, node.id, time);
                 }
@@ -864,16 +878,31 @@ impl EventMonitor {
             times_to_reach_eb.len(),
             txs.len(),
         ));
-        lines.push(format!("{} total votes were generated.", total_votes));
+        let vote_unit = if self.vote_weight_is_stake {
+            "stake weight"
+        } else {
+            "vote(s)"
+        };
+        // Linear stake-weighted committees sign one body per voter and EB;
+        // a pool's stake is certificate weight, not a count of signatures.
+        let vote_count = if self.vote_weight_is_stake {
+            bundle_count as u64
+        } else {
+            total_votes
+        };
+        lines.push(format!("{vote_count} total votes were generated."));
+        if self.vote_weight_is_stake {
+            lines.push(format!("Total generated voting weight: {total_votes}; quorum requires {} of total active stake per EB.", self.vote_threshold));
+        }
         lines.push(format!(
-            "Each stake pool produced an average of {:.3} vote(s) (stddev {:.3}).",
+            "Each stake pool produced an average of {:.3} {vote_unit} (stddev {:.3}).",
             votes_per_pool_stats.mean, votes_per_pool_stats.std_dev
         ));
         lines.push(format!(
-            "Each EB received an average of {:.3} vote(s) (stddev {:.3}).",
+            "Each EB received an average of {:.3} {vote_unit} (stddev {:.3}).",
             votes_per_eb.mean, votes_per_eb.std_dev
         ));
-        lines.push(format!("There were {bundle_count} bundle(s) of votes. Each bundle contained {:.3} vote(s) (stddev {:.3}).",
+        lines.push(format!("There were {bundle_count} bundle(s) of votes. Each bundle contained {:.3} {vote_unit} (stddev {:.3}).",
             votes_per_bundle_stats.mean, votes_per_bundle_stats.std_dev));
         if !no_vote_reasons.is_empty() {
             let total: u64 = no_vote_reasons.values().sum();
@@ -1126,13 +1155,17 @@ struct MessageStats {
     sent: u64,
     received: u64,
     /// Arrivals the recipient did not need: it already held the item, or it
-    /// finished verifying a copy of one it had already accepted.  The push
-    /// vote transports produce these by design; so does the
+    /// finished verifying a copy of one it had already accepted, or the
+    /// votes refer only to pruned EBs. The push transports produce redundant
+    /// copies by design; so does the
     /// announce-then-request path under `relay-strategy: request-from-all`,
     /// which asks every peer that announces a bundle and then throws the
     /// later answers away.
     duplicates: u64,
     duplicate_bytes: u64,
+    /// Completed first acceptance, available for Linear bundle transports.
+    /// None means the protocol does not emit acceptance events.
+    accepted: Option<u64>,
     /// Verifications of arrivals of this item that actually ran to
     /// completion.  Counted off the CPU task finishing, rather than derived
     /// as `received - duplicates` or taken off the task being scheduled.
@@ -1145,29 +1178,35 @@ struct MessageStats {
 }
 impl MessageStats {
     fn summary_line(&self, name: &str) -> String {
-        let percent_received = self.received as f64 / self.sent as f64 * 100.0;
+        let percent_received = if self.sent == 0 {
+            0.0
+        } else {
+            self.received as f64 / self.sent as f64 * 100.0
+        };
         let mut line = format!(
             "{} {} message(s) were sent. {} of them were received ({:.3}%).",
             self.sent, name, self.received, percent_received
         );
-        if self.duplicates > 0 || self.verifications > 0 {
-            // Each arrival is reported redundant at most once, so this
-            // cannot exceed the arrivals it is a share of.
-            let accepted = self.received.saturating_sub(self.duplicates);
-            let percent_duplicate = self.duplicates as f64 / self.received as f64 * 100.0;
+        if self.accepted.is_some() || self.duplicates > 0 || self.verifications > 0 {
+            let percent_duplicate = if self.received == 0 {
+                0.0
+            } else {
+                self.duplicates as f64 / self.received as f64 * 100.0
+            };
             line.push_str(&format!(
-                " {} of those ({:.3}%) were copies the recipient did not need, costing {:.2} MB, \
-                 leaving {} accepted; {} verification(s) completed",
+                " {} of those ({:.3}%) were redundant or obsolete arrivals, costing {:.2} MB; ",
                 self.duplicates,
                 percent_duplicate,
                 self.duplicate_bytes as f64 / 1e6,
-                accepted,
-                self.verifications,
             ));
-            // Nothing accepted means no rate to quote: printing one divided
-            // by zero as "inf" reads as a measurement rather than as the
-            // absence of one.
-            if accepted > 0 {
+            if let Some(accepted) = self.accepted {
+                // An arrival remains pending until accepted or classified as
+                // a duplicate. Verify-first duplicates may still be queued.
+                let pending = self.received.saturating_sub(self.duplicates + accepted);
+                line.push_str(&format!("{accepted} accepted; {pending} pending; "));
+            }
+            line.push_str(&format!("{} verification(s) completed", self.verifications));
+            if let Some(accepted) = self.accepted.filter(|n| *n > 0) {
                 line.push_str(&format!(
                     " ({:.2} per accepted {})",
                     self.verifications as f64 / accepted as f64,
@@ -2139,14 +2178,45 @@ mod tests {
             received: 12,
             duplicates: 4,
             duplicate_bytes: 4_000_000,
+            accepted: Some(8),
             verifications: 12,
         };
         let line = stats.summary_line("Vote body");
         assert_eq!(
             line,
             "12 Vote body message(s) were sent. 12 of them were received (100.000%). \
-             4 of those (33.333%) were copies the recipient did not need, costing 4.00 MB, \
-             leaving 8 accepted; 12 verification(s) completed (1.50 per accepted Vote body)."
+             4 of those (33.333%) were redundant or obsolete arrivals, costing 4.00 MB; \
+             8 accepted; 0 pending; 12 verification(s) completed (1.50 per accepted Vote body)."
+        );
+    }
+
+    #[test]
+    fn pending_verifications_are_not_accepted_votes() {
+        let stats = MessageStats {
+            sent: 105,
+            received: 105,
+            duplicates: 84,
+            accepted: Some(14),
+            verifications: 14,
+            ..MessageStats::default()
+        };
+        let line = stats.summary_line("Vote body");
+        assert!(
+            line.contains(
+                "14 accepted; 7 pending; 14 verification(s) completed (1.00 per accepted Vote body)"
+            ),
+            "{line}"
+        );
+        let pending_only = MessageStats {
+            sent: 3,
+            received: 3,
+            accepted: Some(0),
+            ..MessageStats::default()
+        }
+        .summary_line("Vote body");
+        assert!(
+            pending_only.contains("0 accepted; 3 pending; 0 verification(s) completed."),
+            "{pending_only}"
         );
     }
 
@@ -2159,6 +2229,7 @@ mod tests {
             received: 0,
             duplicates: 0,
             duplicate_bytes: 0,
+            accepted: Some(0),
             verifications: 2,
         };
         let line = stats.summary_line("Vote body");

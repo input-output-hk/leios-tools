@@ -1,14 +1,8 @@
-# Committee arm: the CIP-0164 seat-count committee.
-#
-# The top `committee-seat-count` stake-holding pools are seated, ties broken
-# by pool identifier ascending, and each seat votes with weight 1.  Quorum is
-# `quorum-weight-fraction × seats actually filled`, so a topology with fewer
-# pools than seats still certifies: the 1500-node pseudo-mainnet topology has
-# 458 stake-holding nodes, so a 900-seat request seats 458 and the quorum
-# denominator is 458.
-#
-# Layer over a scenario config, e.g.
-#   sim-cli <topology> -p parameters/linear-with-tx-references.yaml \
-#     -p parameters/turbo.yaml -p parameters/committee-seats.yaml
+# Fixed-size, stake-weighted committee from the open CIP-0164 PR #1250.
+# https://github.com/cardano-foundation/CIPs/pull/1250
+# Top N stake-holding pools, ties broken by pool identifier ascending.
+# If fewer pools exist, all are seated. Each vote carries its pool's stake;
+# quorum is 75% of total active stake, including unseated pools.
 committee-selection-algorithm: "top-stake-seats"
 committee-seat-count: 900
+quorum-weight-fraction: 0.75

@@ -285,15 +285,14 @@ impl TestDriver {
     /// reason about afterwards are the ones the vote bundle itself produced.
     pub fn produce_vote_bundle(&mut self, node: NodeId) -> Arc<VoteBundle> {
         let _txs: [_; 3] = self.produce_txs(node, false);
-        // A node does not wait out the equivocation window for an EB it
-        // produced itself, so it draws its vote lottery as soon as the EB
-        // exists.  Both wins have to be queued before the slot turns over.
+        // Producers obey the same equivocation gate as every other voter.
         self.win_next_rb_lottery(node, 0);
         self.win_next_vote_lottery(node, 0);
         self.next_slot();
         let (_rb, eb) = self.expect_cpu_task_matching(node, is_new_rb_task);
         let eb = eb.expect("node did not produce EB");
 
+        self.advance_time_to(self.config.voting_window().gate_at(eb.slot));
         let votes = self.expect_cpu_task_matching(node, is_new_vote_task);
         assert_eq!(*votes.ebs.first_key_value().unwrap().0, eb.id());
         votes
@@ -963,10 +962,8 @@ fn sim_config_rejects_top_stake_fraction_when_sigma_c_le_tau() {
     );
 }
 
-/// CIP-0164 governs the committee by seat count.  `top-stake-seats`
-/// seats the top `committee-seat-count` pools by stake; each seat votes
-/// with weight 1 and the quorum denominator is the number of seats
-/// filled.
+/// CIP-0164 PR #1250 selects a fixed count of pools but retains stake
+/// weights and a quorum measured against all active stake.
 ///
 /// Topology: stakes 500/300/200 plus a zero-stake relay, 2 seats.
 /// pool-a and pool-b are seated; pool-c has stake but misses the cut,
@@ -994,10 +991,9 @@ fn top_stake_seats_should_seat_only_the_top_pools() {
         params.quorum_weight_fraction = 0.75;
     });
 
-    // One seat per seated pool, so the denominator is 2 — not the node
-    // count, and not the total stake.
-    assert_eq!(config.expected_total_weight, 2);
-    assert_eq!(config.vote_threshold(), 2);
+    // The unseated pool's 200 stake remains in the quorum denominator.
+    assert_eq!(config.expected_total_weight, 1000);
+    assert_eq!(config.vote_threshold(), 750);
 
     let mut sim = TestDriver::new_with_config(config);
     let pool_a = sim.id_for("pool-a");
@@ -1029,12 +1025,12 @@ fn top_stake_seats_should_seat_only_the_top_pools() {
 
     sim.advance_time_to(sim.now() + (sim.config.header_diffusion_time * 3));
 
-    // A seat is worth exactly one vote, whatever the pool's stake.
+    // One body per pool, but its certificate weight is that pool's stake.
     let votes_a = sim.expect_cpu_task_matching(pool_a, is_new_vote_task);
     assert_eq!(*votes_a.ebs.first_key_value().unwrap().0, eb.id());
-    assert_eq!(*votes_a.ebs.first_key_value().unwrap().1, 1);
+    assert_eq!(*votes_a.ebs.first_key_value().unwrap().1, 500);
     let votes_b = sim.expect_cpu_task_matching(pool_b, is_new_vote_task);
-    assert_eq!(*votes_b.ebs.first_key_value().unwrap().1, 1);
+    assert_eq!(*votes_b.ebs.first_key_value().unwrap().1, 300);
 
     // The unseated pool and the relay stay silent.
     for (node, label) in [(pool_c, "pool-c"), (relay, "relay")] {
@@ -1067,7 +1063,16 @@ fn top_stake_seats_breaks_ties_by_pool_id() {
         params.quorum_weight_fraction = 0.75;
     });
 
-    assert_eq!(config.expected_total_weight, 1);
+    assert_eq!(config.expected_total_weight, 800);
+    assert_eq!(config.vote_threshold(), 600);
+    // Even unanimous approval by this 400-stake committee cannot certify.
+    let seated_stake: u64 = config
+        .nodes
+        .iter()
+        .filter(|n| config.vote_eligible_nodes.contains(&n.id))
+        .map(|n| n.stake)
+        .sum();
+    assert!(seated_stake < config.vote_threshold());
 
     let sim = TestDriver::new_with_config(config);
     let pool_a = sim.id_for("pool-a");
@@ -1079,9 +1084,8 @@ fn top_stake_seats_breaks_ties_by_pool_id() {
 
 /// Fewer pools than seats is the expected case, not an error: the
 /// 1500-node pseudo-mainnet topology has 458 stake-holding nodes, so a
-/// 900-seat request seats 458.  Every pool is seated and the quorum
-/// denominator shrinks to the seats actually filled — keeping the
-/// denominator at the request would put quorum out of reach.
+/// 900-seat request seats 458. Every pool is seated and the quorum
+/// denominator remains total active stake.
 #[test]
 fn top_stake_seats_seats_every_pool_when_short() {
     let topology = new_topology(vec![
@@ -1107,10 +1111,8 @@ fn top_stake_seats_seats_every_pool_when_short() {
 
     // Three pools hold stake, so three of the 900 seats are filled.
     assert_eq!(config.vote_eligible_nodes.len(), 3);
-    assert_eq!(config.expected_total_weight, 3);
-    // ceil(0.75 × 3) = 3, reachable.  Against the requested 900 the
-    // threshold would be 675 and no run could ever certify.
-    assert_eq!(config.vote_threshold(), 3);
+    assert_eq!(config.expected_total_weight, 1000);
+    assert_eq!(config.vote_threshold(), 750);
     assert!(config.vote_threshold() <= config.expected_total_weight);
 
     let sim = TestDriver::new_with_config(config);
@@ -1128,8 +1130,7 @@ fn top_stake_seats_seats_every_pool_when_short() {
     );
 }
 
-/// Zero seats would leave the quorum denominator at zero, which
-/// certifies an EB on no votes at all.  Reject it at config load.
+/// Zero seats means nobody can vote. Reject that configuration.
 #[test]
 fn sim_config_rejects_top_stake_seats_with_zero_seats() {
     let topology = new_topology(vec![
@@ -1173,7 +1174,7 @@ fn seat_count_params(
     (params, topology.into())
 }
 
-/// `top-stake-seats` seats a committee and sets a seat-based quorum
+/// `top-stake-seats` seats a committee and sets a stake-based quorum
 /// denominator, but only the linear node reads that seating when it decides
 /// whether, and with what weight, it votes.  Every other variant runs its own
 /// lottery and never looks at it, so the votes it casts are measured against
@@ -1207,7 +1208,7 @@ fn sim_config_accepts_top_stake_seats_for_the_linear_variants() {
         let (params, topology) = seat_count_params(variant);
         let config = SimConfiguration::build(params, topology)
             .unwrap_or_else(|e| panic!("{variant:?} honours the seating and must build: {e}"));
-        assert_eq!(config.expected_total_weight, 2, "{variant:?}");
+        assert_eq!(config.expected_total_weight, 1000, "{variant:?}");
     }
 }
 
@@ -1288,8 +1289,30 @@ fn announce_then_request_should_not_push_vote_bundle() {
     // Delivering one body over this transport costs three messages, not one.
     // Only the body was ever counted, so the arm that spends the most
     // messages was the one that appeared to spend the fewest.
+    let events = sim.drain_tracked_events();
     assert_eq!(
-        vote_wire_reports(&sim.drain_tracked_events()),
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleAnnouncementReceived { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleRequestReceived { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleAccepted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        vote_wire_reports(&events),
         vec![
             ("announce", node1, node2, 8),
             ("request", node2, node1, 8),
@@ -1827,15 +1850,12 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
         sim.expect_tx_sent(node1, node3, tx.clone());
     }
 
-    // Node 1 mints the EB and votes for it without waiting out the gate, the
-    // way a producer does for its own block.
+    // Node 1 mints the EB; all voters wait out the same gate.
     sim.win_next_rb_lottery(node1, 0);
     sim.win_next_vote_lottery(node1, 0);
     sim.next_slot();
     let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
     let eb = eb.expect("node did not produce EB");
-    let votes_1 = sim.expect_cpu_task_matching(node1, is_new_vote_task);
-
     sim.expect_rb_and_eb_sent(node1, node2, rb.clone(), Some(eb.clone()));
     sim.expect_eb_validated(node2, eb.clone());
     // Node 3 will vote at the gate, so its lottery is armed before it can
@@ -1844,6 +1864,8 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
     sim.expect_rb_and_eb_sent(node1, node3, rb, Some(eb.clone()));
     sim.expect_eb_validated(node3, eb.clone());
 
+    sim.advance_time_to(sim.config.voting_window().gate_at(eb.slot));
+    let votes_1 = sim.expect_cpu_task_matching(node1, is_new_vote_task);
     // Node 1's vote is all it takes: node 2 has a quorum, and says so once.
     let _ = sim.drain_tracked_events();
     sim.expect_vote_bundle_sent(node1, node2, votes_1);
@@ -1877,8 +1899,16 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
     // tally, and whose already-reported quorum, have both been erased.
     let _ = sim.drain_tracked_events();
     sim.expect_vote_bundle_sent(node3, node2, votes_3);
+    let events = sim.drain_tracked_events();
     assert!(
-        quorum_reports(&sim.drain_tracked_events()).is_empty(),
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::VTBundleAccepted { .. })),
+        "votes for pruned EBs are obsolete, not new acceptances"
+    );
+    assert_eq!(duplicate_reports(&events), vec![(node3, node2)]);
+    assert!(
+        quorum_reports(&events).is_empty(),
         "node 2 already reported this EB's quorum; reporting it again puts one \
          node in the stake-weighted sample twice"
     );
@@ -1931,6 +1961,7 @@ fn no_vote_is_cast_before_the_gate() {
     }
 
     sim.win_next_rb_lottery(node1, 0);
+    sim.win_next_vote_lottery(node1, 0);
     sim.next_slot();
     let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
     let eb = eb.expect("node did not produce EB");
@@ -1951,6 +1982,11 @@ fn no_vote_is_cast_before_the_gate() {
 
     // The EB is validated and the lottery is won, so the only thing left
     // between node 2 and a vote is the equivocation-detection period.
+    assert_eq!(
+        sim.queued_vote_generations(node1),
+        0,
+        "producer must also wait"
+    );
     let gate = sim.config.voting_window().gate_at(eb.slot);
     sim.advance_time_to(gate - Duration::from_millis(1));
     assert_eq!(
@@ -1958,7 +1994,9 @@ fn no_vote_is_cast_before_the_gate() {
         0,
         "a vote a millisecond before t0 + 3 * L_hdr would be one no honest node may cast"
     );
+    assert_eq!(sim.queued_vote_generations(node1), 0);
     sim.advance_time_to(gate);
+    assert_eq!(sim.queued_vote_generations(node1), 1);
     assert_eq!(
         sim.queued_vote_generations(node2),
         1,
@@ -2108,4 +2146,134 @@ fn sim_config_rejects_a_fanout_limit_that_could_not_apply() {
             "{name}: expected an error mentioning {expected:?}, got {msg:?}"
         );
     }
+}
+
+/// Arrival before the deadline does not excuse validation finishing after it.
+#[test]
+fn eb_validation_must_finish_by_the_voting_deadline() {
+    for late in [false, true] {
+        let topology = new_topology(vec![
+            ("node-1", new_node(Some(1000), vec!["node-2"])),
+            ("node-2", new_node(Some(1000), vec!["node-1"])),
+        ]);
+        let mut sim = TestDriver::new(topology);
+        let node1 = sim.id_for("node-1");
+        let node2 = sim.id_for("node-2");
+        let txs: [_; 3] = sim.produce_txs(node1, false);
+        for tx in &txs {
+            sim.expect_tx_sent(node1, node2, tx.clone());
+        }
+        sim.win_next_rb_lottery(node1, 0);
+        sim.next_slot();
+        let (rb, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+        let eb = eb.unwrap();
+        sim.expect_rb_and_eb_sent(node1, node2, rb, Some(eb.clone()));
+        let seen = sim.now();
+        sim.win_next_vote_lottery(node2, 0);
+        let deadline = sim.config.voting_window().deadline_at(eb.slot);
+        sim.advance_time_to(deadline + Duration::from_millis(u64::from(late)));
+        sim.expect_cpu_task(node2, CpuTask::EBBlockValidated(eb, seen));
+        assert_eq!(sim.queued_vote_generations(node2), usize::from(!late));
+    }
+}
+
+/// Signing also consumes queued CPU time after the eligibility check.
+#[test]
+fn vote_signing_must_finish_by_the_voting_deadline() {
+    for late in [false, true] {
+        let topology = new_topology(vec![
+            ("node-1", new_node(Some(1000), vec!["node-2"])),
+            ("node-2", new_node(Some(1000), vec!["node-1"])),
+        ]);
+        let mut sim = TestDriver::new(topology);
+        let node1 = sim.id_for("node-1");
+        let _txs: [_; 3] = sim.produce_txs(node1, false);
+        sim.win_next_rb_lottery(node1, 0);
+        sim.win_next_vote_lottery(node1, 0);
+        sim.next_slot();
+        let (_, eb) = sim.expect_cpu_task_matching(node1, is_new_rb_task);
+        let eb = eb.unwrap();
+        sim.advance_time_to(sim.config.voting_window().gate_at(eb.slot));
+        assert_eq!(sim.queued_vote_generations(node1), 1);
+        let deadline = sim.config.voting_window().deadline_at(eb.slot);
+        sim.advance_time_to(deadline + Duration::from_millis(u64::from(late)));
+        sim.drain_tracked_events();
+        sim.expect_cpu_task_matching(node1, is_new_vote_task);
+        let events = sim.drain_tracked_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::VTBundleGenerated { .. }))
+                .count(),
+            usize::from(!late)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::VTBundleNotGenerated {
+                        reason: crate::model::NoVoteReason::LateEB,
+                        ..
+                    }
+                ))
+                .count(),
+            usize::from(late)
+        );
+        if late {
+            assert!(vote_wire_reports(&events).is_empty());
+        }
+    }
+}
+
+#[test]
+fn accepted_votes_exclude_pending_and_validated_duplicates() {
+    let topology = new_topology(vec![
+        ("node-1", new_node(Some(1000), vec!["node-2"])),
+        ("node-2", new_node(Some(1000), vec!["node-1"])),
+    ]);
+    let config = new_sim_config_with(topology, |p| {
+        p.vote_transport = VoteTransport::PushLateDedupe
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let node2 = sim.id_for("node-2");
+    let votes = sim.produce_vote_bundle(node1);
+    assert!(
+        !sim.drain_tracked_events()
+            .iter()
+            .any(|e| matches!(e, Event::VTBundleAccepted { .. })),
+        "local generation is not received acceptance"
+    );
+    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+    let queued = sim
+        .nodes
+        .get_mut(&node2)
+        .unwrap()
+        .handle_message(node1, Message::Votes(votes.clone()));
+    sim.process_events(node2, queued);
+    assert_eq!(sim.queued_vote_validations(node2), 2);
+    assert!(
+        !sim.drain_tracked_events()
+            .iter()
+            .any(|e| matches!(e, Event::VTBundleAccepted { .. }))
+    );
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
+    let events = sim.drain_tracked_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleAccepted { .. }))
+            .count(),
+        1
+    );
+    assert!(duplicate_reports(&events).is_empty());
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes));
+    let events = sim.drain_tracked_events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::VTBundleAccepted { .. }))
+    );
+    assert_eq!(duplicate_reports(&events), vec![(node1, node2)]);
 }

@@ -331,9 +331,8 @@ pub struct RawParameters {
     /// - `top-stake-fraction` (CIP-164 PR #1196): threshold =
     ///   `quorum_weight_fraction × total_active_stake`, and per-voter
     ///   weight is stake (not vote count).
-    /// - `top-stake-seats`: threshold = `quorum_weight_fraction ×
-    ///   seats_filled`, where `seats_filled` is the number of pools
-    ///   actually seated (`min(committee_seat_count, pools with stake)`).
+    /// - `top-stake-seats` (CIP-0164 PR #1250): threshold =
+    ///   `quorum_weight_fraction × total_active_stake`; votes carry pool stake.
     #[serde(default = "default_quorum_weight_fraction")]
     pub quorum_weight_fraction: f64,
     pub vote_bundle_size_bytes_constant: u64,
@@ -367,11 +366,10 @@ pub struct RawParameters {
     pub vote_push_fanout: Option<u64>,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
-    /// Committee size in seats, used by `top-stake-seats`.  CIP-0164
-    /// recommends 900.  Each seated pool casts one vote of weight 1.
-    /// A topology with fewer stake-holding pools than seats requested
-    /// seats every pool it has — that is the expected case, not an
-    /// error — and the quorum denominator shrinks to match.
+    /// Committee size for `top-stake-seats`, following CIP-0164 PR #1250
+    /// (proposed value: 900). Each vote carries its pool's active stake.
+    /// If fewer pools exist, all are seated. Quorum is always measured
+    /// against total active stake, including stake outside the committee.
     #[serde(default = "default_committee_seat_count")]
     pub committee_seat_count: u64,
 
@@ -491,9 +489,9 @@ pub enum CommitteeSelectionAlgorithm {
     WfaLs,
     Everyone,
     TopStakeFraction,
-    /// CIP-0164 governs the committee by seat count.  The top
-    /// `committee_seat_count` stake-holding pools are seated, ties broken
-    /// by pool identifier ascending, and each seat votes with weight 1.
+    /// CIP-0164 PR #1250: the top `committee_seat_count` stake-holding
+    /// pools are seated, ties broken by pool identifier ascending.
+    /// Each vote carries its pool's stake, not a unit seat weight.
     /// Deterministic: membership is a function of the stake distribution
     /// alone, so no eligibility proof is carried.
     TopStakeSeats,
@@ -1485,8 +1483,8 @@ pub struct SimConfiguration {
     pub vote_push_fanout: Option<u64>,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
-    /// TopStakeFraction (CIP-164 PR #1196): `total_stake`.
-    /// TopStakeSeats: the number of seats actually filled.
+    /// TopStakeFraction / TopStakeSeats: total active stake, including
+    /// stake outside the selected committee.
     pub expected_total_weight: u64,
     pub(crate) total_stake: u64,
     pub(crate) praos_fallback: bool,
@@ -1627,6 +1625,18 @@ impl SimConfiguration {
     /// old absolute `vote_threshold` config; downstream consumers
     /// (sim-cli liveness telemetry, per-variant endorsement gates) call
     /// this where they previously read the field.
+    /// Whether the Linear node's vote tally is denominated in active stake.
+    pub fn vote_weight_is_stake(&self) -> bool {
+        matches!(
+            self.variant,
+            LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+        ) && matches!(
+            self.committee_selection,
+            CommitteeSelectionAlgorithm::TopStakeFraction
+                | CommitteeSelectionAlgorithm::TopStakeSeats
+        )
+    }
+
     pub fn vote_threshold(&self) -> u64 {
         // Ceiling so an integer threshold compared against integer
         // voted weights enforces `Σ weight ≥ τ × total` exactly —
@@ -1725,7 +1735,7 @@ impl SimConfiguration {
                 // decides whether and with what weight it votes; the
                 // short/full family and shared-consensus each run their own
                 // lottery and ignore the seating entirely.  Seating a
-                // committee they do not consult while setting a seat-based
+                // committee they do not consult while setting a stake-based
                 // quorum denominator they are measured against produces
                 // certification numbers that mean nothing, so every variant
                 // that does not honour the mode is rejected rather than only
@@ -1739,15 +1749,14 @@ impl SimConfiguration {
                          the linear Leios variants only ('linear', \
                          'linear-with-tx-references'); {:?} runs its own vote lottery and \
                          would ignore the seating while still being measured against a \
-                         seat-based quorum denominator",
+                         stake-based quorum denominator",
                         params.leios_variant
                     );
                 }
                 if params.committee_seat_count == 0 {
                     bail!(
-                        "committee-seat-count is 0, so the committee is empty and the quorum \
-                         denominator would be zero; certification would succeed on no votes \
-                         at all"
+                        "committee-seat-count is 0, so the committee is empty and no votes \
+                         could contribute to certification"
                     );
                 }
                 // Only pools — nodes holding stake — can be seated;
@@ -1778,7 +1787,7 @@ impl SimConfiguration {
         // node implementation sums.  WfaLs: persistent + non-persistent
         // expected vote weight.  Everyone: one seat per topology node.
         // TopStakeFraction: total active stake (PR #1196).
-        // TopStakeSeats: one seat per seated pool.
+        // TopStakeSeats: total active stake (PR #1250), not just seated stake.
         let expected_total_weight: u64 = match params.committee_selection_algorithm {
             CommitteeSelectionAlgorithm::WfaLs => {
                 // PV / NPV are f64 in the config; round to the nearest
@@ -1789,12 +1798,8 @@ impl SimConfiguration {
                 (params.persistent_voters + params.non_persistent_voters).round() as u64
             }
             CommitteeSelectionAlgorithm::Everyone => topology.nodes.len() as u64,
-            CommitteeSelectionAlgorithm::TopStakeFraction => total_stake,
-            // Each seated pool votes with weight 1, so the denominator
-            // is the number of seats actually filled — not the number
-            // requested.  Using the request would make quorum
-            // unreachable on any topology with fewer pools than seats.
-            CommitteeSelectionAlgorithm::TopStakeSeats => vote_eligible_nodes.len() as u64,
+            CommitteeSelectionAlgorithm::TopStakeFraction
+            | CommitteeSelectionAlgorithm::TopStakeSeats => total_stake,
         };
         // A knob that is silently ignored is worse than one that is
         // absent, because a run still produces numbers and nothing says

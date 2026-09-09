@@ -196,21 +196,27 @@ impl TraceAggregator {
             }
             Event::VTBundleAnnounced {
                 sender,
-                recipient,
                 msg_size_bytes,
                 ..
             }
             | Event::VTBundleRequested {
                 sender,
+                msg_size_bytes,
+                ..
+            } => {
+                self.track_control_sent(MessageKind::VoteControl, sender, msg_size_bytes);
+            }
+            Event::VTBundleAnnouncementReceived {
+                recipient,
+                msg_size_bytes,
+                ..
+            }
+            | Event::VTBundleRequestReceived {
                 recipient,
                 msg_size_bytes,
                 ..
             } => {
-                // The 8-byte control messages on the vote mini-protocol get
-                // their own kind rather than being folded into `votes`, so
-                // counting them cannot silently redefine the body figures a
-                // consumer of this stream already reads.
-                self.track_control(MessageKind::VoteControl, sender, recipient, msg_size_bytes);
+                self.track_control_received(MessageKind::VoteControl, recipient, msg_size_bytes);
             }
             Event::EBQuorumReached { node, .. } => {
                 // Not a message, so it has no place in the byte counts: it is
@@ -373,14 +379,16 @@ impl TraceAggregator {
 
     /// A control message that carries no body of its own, so its size is on
     /// the event rather than in the `bytes` map keyed by the body's id.
-    fn track_control(&mut self, kind: MessageKind, sender: Node, recipient: Node, bytes: u64) {
+    fn track_control_sent(&mut self, kind: MessageKind, sender: Node, bytes: u64) {
         self.nodes_updated.insert(sender.clone());
         let sender_data = self.nodes.entry(sender).or_default();
         let sent = sender_data.sent.entry(kind).or_default();
         sent.count += 1;
         sent.bytes += bytes;
         sender_data.bytes_sent += bytes;
+    }
 
+    fn track_control_received(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
         self.nodes_updated.insert(recipient.clone());
         let recipient_data = self.nodes.entry(recipient).or_default();
         let received = recipient_data.received.entry(kind).or_default();
@@ -513,4 +521,80 @@ struct InputBlock {
     pipeline: u64,
     header_bytes: u64,
     txs: Vec<Transaction>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_core::config::NodeId;
+    use std::sync::Arc;
+
+    #[test]
+    fn control_bytes_are_received_only_on_delivery() {
+        let sender = Node {
+            id: NodeId::new(0),
+            name: Arc::new("sender".into()),
+        };
+        let recipient = Node {
+            id: NodeId::new(1),
+            name: Arc::new("recipient".into()),
+        };
+        let id = VoteBundleId {
+            slot: 1,
+            pipeline: 0,
+            producer: sender.clone(),
+        };
+        for request in [false, true] {
+            let mut agg = TraceAggregator::new();
+            let sent = if request {
+                Event::VTBundleRequested {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            } else {
+                Event::VTBundleAnnounced {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            };
+            agg.process(OutputEvent {
+                time_s: Timestamp::zero(),
+                message: sent,
+            });
+            assert_eq!(agg.nodes[&sender].bytes_sent, 8);
+            assert!(
+                !agg.nodes.contains_key(&recipient),
+                "an undelivered or dropped message has no recipient bytes"
+            );
+            let received = if request {
+                Event::VTBundleRequestReceived {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            } else {
+                Event::VTBundleAnnouncementReceived {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            };
+            agg.process(OutputEvent {
+                time_s: Timestamp::from_secs(1),
+                message: received,
+            });
+            assert_eq!(agg.nodes[&sender].bytes_sent, 8);
+            assert_eq!(agg.nodes[&recipient].bytes_received, 8);
+            assert_eq!(
+                agg.nodes[&recipient].received[&MessageKind::VoteControl].count,
+                1
+            );
+        }
+    }
 }

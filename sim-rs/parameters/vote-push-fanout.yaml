@@ -1,22 +1,8 @@
-# Bounded fanout: push each vote body to a limited number of peers instead of
-# every consumer.
+# Fanout limit only: layer AFTER vote-push.yaml or vote-push-late-dedupe.yaml.
+# Keeping transport separate lets the same fanout be tested with both early
+# suppression and verify-first deduplication. A limit on announce/request is
+# rejected by configuration validation because it would have no effect.
 #
-# Why this arm exists.  Under `push`, 96% of vote arrivals are copies of a
-# vote the node already holds, because roughly 26 neighbours forward the same
-# vote within milliseconds.  Those copies are what the node pays verification
-# time for, and CIP-0164 does not bound them: its cap is on how many distinct
-# votes a committee member gets relayed per slot, which the bundle key already
-# enforces.  Cutting the fanout attacks the copies directly, without touching
-# the validation path.
-#
-# Choosing the number.  Gossip needs about ln(N) neighbours per node to cover
-# the network with high probability: ln(750) = 6.6 and ln(1500) = 7.3, hence 8
-# as a starting point against an average degree of 26.  Too low and votes stop
-# reaching a quorum, which shows up directly in the summary as bundles that
-# never reach 95% of nodes, and in the certified-block count.  Sweep it.
-#
-# Each vote picks its own subset, ranked by a hash of sender, bundle and peer
-# under the run seed, so different votes take different paths and the union
-# still covers the network even though one vote does not.
-vote-transport: "push"
+# Lower fanout reduces copies but can also delay or prevent stake quorum.
+# Eight peers is an experimental setting, not a demonstrated safe bound.
 vote-push-fanout: 8
