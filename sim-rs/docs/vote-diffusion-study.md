@@ -52,8 +52,9 @@ allowance.
 
 ## Corrections and status of earlier findings
 
-Results previously reported on PR #1 came from revision `6e24ebe8`. They have
-not been regenerated for the fixes described here.
+Results previously reported on PR #1 came from revision `6e24ebe8`. The
+[corrected 108-run study](vote-diffusion-results-20260910/README.md) now provides
+measurements of the fixed simulator; earlier figures below are historical.
 
 - `top-stake-seats` previously gave each pool weight 1 and used filled seats
   as its quorum denominator. It now uses pool stake and total active stake.
@@ -76,12 +77,14 @@ and a traffic ratio of about 7.9. Those remain historical observations for their
 configured arms. Equal certified-block counts do not prove identical certified
 EB identities; that claim requires comparing identifiers in traces.
 
-The old fanout conclusion is **provisional**. It used a count-based quorum and
-only early deduplication. It therefore did not establish whether fanout relieves
-the verify-first backlog, or what limit works under stake quorum. In particular,
-a mean fraction of delivered bodies is not a per-observer, per-EB guarantee of
-stake arriving by the deadline. Stake weighting can change the result in either
-direction depending on which votes are delayed or lost.
+The old fanout conclusion is **superseded by the corrected matrix**. Fanout 22
+can retain median-observer quorum while losing the 95%-stake observer entirely.
+In the 1500-node everyone-votes late-deduplication arm it reduced verification
+work and increased L1 endorsements from 13 to 18 across three seeds, but Q95
+attainment fell from 37/72 EBs to zero. The stake-weighted reference likewise
+lost Q95 with every tested bounded fanout. See the corrected report for the full
+matrix, missed-quorum counts and the distinction between observer coverage and
+vote-body coverage. These results do not establish a safe fanout limit.
 
 ## Validation of these fixes
 
@@ -97,8 +100,8 @@ direction depending on which votes are delayed or lost.
 - A dry-run check covered 40 planned matrix entries, checking that fanout and
   validation order were crossed under matching seeds, sizes and committees.
 
-The 750/1500-node performance study remains to be rerun; the checks above do
-not replace it.
+The [750/1500-node performance study](vote-diffusion-results-20260910/README.md)
+is now complete. The checks above established correctness before those reruns.
 
 ## Running the corrected matrix
 
