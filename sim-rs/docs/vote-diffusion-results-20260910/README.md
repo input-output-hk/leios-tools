@@ -2,20 +2,42 @@
 
 All **108 runs** completed: two network sizes, two committee modes, three matched seeds, and announce/request plus two push deduplication orders crossed with unlimited/22/16/8 fanout. Simulator revision `0769c07310fba223a09d8082e2744013c6856a43`.
 
+## Transport terminology
+
+**Push** means sending the vote body directly to peers, without waiting for a
+request. **Mark seen** means remembering a vote's identifier so later copies can
+be discarded. Both push modes verify the first copy before accepting its vote.
+
+| Term used in the figures | Simulator setting | What happens when copies arrive? |
+|---|---|---|
+| Announce / request | `announce-then-request` | Announce the identifier; send the body when the peer requests it. |
+| Push: mark seen on arrival | `push` | Remember the identifier immediately, so copies arriving while verification is queued or running are discarded too. |
+| Push: mark seen after verification | `push-late-dedupe` | Remember the identifier after verification completes. Copies arriving in the meantime can each trigger verification; later copies are discarded. |
+
+Earlier descriptions called the two push modes **early deduplication** and
+**late deduplication**. “Late” referred to this recording step, not delayed
+sending. In particular, the second mode does **not** reverify every duplicate:
+it skips copies of votes already verified. The results tables retain the exact
+configuration values above for reproduction. The two committee models are
+explained in the [study guide](../vote-diffusion-study.md#committee-reference).
+
 ## Findings
 
-- **Unrestricted push trades bandwidth for about half a second.** Across all 12 paired size/committee/seed comparisons, early-deduplicating push retained the announce/request arm's Q95 attainment and L1 endorsement counts. Its conditional mean Q95 time was 0.356–0.530s earlier, with 7.81–7.88× the vote mini-protocol bytes. These are equal counts, not an EB-identity comparison.
-- **Stake-weighted voting does not reproduce the everyone-votes certification loss under unlimited late deduplication.** At 1500 nodes, both push orders reached Q95 for 58/72 generated EBs and produced 25 L1 endorsements across the three seeds. Late deduplication still incurred 9.69 completed verifications per accepted arrival and increased conditional mean Q95 times from 3.334–3.339s to 3.796–3.814s. The reference has 458 eligible pools, so it also generates fewer vote bodies than the 1500-voter stress arm.
-- **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes, late-deduplication arm, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; median-observer quorum attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted late-deduplication arm, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but median attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
+- **Unrestricted push trades bandwidth for about half a second.** Across all 12 paired size/committee/seed comparisons, push that marks votes seen on arrival retained the announce/request arm's Q95 attainment and L1 endorsement counts. Its conditional mean Q95 time was 0.356–0.530s earlier, with 7.81–7.88× the vote mini-protocol bytes. These are equal counts, not an EB-identity comparison.
+- **At 1500 nodes, marking votes seen after verification reduces endorsement counts only in the everyone-votes arm.** With unrestricted push, the stake-weighted reference reached Q95 for 58/72 generated EBs and produced 25 L1 endorsements across the three seeds with either push setting. Marking seen after verification still incurred 9.69 completed verifications per accepted arrival and increased conditional mean Q95 times from 3.334–3.339s to 3.796–3.814s. The reference has 458 eligible pools, so it also generates fewer vote bodies than the 1500-voter stress arm.
+- **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; median-observer quorum attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but median attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
 - **None of the tested bounded fanouts preserves broad quorum availability.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained median-observer quorum, while 16 and 8 never reached the median in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
 
 These results support unlimited simple vote streaming as feasible under the modeled load, with a bandwidth/latency trade-off. They do not establish a safe bounded-fanout setting or predict the Haskell node's exact performance. Lower fanout reduces verification work but, in this matrix, does not preserve the broad availability of unrestricted diffusion.
 
 ## Reading the measurements
 
+`t0` is the start of the ranking-block slot that announced the EB. Chart times
+and deadlines are measured from that point.
+
 An EB quorum means a node has votes totaling 75% of active stake in the fixed-size reference, or 75% of nodes in the everyone-votes stress arm. **Q50/Q95 are different thresholds:** the time when nodes holding 50%/95% of observer stake each have that EB quorum. They are not 50%/95% of vote bodies received. The summary's separate body-coverage statistic is unweighted by observer stake and is not a certificate-availability guarantee.
 
-Counts include every generated EB; missed quorums remain in the denominator. Timing means include only EBs that reached the stated observer threshold. All reported attained observer quorums in this batch occurred by 7s, so their counts by 7s, by 14s and at run end coincide. This does not make 7s and 14s interchangeable protocol constraints. L1 endorsements count blocks that actually included an endorsement; they are not the same as EBs that reached a quorum somewhere.
+Counts include every generated EB; missed quorums remain in the denominator. Timing means include only EBs that reached the stated observer threshold. All reported attained observer quorums in this batch occurred by 7s, so their counts by 7s, by 14s and at run end coincide. This does not make 7s and 14s interchangeable protocol constraints. L1 endorsements count generated ranking blocks carrying an endorsement. This is neither a count of EBs reaching quorum somewhere nor a separately verified count on the final canonical chain.
 
 ## Availability versus verification cost at 1500 nodes
 
@@ -63,13 +85,14 @@ These compare unlimited-fanout push with announce/request for the same topology,
 
 ![L1 endorsement counts at each fanout, split by committee and duplicate-check order](figures/endorsement-comparison.png)
 
-**Figure 3.** Under unrestricted push, late deduplication reduces endorsements
-from 25 to 13 in the everyone-votes stress arm, while the stake-weighted reference
-retains 25 with either order. Fanout 22 raises the stress arm's late-deduplication
-count to 18, but reduces the reference to 19. This explains why the local recovery
+**Figure 3.** Under unrestricted push, marking votes seen after verification
+reduces endorsements from 25 to 13 in the everyone-votes stress arm, while the stake-weighted reference
+retains 25 with either setting. Fanout 22 raises the stress arm's count with that
+policy to 18, but reduces the reference to 19. This explains why the local recovery
 in the overloaded arm is insufficient to recommend fanout 22: Figure 1 also
-shows its loss of Q95 availability. Bars sum three seeds and count actual L1
-endorsements, not EBs with a quorum somewhere.
+shows its loss of Q95 availability. Bars sum three seeds and count generated L1
+blocks carrying endorsements. They do not measure inclusion on the final
+canonical chain.
 
 ## Fanout and validation order
 

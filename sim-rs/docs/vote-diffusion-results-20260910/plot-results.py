@@ -71,10 +71,10 @@ def save(fig, name):
 
 
 def fanout_overview():
-    fig, axes = plt.subplots(2, 2, figsize=(11.2, 8.0), sharex=True)
-    fig.subplots_adjust(left=.10, right=.96, top=.80, bottom=.20, hspace=.34, wspace=.22)
+    fig, axes = plt.subplots(2, 2, figsize=(11.2, 9.0))
+    fig.subplots_adjust(left=.105, right=.965, top=.81, bottom=.22, hspace=.64, wspace=.39)
     heading(fig, 'Less duplicate verification, weaker quorum availability',
-            '1500 nodes · push with duplicate checks after verification · three matched seeds')
+            '1500 nodes · push: mark votes seen after verification · three matched seeds')
     titles = ['Stake-weighted reference\n458 eligible voters', 'Everyone-votes stress test\n1500 eligible voters']
     for column, committee in enumerate(COMMITTEES):
         top, bottom = axes[:, column]
@@ -92,7 +92,8 @@ def fanout_overview():
                          xytext=(0, 12), textcoords='offset points', ha='center',
                          color=AMBER, weight='bold', fontsize=11)
         top.set_ylim(0, 14)
-        top.set_yticks([0, 4, 8, 12])
+        top.set_yticks([0, 4, 8, 12], labels=['0×', '4×', '8×', '12×'])
+        top.set_ylabel('Completed verifications\nper accepted arrival (×)', labelpad=10)
         for key, color, marker, offset in [('q50', BLUE, 's', -.025), ('q95', TEAL, 'o', .025)]:
             percentages = [100 * a[key] / a['ebs'] for a in totals]
             xs = [x + offset for x in range(4)]
@@ -117,32 +118,32 @@ def fanout_overview():
                                 ha='center', color=TEAL, weight='bold', fontsize=11)
         bottom.set_ylim(-7, 106)
         bottom.set_yticks([0, 25, 50, 75, 100], labels=['0%', '25%', '50%', '75%', '100%'])
-        bottom.set_xticks(range(4), labels=['All peers', '22', '16', '8'])
-        bottom.set_xlabel('Maximum peers per vote', labelpad=9)
+        bottom.set_ylabel('EBs meeting Q50/Q95\nby t0 + 14 s (%)', labelpad=10)
         for ax in [top, bottom]:
+            ax.set_xticks(range(4), labels=['All peers', '22', '16', '8'])
+            ax.set_xlabel('Fanout cap (peers per vote)', labelpad=9)
             ax.set_xlim(-.4, 3.4)
             ax.axvspan(.72, 1.28, color='#fff3df', zorder=0)
             grid(ax)
-    axes[0, 0].set_ylabel('Completed verifications\nper accepted arrival', labelpad=12)
-    axes[1, 0].set_ylabel('EBs attaining observer quorum\nby the 14s inclusion boundary', labelpad=12)
     fig.legend(handles=[Line2D([0], [0], color=BLUE, marker='s', markerfacecolor='white', lw=2,
-                              label='Q50: nodes holding 50% of stake'),
+                              label='Q50: quorum at nodes holding 50% stake'),
                         Line2D([0], [0], color=TEAL, marker='o', lw=2,
-                              label='Q95: nodes holding 95% of stake')],
-               loc='lower center', bbox_to_anchor=(.53, .066), ncol=2, frameon=False, fontsize=10.5)
-    fig.text(.06, .041, 'Small hollow marks: individual seeds. Lines and labels: pooled totals; all 72 generated EBs remain in the denominator.',
+                              label='Q95: quorum at nodes holding 95% stake')],
+               loc='lower center', bbox_to_anchor=(.53, .091), ncol=2, frameon=False, fontsize=10.5)
+    fig.text(.06, .065, 'Small hollow marks: individual seeds. Lines and labels: pooled totals; all 72 generated EBs remain in the denominator.',
              fontsize=9.2, color=MUTED)
-    fig.text(.06, .019, 'Q50/Q95 measure where an EB quorum is available, not how much voting stake a certificate requires. Lines join tested caps only.',
+    fig.text(.06, .037, '0/72 means no EB reached that observer-coverage target; it does not mean zero endorsements. Lines join tested caps only.',
              fontsize=9.2, color=MUTED)
     save(fig, 'fanout-overview')
 
 
 def transport_comparison():
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 6.4), sharey=True)
-    fig.subplots_adjust(left=.27, right=.96, top=.78, bottom=.28, wspace=.27)
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 6.6))
+    fig.subplots_adjust(left=.30, right=.975, top=.78, bottom=.30, wspace=.92)
     heading(fig, 'Push saves time, at about eight times the vote traffic',
-            'Unrestricted diffusion · push suppresses duplicates before verification · three matched seeds')
+            'All peers · push: mark votes seen on arrival · three matched seeds')
     labels = []
+    traffic_labels = []
     for row, (nodes, committee) in enumerate([(750, 'top-stake-seats'), (750, 'everyone'),
                                              (1500, 'top-stake-seats'), (1500, 'everyone')]):
         a, b = group(nodes, committee, 'announce-then-request'), group(nodes, committee, 'push')
@@ -151,6 +152,7 @@ def transport_comparison():
         assert summary['l1_endorsements'] == aggregate(b)['l1_endorsements']
         committee_label = 'Stake-weighted' if committee == 'top-stake-seats' else 'Everyone votes'
         labels.append(f"{nodes} nodes · {committee_label}\nQ95: {summary['q95']}/{summary['ebs']} EBs in both arms")
+        traffic_labels.append(f"{nodes} / {'stake' if committee == 'top-stake-seats' else 'everyone'}")
         y = 3 - row
         for offset, baseline, push in zip([-.15, 0, .15], a, b):
             for ax, x1, x2 in [(axes[0], baseline['quorum_p95']['mean_s'], push['quorum_p95']['mean_s']),
@@ -159,22 +161,26 @@ def transport_comparison():
                 ax.scatter(x1, y + offset, s=35, color=GRAY, marker='s', zorder=3)
                 ax.scatter(x2, y + offset, s=35, color=TEAL, marker='o', zorder=3)
     axes[0].set_yticks([3, 2, 1, 0], labels=labels)
-    axes[0].tick_params(axis='y', labelsize=10.5, pad=13)
+    axes[0].tick_params(axis='y', labelsize=10, pad=10)
+    axes[0].set_ylabel('Network size and committee', labelpad=10)
+    axes[1].set_yticks([3, 2, 1, 0], labels=traffic_labels)
+    axes[1].tick_params(axis='y', labelsize=10)
+    axes[1].set_ylabel('Nodes / committee', labelpad=10)
     axes[0].set_xlim(3.0, 4.17)
     axes[0].set_xticks([3.0, 3.25, 3.5, 3.75, 4.0])
     axes[0].set_title('Quorum time', loc='left', pad=15)
-    axes[0].set_xlabel('Mean Q95 time from t0 (seconds)', labelpad=12)
+    axes[0].set_xlabel('Mean Q95 time from t0 (s)', labelpad=12)
     axes[1].set_xlim(.3, 8.8)
     axes[1].set_xticks([1, 2, 4, 6, 8], labels=['1×', '2×', '4×', '6×', '8×'])
     axes[1].set_title('Vote mini-protocol traffic', loc='left', pad=15)
-    axes[1].set_xlabel('Bytes relative to the paired baseline', labelpad=12)
+    axes[1].set_xlabel('Vote traffic relative to\nannounce/request (×)', labelpad=12)
     for ax in axes:
         ax.set_ylim(-.55, 3.55)
         grid(ax, 'x')
     fig.legend(handles=[Line2D([0], [0], marker='s', color=GRAY, lw=0, label='Announce / request'),
-                        Line2D([0], [0], marker='o', color=TEAL, lw=0, label='Push · early deduplication')],
+                        Line2D([0], [0], marker='o', color=TEAL, lw=0, label='Push: mark seen on arrival')],
                loc='lower center', bbox_to_anchor=(.53, .115), ncol=2, frameon=False, fontsize=11)
-    fig.text(.06, .068, 'Each thin segment joins the same seed. Timing means include only EBs reaching Q95; labels retain the missed EBs.',
+    fig.text(.06, .068, 'Each thin segment joins the same seed. Q95: nodes holding 95% of stake each have a quorum. Means include attained EBs only.',
              fontsize=9.5, color=MUTED)
     fig.text(.06, .032, 'All attained Q95 quorums were before the 7s voting deadline. Equal counts do not establish identical EB identities.',
              fontsize=9.5, color=MUTED)
@@ -182,10 +188,10 @@ def transport_comparison():
 
 
 def endorsement_comparison():
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 6.1), sharey=True)
-    fig.subplots_adjust(left=.085, right=.965, top=.75, bottom=.29, wspace=.18)
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 6.1))
+    fig.subplots_adjust(left=.105, right=.965, top=.75, bottom=.29, wspace=.39)
     heading(fig, 'Endorsement counts expose the cost of lower fanout',
-            '1500 nodes · actual L1 blocks carrying an endorsement · totals across three matched seeds')
+            '1500 nodes · generated L1 blocks carrying an endorsement · totals across three matched seeds')
     for column, committee in enumerate(COMMITTEES):
         ax = axes[column]
         ax.set_title('Stake-weighted reference · 458 voters' if column == 0 else 'Everyone-votes stress · 1500 voters',
@@ -199,15 +205,15 @@ def endorsement_comparison():
         ax.set_ylim(0, 30)
         ax.set_yticks([0, 5, 10, 15, 20, 25, 30])
         ax.set_xticks(range(4), labels=['All peers', '22', '16', '8'])
-        ax.set_xlabel('Maximum peers per vote', labelpad=12)
+        ax.set_xlabel('Fanout cap (peers per vote)', labelpad=12)
+        ax.set_ylabel('Generated L1 blocks with\nan endorsement (count)', labelpad=10)
         grid(ax)
-    axes[0].set_ylabel('L1 endorsements across three seeds', labelpad=12)
-    fig.legend(handles=[Patch(facecolor=TEAL, label='Duplicate checks before verification'),
-                        Patch(facecolor=AMBER, label='Duplicate checks after verification')],
+    fig.legend(handles=[Patch(facecolor=TEAL, label='Push: mark seen on arrival'),
+                        Patch(facecolor=AMBER, label='Push: mark seen after verification')],
                loc='lower center', bbox_to_anchor=(.53, .105), ncol=2, frameon=False, fontsize=10.5)
-    fig.text(.06, .064, 'These are endorsement counts, not the number of EBs with a quorum somewhere. Both columns contain 72 generated EBs.',
+    fig.text(.06, .064, 'Counts sum three seeds; each committee generated 72 EBs. Generated blocks are not a count on the final canonical chain.',
              fontsize=9.5, color=MUTED)
-    fig.text(.06, .028, 'Per-seed results remain in results.json. The committees differ in both voting weight and vote volume.', fontsize=9.5, color=MUTED)
+    fig.text(.06, .028, 'Marking a vote seen on arrival also skips copies arriving while verification is pending. The other mode can verify those copies again.', fontsize=9.5, color=MUTED)
     save(fig, 'endorsement-comparison')
 
 

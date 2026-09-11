@@ -5,6 +5,16 @@ committee, and whether selective fetching or reduced fanout improves timing,
 bandwidth or verification cost. The comparison covers Linear Leios. Full Haskell
 node parity is not a prerequisite for this experiment.
 
+## Transport terminology
+
+The [transport definitions in the report](vote-diffusion-results-20260910/README.md#transport-terminology)
+map figure labels to the exact configuration values. `push` marks a vote's ID
+seen on arrival and suppresses copies even while verification is pending.
+`push-late-dedupe` marks it seen after verification, so copies received while the
+first check is pending can trigger additional checks. Both discard copies of
+already verified votes. This is the meaning of “early” and “late” deduplication
+in earlier descriptions; neither term describes when the vote is sent.
+
 ## Committee reference
 
 [CIP PR #1196](https://github.com/cardano-foundation/CIPs/pull/1196) replaced
