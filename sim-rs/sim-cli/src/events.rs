@@ -1065,7 +1065,12 @@ impl EventMonitor {
         // the announcements and requests on the same mini-protocol are on
         // the line below rather than folded into it.
         lines.push(vote_messages.summary_line("Vote body"));
-        if !vote_wire.is_empty() {
+        // Complete control-message accounting is implemented for Linear only.
+        if matches!(
+            self.variant,
+            LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+        ) && !vote_wire.is_empty()
+        {
             lines.push(vote_wire.summary_line(vote_messages.sent));
         }
         info_span!("network").in_scope(|| info!("{}\n  {}", network_header, lines.join("\n  ")));

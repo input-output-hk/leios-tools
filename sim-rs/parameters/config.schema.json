@@ -139,8 +139,7 @@
       "enum": [
         "announce-then-request",
         "push",
-        "push-late-dedupe",
-        "push-no-dedupe"
+        "push-late-dedupe"
       ],
       "type": "string"
     },
@@ -745,7 +744,7 @@
     },
     "vote-transport": {
       "$ref": "#/definitions/VoteTransport",
-      "description": "How a vote bundle reaches a peer in the Rust simulator: announce-then-request, push, push-late-dedupe, or push-no-dedupe."
+      "description": "How a vote bundle reaches a peer in the Rust simulator: announce-then-request, push, or push-late-dedupe."
     },
     "vote-transport-echo-to-source": {
       "description": "Forward a vote back to the peer it arrived from. Off by default; the Haskell node does this because its notify server has no per-peer provenance.",

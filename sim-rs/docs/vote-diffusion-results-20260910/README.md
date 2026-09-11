@@ -19,6 +19,15 @@ Counts include every generated EB; missed quorums remain in the denominator. Tim
 
 ## Availability versus verification cost at 1500 nodes
 
+![Verification work and Q50/Q95 quorum availability versus fanout, for the two 1500-node committees](figures/fanout-overview.png)
+
+**Figure 1.** Reducing fanout lowers completed verifications per accepted arrival
+in both committees (top panels). At fanout 22, Q50 attainment rises only in the
+everyone-votes stress arm; Q95 falls to zero in both committees (bottom panels).
+The small hollow marks show individual seeds and the labeled lines pool all
+three. The shaded column highlights fanout 22. Lines connect tested settings;
+they do not establish behavior between those settings.
+
 The table sums each arm's three seeds (72 generated EBs). Observer counts are attainment by 14s; the same counts were attained by 7s. `Verify / accepted` divides total completed verifications by total accepted arrivals.
 
 | Committee | Transport | Fanout | First-node quorum | Q50 | Q95 | L1 endorsements | Verify / accepted |
@@ -34,6 +43,13 @@ The table sums each arm's three seeds (72 generated EBs). Observer counts are at
 
 ## Transport comparisons
 
+![Paired quorum times and vote traffic for announce/request versus unrestricted push](figures/transport-comparison.png)
+
+**Figure 2.** Each segment compares the same seed. Push consistently moves Q95
+earlier (left), while sending about eight times the vote mini-protocol bytes
+(right). The row labels retain missed EBs: the time advantage is conditional on
+attainment, not a claim that every EB met the deadline.
+
 These compare unlimited-fanout push with announce/request for the same topology, committee and seed. Time differences are between conditional per-EB observer means; matching counts do not prove matching EB identities.
 
 | Nodes | Committee | Push / announce traffic | Push − announce Q95 mean (s) | Equal Q95 attainment counts | Equal L1 endorsement counts |
@@ -42,6 +58,18 @@ These compare unlimited-fanout push with announce/request for the same topology,
 | 750 | everyone | 7.82–7.82× | -0.356–-0.356 | 3/3 seeds | 3/3 seeds |
 | 1500 | top-stake-seats | 7.88–7.88× | -0.530–-0.515 | 3/3 seeds | 3/3 seeds |
 | 1500 | everyone | 7.88–7.88× | -0.478–-0.476 | 3/3 seeds | 3/3 seeds |
+
+## Endorsements and validation order
+
+![L1 endorsement counts at each fanout, split by committee and duplicate-check order](figures/endorsement-comparison.png)
+
+**Figure 3.** Under unrestricted push, late deduplication reduces endorsements
+from 25 to 13 in the everyone-votes stress arm, while the stake-weighted reference
+retains 25 with either order. Fanout 22 raises the stress arm's late-deduplication
+count to 18, but reduces the reference to 19. This explains why the local recovery
+in the overloaded arm is insufficient to recommend fanout 22: Figure 1 also
+shows its loss of Q95 availability. Bars sum three seeds and count actual L1
+endorsements, not EBs with a quorum somewhere.
 
 ## Fanout and validation order
 
@@ -100,7 +128,7 @@ Upstream config: `ouroboros-leios` `f307ed5fa7077a32eb470ca3832a34092882bfe3`. B
 
 The [study guide](../vote-diffusion-study.md) documents the matrix. [results.json](results.json) contains all per-run metrics and matched comparisons; [runs.csv](runs.csv) records completed runs. Reproducibility artifacts:
 
-- [inputs.tar.gz](inputs.tar.gz): all 113 original input files (including both topologies and all 108 per-run overlays), plus the empty tracked-source patch. [input-sha256.json](input-sha256.json) checks the original bytes inside this archive. The standalone YAML files beside the report are whitespace-normalized reading copies; use the archive for exact checksums.
+- [inputs.tar.gz](inputs.tar.gz): all 113 original input files (including both topologies and all 108 per-run overlays), plus the empty tracked-source patch. [input-sha256.json](input-sha256.json) checks the original bytes inside this archive. Extract this archive to inspect the exact configurations used.
 - [summary-logs.tar.gz](summary-logs.tar.gz): the 108 original summary logs, checked by [log-sha256.json](log-sha256.json). These are summaries, not per-event traces.
 - [extract-results.py](extract-results.py): the summary parser, without runner controls or publication side effects. It can regenerate the results from these artifacts. No additional simulation is needed for this check.
 - [binary.sha256](binary.sha256) and [revision.txt](revision.txt): the original executable hash and source revision. The executable remains local. Rebuilding on another platform need not reproduce its binary hash.
@@ -116,3 +144,27 @@ python3 extract-results.py /tmp/leios-results-check
 ```
 
 Raw simulator runs used the frozen executable at revision `0769c073` with no tracked source diff. Inputs and executable checksums were verified before execution and again after the batch. All 108 logs have final protocol/network summaries, no logged error/panic, consistent acceptance accounting and consistent quorum/deadline counts. Parsed results were independently regenerated from the published archives. `passed` means the simulation completed successfully, not that every EB reached quorum.
+
+### Regenerating the figures
+
+[plot-results.py](plot-results.py) reads only the committed `results.json` and
+writes the three PNGs in `figures/`. It uses per-seed paired comparisons, summed
+counts, and `sum(verifications) / sum(accepted)` for pooled verification cost;
+no plotted measurements are entered manually. The figures were rendered with
+Python 3.13 and Matplotlib 3.11.2:
+
+```sh
+python3 -m venv /tmp/leios-figure-env
+/tmp/leios-figure-env/bin/pip install matplotlib==3.11.2
+/tmp/leios-figure-env/bin/python plot-results.py
+```
+
+The source revision above remains the provenance of the 108 experiments. The
+subsequent PR scope cleanup removes an unused transport mode and limits complete
+vote-traffic reporting to Linear; it does not change the three studied Linear
+transport modes, their inputs, or these archived results.
+The cleanup passes 155 Rust tests (one ignored). Twenty paired 8-node, 40-slot
+release runs against the frozen study binary produced identical complete
+protocol and network summaries. They covered both committees, two seeds, all
+three transports, and both push orders with unlimited and bounded fanout, using
+uneven stake and 100 ms verification to exercise concurrent duplicates.

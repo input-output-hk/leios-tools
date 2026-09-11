@@ -301,13 +301,8 @@ vote-diffusion-strategy: "peer-order"
 #                          validation window are each validated.  This is the
 #                          Haskell node's ordering, which verifies before
 #                          inserting into its seen-set.
-#   push-no-dedupe         forward on every arrival, including bundles already
-#                          held.  Not a run arm: forwarding on every arrival has
-#                          no damping, so on any topology with cycles this is a
-#                          broadcast storm that does not terminate.  Kept as the
-#                          evidence that suppression is load-bearing.
 #
-# Those four are the only accepted values.  "peer-order", "freshest-first" and
+# These three are the only accepted values.  "peer-order", "freshest-first" and
 # "oldest-first" belong to vote-diffusion-strategy above; they are not aliases
 # of anything here, and setting one of them here fails to load the config.
 vote-transport: "announce-then-request"

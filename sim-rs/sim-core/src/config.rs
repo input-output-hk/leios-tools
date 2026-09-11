@@ -523,23 +523,12 @@ pub enum VoteTransport {
     /// its seen-set and notes "one redundant verification per
     /// concurrently-received duplicate".  Forwarding still happens once.
     PushLateDedupe,
-    /// Push the body on every arrival, re-forwarding bundles already held.
-    ///
-    /// Not a design candidate and not a run arm: forwarding on every arrival
-    /// has no damping, so on any topology with cycles it is a broadcast storm
-    /// that does not terminate.  Kept because it is the executable evidence
-    /// that suppression is load-bearing rather than an optimisation.
-    PushNoDedupe,
 }
 
 impl VoteTransport {
     /// True when bodies are pushed rather than announced.
     pub fn is_push(self) -> bool {
-        matches!(self, Self::Push | Self::PushLateDedupe | Self::PushNoDedupe)
-    }
-    /// True when an already-held bundle is forwarded again.
-    pub fn forwards_duplicates(self) -> bool {
-        matches!(self, Self::PushNoDedupe)
+        matches!(self, Self::Push | Self::PushLateDedupe)
     }
     /// True when a bundle is marked on receipt, so copies arriving while it
     /// is still being validated are dropped rather than validated again.
@@ -1619,12 +1608,6 @@ impl SimConfiguration {
         }
     }
 
-    /// Absolute quorum threshold in the units the local node
-    /// implementation sums per-voter weights — derived from
-    /// `quorum_weight_fraction × expected_total_weight`.  Replaces the
-    /// old absolute `vote_threshold` config; downstream consumers
-    /// (sim-cli liveness telemetry, per-variant endorsement gates) call
-    /// this where they previously read the field.
     /// Whether the Linear node's vote tally is denominated in active stake.
     pub fn vote_weight_is_stake(&self) -> bool {
         matches!(
@@ -1637,6 +1620,12 @@ impl SimConfiguration {
         )
     }
 
+    /// Absolute quorum threshold in the units the local node
+    /// implementation sums per-voter weights — derived from
+    /// `quorum_weight_fraction × expected_total_weight`.  Replaces the
+    /// old absolute `vote_threshold` config; downstream consumers
+    /// (sim-cli liveness telemetry, per-variant endorsement gates) call
+    /// this where they previously read the field.
     pub fn vote_threshold(&self) -> u64 {
         // Ceiling so an integer threshold compared against integer
         // voted weights enforces `Σ weight ≥ τ × total` exactly —

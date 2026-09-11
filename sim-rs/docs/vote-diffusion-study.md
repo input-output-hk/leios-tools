@@ -65,8 +65,8 @@ measurements of the fixed simulator; earlier figures below are historical.
   acceptance. The obsolete-vote classification preserves existing relay behavior.
 - Vote announcement/request receives are emitted on delivery. Aggregate output
   no longer credits the recipient when the sender merely queues a message.
-- The fanout overlay only sets a fanout limit. It no longer overrides
-  `push-late-dedupe` with early-deduplicating `push`.
+- The matrix runner sets fanout and transport independently in each generated
+  overlay, so a fanout sweep cannot override `push-late-dedupe` with `push`.
 - Producers now wait for the voting gate. Both validation and signing completion
   are checked against the deadline. These behavior changes require rerunning
   comparisons before quoting the old timings as measurements of current code.
@@ -88,7 +88,7 @@ vote-body coverage. These results do not establish a safe fanout limit.
 
 ## Validation of these fixes
 
-- `cargo test --workspace --locked --offline`: 156 passed, one ignored.
+- `cargo test --workspace --locked --offline`: 155 passed, one ignored (after removing the unused no-deduplication mode and its test).
 - Twenty 8-node, 40-slot smoke runs: two seeds, both committee modes,
   announce/request, and both push dedupe orders with unlimited and bounded
   fanout. These check execution and accounting, not mainnet-scale feasibility.
@@ -150,15 +150,10 @@ This plans 15 runs: five arms per seed. Rerun the command with a new output
 directory and without `VOTE_STUDY_DRY_RUN=1` to execute them. The command preserves
 the supplied config rather than silently fetching a moving upstream revision.
 
-For an individual fanout experiment, layer the fanout overlay after the chosen
-push transport:
-
-```sh
-sim-cli <topology.yaml> -s 400 -p <study-config.yaml> \
-  -p parameters/study-linear-tx-load.yaml -p parameters/turbo.yaml \
-  -p parameters/committee-seats.yaml \
-  -p parameters/vote-push-late-dedupe.yaml -p parameters/vote-push-fanout.yaml
-```
+For an individual experiment, reuse the corresponding generated overlay from
+that plan directory, or extract the exact overlay from the published input
+archive. The runner produces the complete committee, seed, transport and fanout
+settings together; separate transport presets are unnecessary.
 
 Record quorum attainment and misses per EB, observer stake percentiles, vote
 bodies generated, actual eligible stake, total protocol bytes, completed

@@ -1431,23 +1431,14 @@ impl LeiosNode {
         }
     }
 
-    /// The announcement and the request are counted here for the same
-    /// reason they are counted in `linear_leios`: the "Vote mini-protocol
-    /// traffic" line in the run summary adds them to the bodies, and a
-    /// variant that sends them without reporting them makes that line
-    /// state, as a measurement, that it sent none.  This variant announces
-    /// on every link and requests once per body, so the two together
-    /// outnumber the bodies by an order of magnitude.
     fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId) {
         if self.leios.votes.get(&id).is_none_or(|v| {
             self.sim_config.relay_strategy == RelayStrategy::RequestFromAll
                 && matches!(v, VoteBundleState::Requested)
         }) {
             self.leios.votes.insert(id, VoteBundleState::Requested);
-            let request = SimulationMessage::RequestVotes(id);
-            self.tracker
-                .track_votes_requested(id, self.id, from, request.bytes_size());
-            self.queued.send_to(from, request);
+            self.queued
+                .send_to(from, SimulationMessage::RequestVotes(id));
         }
     }
 
@@ -1496,10 +1487,8 @@ impl LeiosNode {
             if *peer == from {
                 continue;
             }
-            let announcement = SimulationMessage::AnnounceVotes(id);
-            self.tracker
-                .track_votes_announced(id, self.id, *peer, announcement.bytes_size());
-            self.queued.send_to(*peer, announcement);
+            self.queued
+                .send_to(*peer, SimulationMessage::AnnounceVotes(id));
         }
     }
 
@@ -1851,10 +1840,8 @@ impl LeiosNode {
             .votes
             .insert(votes.id, VoteBundleState::Received(votes.clone()));
         for peer in &self.consumers {
-            let announcement = SimulationMessage::AnnounceVotes(votes.id);
-            self.tracker
-                .track_votes_announced(votes.id, self.id, *peer, announcement.bytes_size());
-            self.queued.send_to(*peer, announcement);
+            self.queued
+                .send_to(*peer, SimulationMessage::AnnounceVotes(votes.id));
         }
     }
 

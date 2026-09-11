@@ -1637,7 +1637,7 @@ impl LinearLeiosNode {
     /// Send a vote bundle onwards to consumers.
     ///
     /// `from` is the peer it arrived from, and is skipped unless
-    /// `vote-diffusion-echo-to-source` is set on a push transport; `None`
+    /// `vote-transport-echo-to-source` is set on a push transport; `None`
     /// when we produced it.  Under `announce-then-request` this sends the
     /// 8-byte id and the peer asks for the body; under the push strategies
     /// it sends the body.
@@ -1785,16 +1785,8 @@ impl LinearLeiosNode {
                 Some(VoteBundleView::Requested) => strategy.suppresses_in_flight(),
                 None => false,
             };
-        if already_have && !strategy.forwards_duplicates() {
-            // Dropped here, so here is where this arrival is reported.  An
-            // arrival is reported exactly once: an arm that forwards its
-            // duplicates instead of dropping them goes on to validate this
-            // one, and `finish_validating_vote_bundle` reports it there,
-            // once the verification it did not need has been paid for.
-            // Reporting in both places made `push-no-dedupe` count every
-            // duplicate twice, which drove duplicates past received,
-            // saturated accepted to zero, and printed a duplicate share
-            // above 100% and an "inf" verification rate.
+        if already_have {
+            // Report a dropped arrival once, before scheduling any verification.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
             return;
         }
@@ -1823,19 +1815,10 @@ impl LinearLeiosNode {
             )
             .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }));
         if already_held {
-            // A copy we paid to verify and did not need: under
-            // `push-late-dedupe` one that arrived inside the validation
-            // window, under `request-from-all` a second answer to the same
-            // bundle requested from every peer that announced it, and under
-            // `push-no-dedupe` every copy of a bundle already held, since
-            // that arm forwards rather than drops them and so reaches here.
-            // The verification is already spent; counting it here is what
-            // keeps those arms from looking cheaper than they are, and it
-            // is the only place they are counted.
+            // Late deduplication and request-from-all can validate multiple
+            // copies concurrently. Only the first completion is accepted.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
-            if !self.sim_config.vote_transport.forwards_duplicates() {
-                return;
-            }
+            return;
         } else if votes
             .ebs
             .keys()

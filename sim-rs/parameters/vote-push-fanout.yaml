@@ -1,8 +1,0 @@
-# Fanout limit only: layer AFTER vote-push.yaml or vote-push-late-dedupe.yaml.
-# Keeping transport separate lets the same fanout be tested with both early
-# suppression and verify-first deduplication. A limit on announce/request is
-# rejected by configuration validation because it would have no effect.
-#
-# Lower fanout reduces copies but can also delay or prevent stake quorum.
-# Eight peers is an experimental setting, not a demonstrated safe bound.
-vote-push-fanout: 8

@@ -1229,12 +1229,7 @@ fn the_request_ordering_key_is_not_the_vote_transport() {
              and documenting one sends readers into a parse error"
         );
     }
-    for value in [
-        "announce-then-request",
-        "push",
-        "push-late-dedupe",
-        "push-no-dedupe",
-    ] {
+    for value in ["announce-then-request", "push", "push-late-dedupe"] {
         serde_yaml::from_str::<VoteTransport>(value)
             .unwrap_or_else(|e| panic!("{value} is a documented transport and must parse: {e}"));
     }
@@ -1522,84 +1517,6 @@ fn push_should_drop_duplicate_vote_bundle() {
     );
     sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
     sim.expect_no_message(node2, node3, Message::Votes(votes));
-}
-
-/// `push-no-dedupe` is the deliberate worst case: it pays for a bundle it
-/// already holds and sends it on again.  Only that single step is asserted;
-/// the strategy is a broadcast storm and does not settle if run out.
-#[test]
-fn push_no_dedupe_should_revalidate_duplicate_vote_bundle() {
-    let topology = new_topology(vec![
-        ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
-        ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
-        ("node-3", new_node(Some(1000), vec!["node-1", "node-2"])),
-    ]);
-    let config = new_sim_config_with(topology, |params| {
-        params.vote_transport = VoteTransport::PushNoDedupe;
-    });
-    let mut sim = TestDriver::new_with_config(config);
-    let node1 = sim.id_for("node-1");
-    let node2 = sim.id_for("node-2");
-    let node3 = sim.id_for("node-3");
-
-    let votes = sim.produce_vote_bundle(node1);
-
-    sim.expect_message(node1, node2, Message::Votes(votes.clone()));
-    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
-    sim.expect_message(node1, node3, Message::Votes(votes.clone()));
-    sim.expect_cpu_task(node3, CpuTask::VTBundleValidated(node1, votes.clone()));
-
-    // Node 3's copy is a duplicate for node 2, and node 2 validates it anyway.
-    let _ = sim.drain_tracked_events();
-    sim.expect_message(node3, node2, Message::Votes(votes.clone()));
-    let on_arrival = duplicate_reports(&sim.drain_tracked_events());
-    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes.clone()));
-    let after_validating = duplicate_reports(&sim.drain_tracked_events());
-
-    // Reported once, and reported where the arm actually pays for it: this
-    // is the one strategy that forwards a duplicate rather than dropping it,
-    // so it goes on to verify the copy and is charged for it at the far end.
-    // Reporting the same arrival on the way in as well drove duplicates past
-    // arrivals, which is how the summary came to print a duplicate share
-    // above 100% and an "inf" verification rate.
-    assert_eq!(
-        [on_arrival, after_validating].concat(),
-        vec![(node3, node2)],
-        "the arm that suppresses nothing is the one whose duplicates most need reporting, \
-         and it needs them reported once"
-    );
-
-    // Having revalidated it, node 2 sends it on to every consumer but node 3.
-    // Following that hop is the point: node 1 already holds the bundle, so
-    // its copy is the run's second duplicate, and stopping the test here left
-    // the one-report-per-arrival property asserted on a single arrival.  It
-    // is on the second, where a bundle that keeps being forwarded keeps being
-    // reported, that a double report compounds.
-    let _ = sim.drain_tracked_events();
-    sim.expect_message(node2, node1, Message::Votes(votes.clone()));
-    assert!(
-        duplicate_reports(&sim.drain_tracked_events()).is_empty(),
-        "this arm verifies before it calls a copy redundant, so nothing is \
-         reported on the way in"
-    );
-    assert_eq!(
-        sim.queued_vote_validations(node1),
-        1,
-        "the copy is queued for a verification node 1 does not need, which is \
-         the cost this arm exists to show"
-    );
-
-    sim.expect_cpu_task(node1, CpuTask::VTBundleValidated(node2, votes.clone()));
-    assert_eq!(
-        duplicate_reports(&sim.drain_tracked_events()),
-        vec![(node2, node1)],
-        "one report for this arrival too, at the far end, where the wasted \
-         verification was paid for"
-    );
-
-    // And on it goes: node 1 forwards a bundle it has now verified twice.
-    // This is the storm, and the reason the arm is never run out.
-    sim.expect_message(node1, node3, Message::Votes(votes));
 }
 
 /// `push-late-dedupe` marks a bundle only once it is fully held, so a copy

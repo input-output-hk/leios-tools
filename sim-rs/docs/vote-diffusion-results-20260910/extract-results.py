@@ -93,6 +93,6 @@ for r in results:
     lines.append(f"| {r['nodes']} | {'stake' if r['committee']=='top-stake-seats' else 'all-nodes'} | {r['seed']} | {r['transport']} | {r['fanout']} | {r['ebs_generated']} | {r['l1_endorsements']} | {q['reached']}/{q['total']} | {q['by_vote_deadline']}/{q['total']} | {mean} | {r['wire_mb_rounded']/1000:.3f} | {amp} | {r['pending']} | {r['elapsed_s']/60:.1f} |")
 if errors:
     lines+=['','## Parsing issues','']+[f"- {e['run']}: {e['error']}" for e in errors]
-lines+=['','Full numeric data and paired comparisons: [results.json](results.json). Execution progress: [status.json](status.json). Commands, overlays, logs and checksums are retained beside this report.','']
+lines+=['','Full numeric data and paired comparisons: [results.json](results.json). Inputs, overlays and summary logs are retained beside this report.','']
 atomic('RESULTS.md','\n'.join(lines))
 print(f'Parsed {len(results)}/{len(runs)} completed runs; {len(errors)} parsing issues.',flush=True)

@@ -1,8 +1,0 @@
-# Fixed-size, stake-weighted committee from the open CIP-0164 PR #1250.
-# https://github.com/cardano-foundation/CIPs/pull/1250
-# Top N stake-holding pools, ties broken by pool identifier ascending.
-# If fewer pools exist, all are seated. Each vote carries its pool's stake;
-# quorum is 75% of total active stake, including unseated pools.
-committee-selection-algorithm: "top-stake-seats"
-committee-seat-count: 900
-quorum-weight-fraction: 0.75
