@@ -132,7 +132,7 @@ def fanout_overview():
                loc='lower center', bbox_to_anchor=(.53, .091), ncol=2, frameon=False, fontsize=10.5)
     fig.text(.06, .065, 'Small hollow marks: individual seeds. Lines and labels: pooled totals; all 72 generated EBs remain in the denominator.',
              fontsize=9.2, color=MUTED)
-    fig.text(.06, .037, '0/72 means no EB reached that observer-coverage target; it does not mean zero endorsements. Lines join tested caps only.',
+    fig.text(.06, .037, '0/72: no EB had a quorum at the stake share shown in the legend. Endorsements can still occur. Lines join tested caps only.',
              fontsize=9.2, color=MUTED)
     save(fig, 'fanout-overview')
 

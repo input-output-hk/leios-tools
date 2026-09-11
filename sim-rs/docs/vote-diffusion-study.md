@@ -15,6 +15,12 @@ first check is pending can trigger additional checks. Both discard copies of
 already verified votes. This is the meaning of “early” and “late” deduplication
 in earlier descriptions; neither term describes when the vote is sent.
 
+The [Haskell source context and sim-rs comparison](vote-diffusion-results-20260910/README.md#why-compare-the-two-duplicate-handling-orders)
+explain why both settings are tested: the inspected prototype records a vote as
+known only after verification, so concurrent copies can repeat that work without
+counting the vote twice. The alternative suppresses pending copies to measure
+how much verification work they cause. Neither arm is a Haskell runtime benchmark.
+
 ## Committee reference
 
 [CIP PR #1196](https://github.com/cardano-foundation/CIPs/pull/1196) replaced
@@ -82,19 +88,21 @@ measurements of the fixed simulator; earlier figures below are historical.
   comparisons before quoting the old timings as measurements of current code.
 
 The earlier everyone-votes comparison reported 1500-node quorum timings of
-about 3.525s for push versus 4.002s for announce/request at the 95%-stake observer,
+about 3.525s for push versus 4.002s for announce/request at Q95 (quorum available
+at nodes collectively holding 95% of network stake),
 and a traffic ratio of about 7.9. Those remain historical observations for their
 configured arms. Equal certified-block counts do not prove identical certified
 EB identities; that claim requires comparing identifiers in traces.
 
 The old fanout conclusion is **superseded by the corrected matrix**. Fanout 22
-can retain median-observer quorum while losing the 95%-stake observer entirely.
-In the 1500-node everyone-votes late-deduplication arm it reduced verification
-work and increased L1 endorsements from 13 to 18 across three seeds, but Q95
-attainment fell from 37/72 EBs to zero. The stake-weighted reference likewise
+can retain Q50 (quorum at nodes holding 50% of stake) while losing Q95 entirely.
+In the 1500-node everyone-votes arm that marks seen after verification, it
+reduced verification work and increased L1 endorsements from 13 to 18 across
+three seeds, but Q95 attainment fell from 37/72 EBs to zero. The stake-weighted reference likewise
 lost Q95 with every tested bounded fanout. See the corrected report for the full
-matrix, missed-quorum counts and the distinction between observer coverage and
-vote-body coverage. These results do not establish a safe fanout limit.
+matrix, missed-quorum counts and the distinction between nodes having enough
+votes for a quorum and individual vote bodies being delivered. These results do
+not establish a safe fanout limit.
 
 ## Validation of these fixes
 
@@ -105,7 +113,7 @@ vote-body coverage. These results do not establish a safe fanout limit.
 - An overloaded trace reconciled exactly with its summary: 56 distinct relevant
   acceptances, 14 pending arrivals and 98 completed verifications.
 - An uneven-stake trace counted eight generated vote bodies separately from
-  2400 total voting weight. All 16 reported observer quorums met 750 stake out
+  2400 total voting weight. All 16 reported node quorums met 750 stake out
   of 1000 total active stake.
 - A dry-run check covered 40 planned matrix entries, checking that fanout and
   validation order were crossed under matching seeds, sizes and committees.
@@ -165,20 +173,20 @@ that plan directory, or extract the exact overlay from the published input
 archive. The runner produces the complete committee, seed, transport and fanout
 settings together; separate transport presets are unnecessary.
 
-Record quorum attainment and misses per EB, observer stake percentiles, vote
+Record quorum attainment and misses per EB, Q50/Q95 attainment, vote
 bodies generated, actual eligible stake, total protocol bytes, completed
 verifications, accepted arrivals and pending arrivals. Keep a fixed scenario
-and seed across each comparison. The 95%-stake observer statistic is a mean of
-per-EB observer quantiles; it is not a worst-case deadline guarantee. Preserve
-miss counts alongside conditional timing averages.
+and seed across each comparison. The reported Q95 time is a mean of per-EB times
+at which nodes holding 95% of stake each have a quorum; it is not a worst-case
+deadline guarantee. Preserve miss counts alongside conditional timing averages.
 
 ## Limits on transfer to the Haskell node
 
-The Haskell source audit used cardano-node `afa091b4`, whose `cabal.project`
-pins ouroboros-consensus `7abeda65`. Its seen-check, verification and insertion
-order motivates `push-late-dedupe`. The simulator does not reproduce the node's
-per-peer serial handling, shared notification queue or credit-dependent vote
-drops. The audit was source inspection, not a node runtime benchmark.
+The [pinned Haskell audit in the report](vote-diffusion-results-20260910/README.md#why-compare-the-two-duplicate-handling-orders)
+links the exact node and consensus revisions and explains the checks before and
+after verification that motivate `push-late-dedupe`. The simulator does not
+reproduce the node's per-peer serial handling, shared notification queue or
+credit-dependent vote drops. The audit was source inspection, not a node runtime benchmark.
 
 The simulator's ranking-header identifier announcement/request/body exchange
 also differs from the node's full-header Leios announcements. Haskell validates

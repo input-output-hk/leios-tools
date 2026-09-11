@@ -21,12 +21,66 @@ it skips copies of votes already verified. The results tables retain the exact
 configuration values above for reproduction. The two committee models are
 explained in the [study guide](../vote-diffusion-study.md#committee-reference).
 
+## Why compare the two duplicate-handling orders?
+
+Direct streaming delivers the same vote along several peer connections. The
+question is whether those copies consume only bandwidth, or also repeat the
+expensive signature check and delay other work on the node's CPU. This is why
+the experiment crosses fanout with duplicate handling, in addition to comparing
+push against announce/request.
+
+**What the inspected Haskell prototype does.** The audit used cardano-node's
+`leios-prototype` at
+[`afa091b4`](https://github.com/IntersectMBO/cardano-node/blob/afa091b4af2795d1d9c46e59145ed16127760f7b/cabal.project#L95),
+which pins ouroboros-consensus `7abeda65`. At that revision,
+[`LeiosVoteState.addVote`](https://github.com/IntersectMBO/ouroboros-consensus/blob/7abeda6501282c8a2491ccf66c16f051d74fb895/ouroboros-consensus/src/ouroboros-consensus/LeiosVoteState.hs#L109)
+does the following:
+
+1. Check the shared set of successfully verified votes; return if already known.
+2. Validate the vote, including its BLS signature, outside the atomic state update.
+3. Check the set again atomically, then store and count the vote only if another
+   handler has not already done so.
+
+Two peer handlers can both pass step 1 before either reaches step 3. Both then
+pay for verification, but only one counts and relays the vote. The second check
+prevents double counting; it does not recover the duplicate verification work.
+The source comment explicitly identifies concurrent duplicates as a remaining
+source of redundant checks.
+
+**What sim-rs does.** The existing announce/request baseline records a pending
+request and normally avoids fetching the body again; if multiple bodies are
+requested, it schedules verification for each and detects redundant copies on
+completion. This PR adds two push alternatives in
+[`receive_votes` and `finish_validating_vote_bundle`](../../sim-core/src/sim/linear_leios.rs):
+
+- `push` records an in-flight identifier before scheduling verification. Further
+  copies are discarded while that check is queued or running.
+- `push-late-dedupe` checks for an already verified copy on arrival but does not
+  reserve the identifier while verification is pending. Concurrent copies can
+  each schedule a check; only the first completion counts the vote.
+
+For example, if three copies arrive before the first check completes, these
+settings schedule one versus three verifications, with one accepted vote in
+either case. Verification is modeled as CPU work, not actual BLS execution.
+
+**How far the comparison transfers.** The second setting is motivated by the
+Haskell ordering above; the first measures the benefit of suppressing pending
+copies. They are simulator alternatives, not two measured Haskell versions.
+The prototype's
+[notification handlers and queues](https://github.com/IntersectMBO/ouroboros-consensus/blob/7abeda6501282c8a2491ccf66c16f051d74fb895/ouroboros-consensus-diffusion/src/ouroboros-consensus-diffusion/Ouroboros/Consensus/Network/NodeToNode.hs#L580)
+process votes serially per peer and share outgoing notification capacity with
+other messages, dropping votes when no notification credit is available. Those
+mechanisms affect which duplicates reach verification and are not reproduced
+here. This was source inspection at a pinned revision, not a Haskell runtime
+benchmark or a claim about the latest prototype. The measured amplification and
+endorsement changes below therefore apply to the simulator.
+
 ## Findings
 
 - **Unrestricted push trades bandwidth for about half a second.** Across all 12 paired size/committee/seed comparisons, push that marks votes seen on arrival retained the announce/request arm's Q95 attainment and L1 endorsement counts. Its conditional mean Q95 time was 0.356–0.530s earlier, with 7.81–7.88× the vote mini-protocol bytes. These are equal counts, not an EB-identity comparison.
 - **At 1500 nodes, marking votes seen after verification reduces endorsement counts only in the everyone-votes arm.** With unrestricted push, the stake-weighted reference reached Q95 for 58/72 generated EBs and produced 25 L1 endorsements across the three seeds with either push setting. Marking seen after verification still incurred 9.69 completed verifications per accepted arrival and increased conditional mean Q95 times from 3.334–3.339s to 3.796–3.814s. The reference has 458 eligible pools, so it also generates fewer vote bodies than the 1500-voter stress arm.
-- **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; median-observer quorum attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but median attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
-- **None of the tested bounded fanouts preserves broad quorum availability.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained median-observer quorum, while 16 and 8 never reached the median in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
+- **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; Q50 attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but Q50 attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
+- **None of the tested bounded fanouts preserves quorum availability at nodes holding 95% of stake.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained Q50, while 16 and 8 never reached Q50 in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
 
 These results support unlimited simple vote streaming as feasible under the modeled load, with a bandwidth/latency trade-off. They do not establish a safe bounded-fanout setting or predict the Haskell node's exact performance. Lower fanout reduces verification work but, in this matrix, does not preserve the broad availability of unrestricted diffusion.
 
@@ -35,9 +89,27 @@ These results support unlimited simple vote streaming as feasible under the mode
 `t0` is the start of the ranking-block slot that announced the EB. Chart times
 and deadlines are measured from that point.
 
-An EB quorum means a node has votes totaling 75% of active stake in the fixed-size reference, or 75% of nodes in the everyone-votes stress arm. **Q50/Q95 are different thresholds:** the time when nodes holding 50%/95% of observer stake each have that EB quorum. They are not 50%/95% of vote bodies received. The summary's separate body-coverage statistic is unweighted by observer stake and is not a certificate-availability guarantee.
+A **quorum at one node** requires verified votes totaling 75% of active stake in
+the reference arm, or 75% of node votes in the everyone-votes stress arm.
 
-Counts include every generated EB; missed quorums remain in the denominator. Timing means include only EBs that reached the stated observer threshold. All reported attained observer quorums in this batch occurred by 7s, so their counts by 7s, by 14s and at run end coincide. This does not make 7s and 14s interchangeable protocol constraints. L1 endorsements count generated ranking blocks carrying an endorsement. This is neither a count of EBs reaching quorum somewhere nor a separately verified count on the final canonical chain.
+We separately measure **how widely nodes have collected a quorum**:
+
+- **Q50:** nodes collectively holding 50% of network stake each have a quorum for the EB.
+- **Q95:** nodes collectively holding 95% of network stake each have a quorum for the EB.
+
+Q50/Q95 are shorthand defined for this study, not additional certificate
+thresholds. Earlier wording called this “observer coverage”; no separate observer
+role is implied. Both measurements weight the receiving nodes by stake, even in
+the everyone-votes arm. Neither measures the fraction of votes inside one
+certificate. The separate vote-body delivery statistic is unweighted by stake.
+
+The [CIP's network characteristics](https://github.com/cardano-foundation/CIPs/blob/master/CIP-0164/README.md#protocol-parameters)
+also discuss propagation to approximately 95% of honest stake. That related
+propagation target does not define this study's particular quorum statistic.
+Failing Q95 therefore does not, by itself, establish that certification stopped
+or that a certificate is invalid.
+
+Counts include every generated EB; missed quorums remain in the denominator. Timing means include only EBs whose quorum became available at the stated share of stake. All reported Q50/Q95 quorums in this batch occurred by 7s, so their counts by 7s, by 14s and at run end coincide. This does not make 7s and 14s interchangeable protocol constraints. L1 endorsements count generated ranking blocks carrying an endorsement. This is neither a count of EBs reaching quorum somewhere nor a separately verified count on the final canonical chain.
 
 ## Availability versus verification cost at 1500 nodes
 
@@ -50,7 +122,7 @@ The small hollow marks show individual seeds and the labeled lines pool all
 three. The shaded column highlights fanout 22. Lines connect tested settings;
 they do not establish behavior between those settings.
 
-The table sums each arm's three seeds (72 generated EBs). Observer counts are attainment by 14s; the same counts were attained by 7s. `Verify / accepted` divides total completed verifications by total accepted arrivals.
+The table sums each arm's three seeds (72 generated EBs). Q50/Q95 counts are attainment by 14s; the same counts were attained by 7s. `Verify / accepted` divides total completed verifications by total accepted arrivals.
 
 | Committee | Transport | Fanout | First-node quorum | Q50 | Q95 | L1 endorsements | Verify / accepted |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -72,7 +144,7 @@ earlier (left), while sending about eight times the vote mini-protocol bytes
 (right). The row labels retain missed EBs: the time advantage is conditional on
 attainment, not a claim that every EB met the deadline.
 
-These compare unlimited-fanout push with announce/request for the same topology, committee and seed. Time differences are between conditional per-EB observer means; matching counts do not prove matching EB identities.
+These compare unlimited-fanout push with announce/request for the same topology, committee and seed. Time differences are between conditional per-EB Q95 means; matching counts do not prove matching EB identities.
 
 | Nodes | Committee | Push / announce traffic | Push − announce Q95 mean (s) | Equal Q95 attainment counts | Equal L1 endorsement counts |
 |---:|---|---:|---:|---:|---:|
@@ -140,7 +212,7 @@ Each row combines three seeds. Q95 attainment is the sum of per-run EB counts. T
 ## Scope and interpretation
 
 - The fixed-size mode is stake-weighted with quorum against total active stake. Its 900-seat request seats all 216 available pools at 750 nodes and all 458 at 1500 nodes. The everyone mode supplies the larger vote-volume stress test but uses node-count quorum. These modes differ in both voting weight and vote volume.
-- A fanout result applies to the tested topology, seed and validation order. The tables supersede the previous general recommendation that 22 is usable and lower limits are unusable; the observer threshold and actual endorsement counts matter. Three seeds do not establish a universal safe limit.
+- A fanout result applies to the tested topology, seed and validation order. The tables supersede the previous general recommendation that 22 is usable and lower limits are unusable; the share of stake at nodes with a quorum and actual endorsement counts matter. Three seeds do not establish a universal safe limit.
 - Quorum by 7s is an early-attainment metric. Voting closes at 7s; vote diffusion has an additional allowance until the 14s inclusion boundary.
 - The fixed 400-slot horizon can leave the newest EBs unfinished. Means are conditional on attaining quorum. Equal counts do not establish equal EB identities, and these summary-only runs do not contain per-EB traces.
 - Shared header approximations can affect differences between arms through CPU queueing, header eligibility and subsequent votes. Missing per-peer serialization, notification credits and shared queues limit quantitative transfer to Haskell. Full node parity remains outside this voting-strategy study.
