@@ -132,6 +132,15 @@ pub fn build_action(
             fire_at_slot: *fire_at_slot,
         }),
         ActionSpec::VoteFlood { count } => Box::new(catalogue::VoteFlood { count: *count }),
+        ActionSpec::EbBurst {
+            withhold_slots,
+            count,
+            n_txs,
+        } => Box::new(catalogue::EbBurst {
+            withhold_slots: *withhold_slots,
+            count: *count,
+            n_txs: *n_txs,
+        }),
     }
 }
 
