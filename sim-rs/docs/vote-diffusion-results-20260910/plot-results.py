@@ -114,7 +114,7 @@ def fanout_overview():
             else:
                 bottom.annotate(f"{a['q50']}/72", (x, 100 * a['q50'] / 72), xytext=(0, 14),
                                 textcoords='offset points', ha='center', color=BLUE, weight='bold', fontsize=11)
-                bottom.annotate(f"{a['q95']}/72", (x, 0), xytext=(0, 10), textcoords='offset points',
+                bottom.annotate(f"{a['q95']}/72", (x, 100 * a['q95'] / a['ebs']), xytext=(0, 10), textcoords='offset points',
                                 ha='center', color=TEAL, weight='bold', fontsize=11)
         bottom.set_ylim(-7, 106)
         bottom.set_yticks([0, 25, 50, 75, 100], labels=['0%', '25%', '50%', '75%', '100%'])

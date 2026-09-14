@@ -1622,6 +1622,10 @@ impl LinearLeiosNode {
         if self.clock.now() > self.sim_config.voting_window().deadline_at(eb.slot) {
             self.tracker
                 .track_no_vote(eb.slot, 0, self.id, eb.id(), NoVoteReason::LateEB);
+            if self.sim_config.emit_conformance_events {
+                self.tracker
+                    .track_linear_no_vote_generated(self.id, eb.id());
+            }
             return;
         }
         self.tracker.track_votes_generated(&votes);
@@ -1642,6 +1646,11 @@ impl LinearLeiosNode {
     /// 8-byte id and the peer asks for the body; under the push strategies
     /// it sends the body.
     fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
+        let obsolete = match self.leios.votes.get(&id) {
+            Some(VoteBundleView::Received { votes }) => self.vote_bundle_is_obsolete(votes),
+            _ => false,
+        };
+        let mut recipients = 0u64;
         let push = self.sim_config.vote_transport.is_push();
         // The echo is a push-path artefact: it models the Haskell node's
         // notify server, which pushes bodies and has no per-peer
@@ -1664,8 +1673,8 @@ impl LinearLeiosNode {
         };
         // Bounded fanout: push the body to at most `k` peers rather than
         // every consumer.  Only the push path floods, so only the push
-        // path is limited; the announce path sends a body when asked and
-        // produces no copies to cut.
+        // path is limited; on the announce path, requests determine which
+        // peers receive bodies.
         //
         // The subset is chosen by ranking peers on a hash of
         // `(sender, bundle, peer)` under the global seed.  That is a pure
@@ -1710,6 +1719,7 @@ impl LinearLeiosNode {
             if selected.as_ref().is_some_and(|set| !set.contains(peer)) {
                 continue;
             }
+            recipients += 1;
             match &body {
                 Some(votes) => {
                     self.tracker.track_votes_sent(votes, self.id, *peer);
@@ -1726,6 +1736,18 @@ impl LinearLeiosNode {
                     self.queued.send_to(*peer, announcement);
                 }
             }
+        }
+        if obsolete && recipients > 0 {
+            let (bodies, announcements, bytes) = match &body {
+                Some(votes) => (recipients, 0, recipients * votes.bytes),
+                None => (
+                    0,
+                    recipients,
+                    recipients * Message::AnnounceVotes(id).bytes_size(),
+                ),
+            };
+            self.tracker
+                .track_obsolete_votes_sent(id, self.id, bodies, announcements, bytes);
         }
     }
 
@@ -1760,6 +1782,10 @@ impl LinearLeiosNode {
             Message::RequestVotes(id).bytes_size(),
         );
         if let Some(VoteBundleView::Received { votes }) = self.leios.votes.get(&id) {
+            if self.vote_bundle_is_obsolete(votes) {
+                self.tracker
+                    .track_obsolete_votes_sent(id, self.id, 1, 0, votes.bytes);
+            }
             self.tracker.track_votes_sent(votes, self.id, from);
             self.queued.send_to(from, Message::Votes(votes.clone()));
         }
@@ -1767,6 +1793,10 @@ impl LinearLeiosNode {
 
     fn receive_votes(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
         self.tracker.track_votes_received(&votes, from, self.id);
+        if self.vote_bundle_is_obsolete(&votes) {
+            self.tracker
+                .track_obsolete_votes_received(votes.id, self.id, votes.bytes);
+        }
         // A bundle already held costs nothing beyond the bytes: real nodes test
         // the seen-set rather than verifying again.  Only the push strategies
         // can recognise a redundant body this early; the announce path has
@@ -1803,6 +1833,7 @@ impl LinearLeiosNode {
     }
 
     fn finish_validating_vote_bundle(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
+        let obsolete = self.vote_bundle_is_obsolete(&votes);
         let id = votes.id;
         let already_held = self
             .leios
@@ -1814,16 +1845,16 @@ impl LinearLeiosNode {
                 },
             )
             .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }));
+        if obsolete {
+            self.tracker
+                .track_obsolete_votes_validated(id, self.id, already_held);
+        }
         if already_held {
             // Late deduplication and request-from-all can validate multiple
             // copies concurrently. Only the first completion is accepted.
             self.tracker.track_votes_duplicate(&votes, from, self.id);
             return;
-        } else if votes
-            .ebs
-            .keys()
-            .all(|eb| self.leios.pruned_ebs.contains(eb))
-        {
+        } else if obsolete {
             // Pruning can remove the cached copy while another validation
             // is queued. This obsolete arrival contributes no tally and
             // must not be reported as a new acceptance. Preserve its relay
@@ -1834,6 +1865,15 @@ impl LinearLeiosNode {
             self.count_votes(&votes);
         }
         self.diffuse_vote_bundle(id, Some(from));
+    }
+
+    // Classification is local and phase-specific: a bundle may become
+    // obsolete while its validation is queued. Telemetry never changes routing.
+    fn vote_bundle_is_obsolete(&self, votes: &VoteBundle) -> bool {
+        votes
+            .ebs
+            .keys()
+            .all(|eb| self.leios.pruned_ebs.contains(eb))
     }
 
     fn count_votes(&mut self, votes: &VoteBundle) {
@@ -1851,12 +1891,10 @@ impl LinearLeiosNode {
                 //
                 // The tombstone is what makes "at most once per (node,
                 // EB)" structural rather than merely asserted by the
-                // `quorum_reached_ebs` doc comment: a pruned EB is
-                // already endorsed on-chain and can never be needed
-                // again, so a vote for it is not merely uncounted here,
-                // it is unwanted.  Same guard, same reason, as the
-                // pruned-EB checks on the header-announcement and
-                // endorsement paths.
+                // `quorum_reached_ebs` doc comment: a pruned EB has been
+                // superseded by endorsed state and must not rebuild a tally.
+                // Late bundles may still be verified and relayed; the
+                // obsolete-work telemetry measures those costs separately.
                 continue;
             }
             *self

@@ -140,6 +140,7 @@ impl EventMonitor {
             ..MessageStats::default()
         };
         let mut vote_wire = VoteWireStats::default();
+        let mut obsolete_votes = ObsoleteVoteStats::new(self.node_ids.len());
         let mut no_vote_reasons: BTreeMap<NoVoteReason, u64> = BTreeMap::new();
         let mut txs_dropped_generated_backlog_full: u64 = 0;
         let mut txs_dropped_peer_backlog_full: u64 = 0;
@@ -290,6 +291,7 @@ impl EventMonitor {
                             &eb_messages,
                             &vote_messages,
                             &vote_wire,
+                            &obsolete_votes,
                             &vote_timing,
                             &pbo,
                         );
@@ -531,6 +533,9 @@ impl EventMonitor {
                 }
                 Event::VTLotteryWon { .. } => {}
                 Event::VTBundleGenerated { id, votes, .. } => {
+                    if vote_messages.accepted.is_some() {
+                        obsolete_votes.record_processed(&id, id.producer.id);
+                    }
                     vote_timing.bundle_generated(id.clone(), id.producer.id, time);
                     for (eb, count) in votes.0 {
                         total_votes += count as u64;
@@ -559,8 +564,41 @@ impl EventMonitor {
                     vote_messages.received += 1;
                     vote_timing.bundle_received(&id, recipient.id, time);
                 }
-                Event::VTBundleAccepted { .. } => {
+                Event::VTBundleAccepted { id, recipient, .. } => {
                     *vote_messages.accepted.get_or_insert(0) += 1;
+                    obsolete_votes.record_processed(&id, recipient.id);
+                }
+                Event::VTBundleObsoleteReceived {
+                    id,
+                    node,
+                    msg_size_bytes,
+                } => {
+                    obsolete_votes.arrivals += 1;
+                    obsolete_votes.received_bytes += msg_size_bytes;
+                    if obsolete_votes.was_processed(&id, node.id) {
+                        obsolete_votes.repeat_arrivals += 1;
+                    }
+                }
+                Event::VTBundleObsoleteValidated {
+                    id,
+                    node,
+                    already_held,
+                } => {
+                    obsolete_votes.record_verification(&id, node.id, already_held);
+                }
+                Event::VTBundleObsoleteSent {
+                    bodies,
+                    announcements,
+                    msg_size_bytes,
+                    ..
+                } => {
+                    obsolete_votes.bodies_sent += bodies;
+                    obsolete_votes.announcements_sent += announcements;
+                    if bodies > 0 {
+                        obsolete_votes.body_bytes += msg_size_bytes;
+                    } else {
+                        obsolete_votes.announcement_bytes += msg_size_bytes;
+                    }
                 }
                 Event::VTBundleAnnouncementReceived { .. }
                 | Event::VTBundleRequestReceived { .. } => {}
@@ -669,6 +707,7 @@ impl EventMonitor {
             &eb_messages,
             &vote_messages,
             &vote_wire,
+            &obsolete_votes,
             &vote_timing,
             &pbo,
         );
@@ -723,6 +762,7 @@ impl EventMonitor {
         eb_messages: &MessageStats,
         vote_messages: &MessageStats,
         vote_wire: &VoteWireStats,
+        obsolete_votes: &ObsoleteVoteStats,
         vote_timing: &VoteTiming,
         pbo: &Option<PrettyBytesOptions>,
     ) {
@@ -985,8 +1025,8 @@ impl EventMonitor {
                     // slice off the mean, so it is worded as its own average
                     // rather than as a decomposition of the one before it:
                     // the two do not subtract whenever any EB reached a
-                    // quorum before the gate, which happens because a
-                    // producer votes for its own block without waiting.
+                    // quorum before the gate. Honest Linear nodes now wait
+                    // for the gate; flooring also handles synthetic samples.
                     line.push_str(&format!(
                         " Average {:.3}s from t0 (median {:.3}, p95 {:.3}, max {:.3}); the part of each EB's wait that fell after the gate averaged {diffusion:.3}s; margin against the deadline averaged {margin_mean:+.3}s and was {margin_worst:+.3}s at worst.",
                         dist.mean, dist.median, dist.p95, dist.max,
@@ -1065,6 +1105,9 @@ impl EventMonitor {
         // the announcements and requests on the same mini-protocol are on
         // the line below rather than folded into it.
         lines.push(vote_messages.summary_line("Vote body"));
+        if vote_messages.accepted.is_some() {
+            lines.extend(obsolete_votes.summary_lines());
+        }
         // Complete control-message accounting is implemented for Linear only.
         if matches!(
             self.variant,
@@ -1192,7 +1235,7 @@ impl MessageStats {
             "{} {} message(s) were sent. {} of them were received ({:.3}%).",
             self.sent, name, self.received, percent_received
         );
-        if self.accepted.is_some() || self.duplicates > 0 || self.verifications > 0 {
+        if self.accepted.is_some() || self.duplicates > 0 {
             let percent_duplicate = if self.received == 0 {
                 0.0
             } else {
@@ -1219,8 +1262,96 @@ impl MessageStats {
                 ));
             }
             line.push('.');
+        } else if self.verifications > 0 {
+            // Other variants report CPU work without classifying duplicate
+            // arrivals. An unmeasured redundancy count must not look like zero.
+            line.push_str(&format!(
+                " {} verification(s) completed.",
+                self.verifications
+            ));
         }
         line
+    }
+}
+
+/// Measurements only: no history in this monitor is consulted by simulated
+/// nodes. One bit per (bundle, node) remembers prior completed processing,
+/// including local generation, across cache pruning. At 1500 nodes this uses
+/// 192 bytes per bundle plus map overhead, without per-arrival allocations.
+#[derive(Default)]
+struct ObsoleteVoteStats {
+    node_count: usize,
+    processed: BTreeMap<VoteBundleId, Vec<u64>>,
+    arrivals: u64,
+    repeat_arrivals: u64,
+    received_bytes: u64,
+    verifications: u64,
+    first_verifications: u64,
+    repeat_verifications: u64,
+    cache_reinsertions: u64,
+    bodies_sent: u64,
+    body_bytes: u64,
+    announcements_sent: u64,
+    announcement_bytes: u64,
+}
+
+impl ObsoleteVoteStats {
+    fn new(node_count: usize) -> Self {
+        Self {
+            node_count,
+            ..Self::default()
+        }
+    }
+
+    fn was_processed(&self, id: &VoteBundleId, node: NodeId) -> bool {
+        let index = node.to_inner();
+        self.processed
+            .get(id)
+            .is_some_and(|seen| seen[index / 64] & (1 << (index % 64)) != 0)
+    }
+
+    /// Returns whether generation or a prior validation already completed here.
+    fn record_processed(&mut self, id: &VoteBundleId, node: NodeId) -> bool {
+        let index = node.to_inner();
+        let seen = self
+            .processed
+            .entry(id.clone())
+            .or_insert_with(|| vec![0; self.node_count.div_ceil(64)]);
+        let bit = 1u64 << (index % 64);
+        let prior = seen[index / 64] & bit != 0;
+        seen[index / 64] |= bit;
+        prior
+    }
+
+    fn record_verification(&mut self, id: &VoteBundleId, node: NodeId, already_held: bool) {
+        self.verifications += 1;
+        if self.record_processed(id, node) {
+            self.repeat_verifications += 1;
+            if !already_held {
+                self.cache_reinsertions += 1;
+            }
+        } else {
+            self.first_verifications += 1;
+        }
+    }
+
+    fn summary_lines(&self) -> [String; 2] {
+        [
+            format!(
+                "Obsolete vote work (subsets of totals): {} arrivals ({} bytes; {} after prior processing); {} completed verifications ({} first, {} repeat; {} cache reinsertions).",
+                self.arrivals,
+                self.received_bytes,
+                self.repeat_arrivals,
+                self.verifications,
+                self.first_verifications,
+                self.repeat_verifications,
+                self.cache_reinsertions
+            ),
+            format!(
+                "Obsolete vote traffic sent (subsets of totals): {} bodies ({} bytes); {} announcements ({} bytes).",
+                self.bodies_sent, self.body_bytes, self.announcements_sent, self.announcement_bytes
+            ),
+        ]
     }
 }
 
@@ -1292,12 +1423,10 @@ struct QuorumOutcome {
     /// Mean over those same EBs of the part of each EB's wait that fell
     /// after the gate, each floored at zero before the mean is taken.
     ///
-    /// The flooring has to happen per EB and not on the mean.  A block's
-    /// producer votes for its own block without waiting out its
-    /// equivocation-detection period, so an EB really can reach a quorum
-    /// before the gate, and those EBs contribute zero diffusion rather than
-    /// a negative amount that cancels the diffusion of the EBs that did
-    /// wait.  Flooring the mean instead reported 0.000s of diffusion for
+    /// The flooring has to happen per EB and not on the mean. Honest Linear
+    /// nodes wait for the gate, but earlier or synthetic samples contribute
+    /// zero diffusion rather than cancelling the delay of later samples.
+    /// Flooring the mean instead reports 0.000s of diffusion for
     /// per-EB delays of 2.0s and 4.0s against a 3.0s gate, where the answer
     /// is 0.5s.
     diffusion_mean_s: Option<f64>,
@@ -1949,9 +2078,8 @@ mod tests {
     }
 
     /// The diffusion figure is a mean of per-EB parts, each floored at zero,
-    /// and not the mean floored: an EB whose producer's own vote carried it
-    /// past the threshold before the gate contributes nothing to diffusion,
-    /// but it must not cancel out an EB that waited.
+    /// and not the mean floored: a synthetic pre-gate sample contributes
+    /// nothing to diffusion, but must not cancel out a later sample.
     #[test]
     fn diffusion_is_floored_per_eb_and_then_averaged() {
         let mut timing = timing(vec![1]);
@@ -2192,6 +2320,46 @@ mod tests {
             "12 Vote body message(s) were sent. 12 of them were received (100.000%). \
              4 of those (33.333%) were redundant or obsolete arrivals, costing 4.00 MB; \
              8 accepted; 0 pending; 12 verification(s) completed (1.50 per accepted Vote body)."
+        );
+    }
+
+    #[test]
+    fn obsolete_work_distinguishes_first_processing_duplicates_and_cache_reinsertions() {
+        let mut stats = ObsoleteVoteStats::new(3);
+        let id = bundle_id(0);
+        let producer = NodeId::new(0);
+        let recipient = NodeId::new(1);
+        stats.record_processed(&id, producer); // locally generated before pruning
+        assert!(!stats.was_processed(&id, recipient));
+        stats.record_verification(&id, recipient, false); // first late copy
+        stats.record_verification(&id, recipient, true); // concurrently verified duplicate
+        stats.record_verification(&id, recipient, false); // cache forgotten, then rebuilt
+        stats.record_verification(&id, producer, false); // even a producer can forget its own vote
+        assert_eq!(stats.verifications, 4);
+        assert_eq!(stats.first_verifications, 1);
+        assert_eq!(stats.repeat_verifications, 3);
+        assert_eq!(stats.cache_reinsertions, 2);
+        assert!(
+            stats.summary_lines()[0]
+                .contains("4 completed verifications (1 first, 3 repeat; 2 cache reinsertions)")
+        );
+        // A different bundle at the same node is still a first completion.
+        stats.record_verification(&bundle_id(2), recipient, false);
+        assert_eq!(stats.first_verifications, 2);
+    }
+
+    #[test]
+    fn verification_only_variants_do_not_claim_measured_redundancy() {
+        let line = MessageStats {
+            sent: 3,
+            received: 3,
+            verifications: 3,
+            ..MessageStats::default()
+        }
+        .summary_line("Vote body");
+        assert_eq!(
+            line,
+            "3 Vote body message(s) were sent. 3 of them were received (100.000%). 3 verification(s) completed."
         );
     }
 

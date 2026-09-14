@@ -342,10 +342,16 @@ impl TestDriver {
     }
 
     pub fn expect_vote_bundle_sent(&mut self, from: NodeId, to: NodeId, votes: Arc<VoteBundle>) {
-        self.expect_message(from, to, Message::AnnounceVotes(votes.id));
-        self.expect_message(to, from, Message::RequestVotes(votes.id));
-        self.expect_message(from, to, Message::Votes(votes.clone()));
+        self.deliver_vote_bundle(from, to, votes.clone());
         self.expect_cpu_task(to, CpuTask::VTBundleValidated(from, votes));
+    }
+
+    fn deliver_vote_bundle(&mut self, from: NodeId, to: NodeId, votes: Arc<VoteBundle>) {
+        if !self.config.vote_transport.is_push() {
+            self.expect_message(from, to, Message::AnnounceVotes(votes.id));
+            self.expect_message(to, from, Message::RequestVotes(votes.id));
+        }
+        self.expect_message(from, to, Message::Votes(votes));
     }
 
     pub fn expect_message(
@@ -1047,8 +1053,7 @@ fn top_stake_seats_should_seat_only_the_top_pools() {
     }
 }
 
-/// Ties are broken by pool identifier ascending, which is what the
-/// specification says.  Two pools of equal stake, one seat: the lower
+/// The simulator uses node identifiers as its pool-ID surrogate.  Two pools of equal stake, one seat: the lower
 /// identifier takes it.  Node ids follow the topology's name order, so
 /// pool-a is id 0 and pool-b is id 1.
 #[test]
@@ -1734,17 +1739,22 @@ fn quorum_should_be_reported_when_the_tally_crosses_the_threshold() {
     );
 }
 
-/// Once per node per EB has to survive pruning.
-///
-/// A node prunes an EB's tally once that EB is endorsed on-chain, and the
-/// record that its quorum was already reported goes with it.  A vote bundle
-/// that finishes validating after the prune would rebuild the tally from
-/// zero and cross the threshold a second time, putting the same node into
-/// the summary's sample twice -- and the sample is stake-weighted, so its
-/// stake is counted twice in the median and the 95th percentile the study
-/// reports.  The pruned-EB tombstone is what stops it.
+/// Instrument both arrival after pruning and validation spanning a prune,
+/// preserving all existing CPU work and forwarding, without new acceptances.
 #[test]
-fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
+fn obsolete_vote_telemetry_preserves_transport_work() {
+    for transport in [
+        VoteTransport::AnnounceThenRequest,
+        VoteTransport::Push,
+        VoteTransport::PushLateDedupe,
+    ] {
+        for queued_before_prune in [false, true] {
+            check_obsolete_vote(transport, queued_before_prune);
+        }
+    }
+}
+
+fn check_obsolete_vote(transport: VoteTransport, queued_before_prune: bool) {
     let topology = new_topology(vec![
         ("node-1", new_node(Some(1000), vec!["node-2", "node-3"])),
         ("node-2", new_node(Some(1000), vec!["node-1", "node-3"])),
@@ -1754,6 +1764,7 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
     // threshold on a tally that has been reset to zero.
     let config = new_sim_config_with(topology, |params| {
         params.quorum_weight_fraction = 0.5;
+        params.vote_transport = transport;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
@@ -1792,11 +1803,15 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
         "one vote is the threshold here, so the first one crosses it"
     );
 
-    // Node 3 votes at the gate.  Its bundle is announced to node 2 and left
-    // sitting there: it is the late arrival this test is about.
+    // Keep node 3's vote either in transit or queued for validation.
     sim.advance_time_to(sim.config.voting_window().gate_at(eb.slot));
     let votes_3 = sim.expect_cpu_task_matching(node3, is_new_vote_task);
     assert_eq!(*votes_3.ebs.first_key_value().unwrap().0, eb.id());
+
+    if queued_before_prune {
+        sim.deliver_vote_bundle(node3, node2, votes_3.clone());
+        assert_eq!(sim.queued_vote_validations(node2), 1);
+    }
 
     // Node 2 certifies the EB in a ranking block of its own, which is what
     // makes the EB old news and prunes its tally.
@@ -1811,23 +1826,105 @@ fn a_late_vote_for_a_pruned_eb_does_not_report_a_second_quorum() {
          without the endorsement would leave this test asserting nothing"
     );
 
-    // Node 3's bundle turns up after all that.  It is the first copy node 2
-    // has seen, so it is verified and counted -- and counted into an EB whose
-    // tally, and whose already-reported quorum, have both been erased.
-    let _ = sim.drain_tracked_events();
-    sim.expect_vote_bundle_sent(node3, node2, votes_3);
+    sim.drain_tracked_events();
+    if !queued_before_prune {
+        sim.deliver_vote_bundle(node3, node2, votes_3.clone());
+    }
+    assert_eq!(
+        sim.queued_vote_validations(node2),
+        1,
+        "measurement must preserve verification"
+    );
+    sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes_3.clone()));
     let events = sim.drain_tracked_events();
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, Event::VTBundleAccepted { .. })),
-        "votes for pruned EBs are obsolete, not new acceptances"
+            .any(|e| matches!(e, Event::VTBundleAccepted { .. }))
     );
     assert_eq!(duplicate_reports(&events), vec![(node3, node2)]);
+    assert!(quorum_reports(&events).is_empty());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleObsoleteReceived { .. }))
+            .count(),
+        usize::from(!queued_before_prune)
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::VTBundleObsoleteValidated {
+                    already_held: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    let outgoing = vote_wire_reports(&events);
+    let forwarded: Vec<_> = outgoing
+        .iter()
+        .filter(|(kind, sender, _, _)| *sender == node2 && (*kind == "body" || *kind == "announce"))
+        .collect();
+    assert_eq!(forwarded.len(), 1, "measurement must preserve forwarding");
+    let bytes = forwarded[0].3;
+    assert!(events.iter().any(|e| matches!(e, Event::VTBundleObsoleteSent { node, bodies, announcements, msg_size_bytes, .. }
+        if node.id == node2 && *bodies == u64::from(transport.is_push()) && *announcements == u64::from(!transport.is_push()) && *msg_size_bytes == bytes)));
+
+    // Keep the cached copy and account for a later body request as well.
+    let response = sim
+        .nodes
+        .get_mut(&node2)
+        .unwrap()
+        .handle_message(node1, Message::RequestVotes(votes_3.id));
+    assert_eq!(
+        response.messages.len(),
+        1,
+        "measurement must preserve the held copy"
+    );
+    let events = sim.drain_tracked_events();
+    assert!(events.iter().any(|e| matches!(e, Event::VTBundleObsoleteSent { bodies: 1, announcements: 0, msg_size_bytes, .. } if *msg_size_bytes == votes_3.bytes)));
+
+    // An already-held obsolete arrival still follows its original transport's
+    // deduplication order: push skips verification; pull discovers it after CPU.
+    let response = sim
+        .nodes
+        .get_mut(&node2)
+        .unwrap()
+        .handle_message(node3, Message::Votes(votes_3.clone()));
+    assert_eq!(response.tasks.len(), usize::from(!transport.is_push()));
+    sim.process_events(node2, response);
+    if !transport.is_push() {
+        sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node3, votes_3));
+    }
+    let events = sim.drain_tracked_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::VTBundleObsoleteReceived { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                Event::VTBundleObsoleteValidated {
+                    already_held: true,
+                    ..
+                }
+            ))
+            .count(),
+        usize::from(!transport.is_push())
+    );
     assert!(
-        quorum_reports(&events).is_empty(),
-        "node 2 already reported this EB's quorum; reporting it again puts one \
-         node in the stake-weighted sample twice"
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::VTBundleObsoleteSent { .. }))
     );
 }
 
@@ -2097,12 +2194,14 @@ fn eb_validation_must_finish_by_the_voting_deadline() {
 /// Signing also consumes queued CPU time after the eligibility check.
 #[test]
 fn vote_signing_must_finish_by_the_voting_deadline() {
-    for late in [false, true] {
+    for (late, conformance) in [(false, false), (false, true), (true, false), (true, true)] {
         let topology = new_topology(vec![
             ("node-1", new_node(Some(1000), vec!["node-2"])),
             ("node-2", new_node(Some(1000), vec!["node-1"])),
         ]);
-        let mut sim = TestDriver::new(topology);
+        let mut config = new_sim_config(topology);
+        Arc::get_mut(&mut config).unwrap().emit_conformance_events = conformance;
+        let mut sim = TestDriver::new_with_config(config);
         let node1 = sim.id_for("node-1");
         let _txs: [_; 3] = sim.produce_txs(node1, false);
         sim.win_next_rb_lottery(node1, 0);
@@ -2136,6 +2235,13 @@ fn vote_signing_must_finish_by_the_voting_deadline() {
                 ))
                 .count(),
             usize::from(late)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::NoVTBundleGenerated { .. }))
+                .count(),
+            usize::from(late && conformance)
         );
         if late {
             assert!(vote_wire_reports(&events).is_empty());
@@ -2193,4 +2299,43 @@ fn accepted_votes_exclude_pending_and_validated_duplicates() {
             .any(|e| matches!(e, Event::VTBundleAccepted { .. }))
     );
     assert_eq!(duplicate_reports(&events), vec![(node1, node2)]);
+}
+
+#[test]
+fn unsupported_vote_transport_options_are_rejected_without_a_fanout_cap() {
+    for variant in [
+        LeiosVariant::Short,
+        LeiosVariant::Full,
+        LeiosVariant::FullWithoutIbs,
+        LeiosVariant::FullWithTxReferences,
+        LeiosVariant::SharedConsensus,
+        LeiosVariant::Linear,
+        LeiosVariant::LinearWithTxReferences,
+    ] {
+        for (transport, echo) in [
+            (VoteTransport::Push, false),
+            (VoteTransport::PushLateDedupe, false),
+            (VoteTransport::AnnounceThenRequest, true),
+            (VoteTransport::AnnounceThenRequest, false),
+        ] {
+            let (mut params, topology) = seat_count_params(variant);
+            params.committee_selection_algorithm = CommitteeSelectionAlgorithm::WfaLs;
+            params.vote_transport = transport;
+            params.vote_transport_echo_to_source = echo;
+            params.vote_push_fanout = None;
+            let supported = matches!(
+                variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            ) || (!transport.is_push() && !echo);
+            let result = SimConfiguration::build(params, topology);
+            assert_eq!(
+                result.is_ok(),
+                supported,
+                "{variant:?}, {transport:?}, echo={echo}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert!(error.to_string().contains("linear Leios variants only"));
+            }
+        }
+    }
 }

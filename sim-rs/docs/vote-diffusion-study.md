@@ -39,7 +39,9 @@ The fixed-size reference uses `committee-seat-count: 900` and
 `quorum-weight-fraction: 0.75`. Fewer than 900 pools means all available pools
 are seated. Unseated stake remains in the denominator: a committee holding less
 than 75% of total active stake cannot certify, even if all its members vote.
-The simulator uses node identifiers to break equal-stake ties.
+The simulator warns when seated stake cannot reach the quorum; such configurations
+remain available for deliberate failure experiments. Node identifiers (topology
+name order) break equal-stake ties.
 
 The 750/1500-node everyone-votes scenarios are deliberate vote-volume stress
 tests, also discussed in the CIP proposal. They do not implement stake quorum.
@@ -104,7 +106,44 @@ matrix, missed-quorum counts and the distinction between nodes having enough
 votes for a quorum and individual vote bodies being delivered. These results do
 not establish a safe fanout limit.
 
-## Validation of these fixes
+## Measuring obsolete vote work
+
+The new obsolete-work metrics preserve the existing transport behavior. An
+obsolete bundle is one whose referenced EBs are all in the measuring node's
+`pruned_ebs` set. This is local state, not simply a vote arriving after its
+signing deadline. Nodes still verify, cache and forward the same messages.
+
+The summary reports the following **subsets of the existing totals**:
+
+- Arrivals obsolete when received, their bytes, and how many had already been
+  generated or successfully processed at that receiving node.
+- Verifications obsolete when completed. A validation can span a prune, so
+  this count need not match arrivals already obsolete on receipt.
+- First and repeat completed processing at a node. A repeat verification with
+  no held copy before insertion is additionally counted as a **cache reinsertion**.
+  Concurrent duplicate completions with a held copy are repeats without a
+  cache reinsertion. Locally generated votes count as prior processing too.
+- Bodies and announcements sent while obsolete at the sender, including bodies
+  served in response to requests. Their bytes remain in the normal traffic total.
+
+The monitor remembers prior processing in a bitset; simulated nodes never read
+it. No CPU work or traffic is subtracted. The `VTBundleObsolete*` events also
+appear in raw traces. Older logs have no obsolete-work breakdown: the extractor
+leaves the field absent rather than inventing zeros.
+
+This distinguishes first late processing from repeated work after the cache
+has forgotten a vote. The pinned Haskell `LeiosVoteState` retains its seen-vote
+set and has no garbage collection yet; it can still verify a previously unseen
+late vote. Consequently, dropping every pruned-EB vote would be a separate
+modeling change, not an accounting fix. Completed verification totals count
+work the simulator actually performed, including work on obsolete votes. The
+open modeling question is whether forgetting vote IDs during pruning matches
+the intended node behavior. The new measurements do not establish
+how much pruning affected the published 108 runs; those archived logs lack this
+breakdown. A full matrix rerun is deferred until review or targeted evidence
+justifies it, especially before making a behavior change or new effect-size claim.
+
+## Validation of the published study
 
 - `cargo test --workspace --locked --offline`: 155 passed, one ignored (after removing the unused no-deduplication mode and its test).
 - Twenty 8-node, 40-slot smoke runs: two seeds, both committee modes,
@@ -121,7 +160,29 @@ not establish a safe fanout limit.
 The [750/1500-node performance study](vote-diffusion-results-20260910/README.md)
 is now complete. The checks above established correctness before those reruns.
 
-## Running the corrected matrix
+## Validation of the review changes
+
+- `cargo test --workspace --locked --offline`: 158 passed, one ignored.
+- `python3 scripts/test-vote-diffusion-study.py`: nine checks cover the runner's
+  108-row plan, smaller matrices, manifests, parse failures, obsolete-work
+  reconciliation, and exact re-extraction of the published results.
+- A real 750-node, one-slot smoke matrix completed and parsed all three transport
+  arms. This checks the runner/extractor interface, not voting feasibility.
+- Ten paired 8-node, 80-slot runs against PR head `00d6983` match every existing
+  protocol and network summary line. They cover both committee modes, all three
+  transports and bounded push fanout, with 500 ms vote verification to exercise
+  queued duplicate checks.
+- Node regression tests exercise arrivals after pruning, validations spanning a
+  prune, obsolete forwarding and later requests, and held-copy deduplication in
+  all three transports. Monitor tests separate first processing, duplicate
+  completions and cache reinsertions, including a node's own generated votes.
+
+The 108-run matrix has not been repeated for this instrumentation-only change.
+The additional fields in new logs measure existing work rather than replacing
+or revising the archived results. Quantifying that breakdown at mainnet scale
+remains a separate experiment.
+
+## Running the matrix
 
 From `sim-rs`, pass the upstream study configuration (the earlier runs used
 `ouroboros-leios` revision `f307ed5`):
@@ -136,8 +197,35 @@ The output directory must be new and its parent must exist. Each run saves a
 summary, a final parameter overlay, and a row in `runs.csv`. The directory also
 contains copies of the base configuration, workload, engine configuration and
 topologies, plus the source revision, tracked diff and built binary SHA-256. No trace files are
-produced. Run status `passed` means the simulator exited successfully, not that
-all EBs achieved quorum. A failed simulation makes the script exit nonzero.
+produced. A private copy of the built executable is retained as `sim-cli`.
+The runner writes all planned rows before execution, then records start/end UTC,
+elapsed seconds, exit code and status after each run. Input and log checksum
+manifests accompany the output; the frozen executable and inputs are checked
+before each run and the full set is checked after the batch. Run status `passed`
+means the simulator exited successfully, not that all EBs achieved quorum. A
+failed simulation makes the script exit nonzero.
+
+Set `VOTE_STUDY_CONFIG_REVISION` to the source revision of an exported base
+configuration. Otherwise the runner records its enclosing Git revision if
+available, or explicitly records that it is unknown. The input bytes are saved
+in either case. `revision.txt` and `source.patch` identify the simulator source;
+`defaults.yaml` saves the shared defaults for provenance. It is not passed as
+an overlay: sim-cli applies its own TCP default after loading those defaults,
+and the runner preserves that behavior.
+
+To extract a fresh run directory, including a smaller matrix:
+
+```sh
+python3 docs/vote-diffusion-results-20260910/extract-results.py /tmp/vote-study-corrected
+```
+
+This checks that directory's own manifests and reads only its topology sizes.
+Missing metrics or incomplete/failed runs produce a nonzero exit status and are
+listed in `results.json`; they are never counted as parsed results. Use
+`--archive` only when re-extracting the frozen September 10 archives against
+the manifests shipped beside the extractor. Run the interface regression checks
+with `python3 scripts/test-vote-diffusion-study.py`. Python 3.11 or later is
+required by the runner and extractor.
 
 Defaults:
 
@@ -149,6 +237,7 @@ Defaults:
 | `VOTE_STUDY_FANOUTS` | `all 22 16 8` |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
+| `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
 
 For each size, committee and seed, the runner executes announce/request once,
 then both `push` and `push-late-dedupe` at every fanout. Echo-to-source is held

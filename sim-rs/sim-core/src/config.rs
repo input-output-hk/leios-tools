@@ -361,7 +361,7 @@ pub struct RawParameters {
     /// bound on how many *copies* of one vote cross the network, and the
     /// copies are what cost verification time.  Applies to the push
     /// transports only: `announce-then-request` sends bodies solely on
-    /// request and already produces no copies.
+    /// request, so a push fanout cap does not apply.
     #[serde(default)]
     pub vote_push_fanout: Option<u64>,
     #[serde(default = "default_committee_stake_fraction_threshold")]
@@ -490,7 +490,8 @@ pub enum CommitteeSelectionAlgorithm {
     Everyone,
     TopStakeFraction,
     /// CIP-0164 PR #1250: the top `committee_seat_count` stake-holding
-    /// pools are seated, ties broken by pool identifier ascending.
+    /// pools are seated, ties broken by node identifier ascending (topology
+    /// name order, the simulator's surrogate for pool identifiers).
     /// Each vote carries its pool's stake, not a unit seat weight.
     /// Deterministic: membership is a function of the stake distribution
     /// alone, so no eligibility proof is carried.
@@ -499,9 +500,9 @@ pub enum CommitteeSelectionAlgorithm {
 
 /// How a vote bundle reaches a peer.
 ///
-/// The simulator has only ever done `AnnounceThenRequest`, which delivers
-/// each body exactly once per node.  Both node implementations instead push
-/// bodies inline, bounded by links rather than by nodes.  See
+/// The original `AnnounceThenRequest` path requests bodies after an
+/// announcement, suppressing requests while its local cache remembers them.
+/// Push sends bodies inline to peers without that round trip. See
 /// `vote-transport` in `config.default.yaml`.
 ///
 /// Distinct from `vote-diffusion-strategy`, which is a request-ordering knob
@@ -1750,8 +1751,8 @@ impl SimConfiguration {
                 }
                 // Only pools — nodes holding stake — can be seated;
                 // zero-stake relays are not candidates.  Highest stake
-                // first, ties broken by pool identifier ascending, which
-                // is what the specification says.
+                // first, ties broken by node identifier ascending. IDs follow
+                // topology name order and stand in for pool identifiers.
                 let mut pools: Vec<_> = topology
                     .nodes
                     .iter()
@@ -1769,6 +1770,15 @@ impl SimConfiguration {
                 // error: the 1500-node pseudo-mainnet topology has 458
                 // stake-holding nodes, so a 900-seat request seats 458.
                 pools.truncate(params.committee_seat_count as usize);
+                let seated_stake: u64 = pools.iter().map(|(_, stake)| stake).sum();
+                let threshold = (params.quorum_weight_fraction * total_stake as f64).ceil() as u64;
+                if seated_stake < threshold {
+                    tracing::warn!(
+                        seated_stake,
+                        threshold,
+                        "top-stake-seats committee cannot reach quorum even with every seated pool voting"
+                    );
+                }
                 pools.into_iter().map(|(id, _)| id).collect()
             }
         };
@@ -1799,7 +1809,8 @@ impl SimConfiguration {
         if let Some(fanout) = params.vote_push_fanout {
             if fanout == 0 {
                 bail!(
-                    "vote-push-fanout is 0, so a vote would never leave the node that cast                      it and no endorser block could ever reach a quorum"
+                    "vote-push-fanout is 0, so a vote would never leave the node that cast \
+                     it; the fanout must be positive"
                 );
             }
             if !matches!(
@@ -1807,16 +1818,33 @@ impl SimConfiguration {
                 LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
             ) {
                 bail!(
-                    "vote-push-fanout is implemented for the linear Leios variants only                      ('linear', 'linear-with-tx-references'); {:?} diffuses votes by its own                      path and would ignore the limit",
+                    "vote-push-fanout is implemented for the linear Leios variants only \
+                     ('linear', 'linear-with-tx-references'); {:?} diffuses votes by its own \
+                     path and would ignore the limit",
                     params.leios_variant
                 );
             }
             if !params.vote_transport.is_push() {
                 bail!(
-                    "vote-push-fanout bounds how many peers a vote body is pushed to, but                      vote-transport is {:?}, which sends a body only when a peer asks for                      it; the limit would have no effect",
+                    "vote-push-fanout bounds how many peers a vote body is pushed to, but \
+                     vote-transport is {:?}, which sends a body only when a peer asks for \
+                     it; the limit would have no effect",
                     params.vote_transport
                 );
             }
+        }
+        if (params.vote_transport.is_push() || params.vote_transport_echo_to_source)
+            && !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            )
+        {
+            bail!(
+                "vote-transport push modes and vote-transport-echo-to-source are implemented \
+                 for the linear Leios variants only ('linear', 'linear-with-tx-references'); \
+                 {:?} would ignore these settings",
+                params.leios_variant
+            );
         }
         Ok(Self {
             seed: params.seed,

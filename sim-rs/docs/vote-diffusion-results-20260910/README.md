@@ -2,6 +2,12 @@
 
 All **108 runs** completed: two network sizes, two committee modes, three matched seeds, and announce/request plus two push deduplication orders crossed with unlimited/22/16/8 fanout. Simulator revision `0769c07310fba223a09d8082e2744013c6856a43`.
 
+The subsequent review changes add obsolete-work telemetry while preserving
+transport behavior. These archived runs have **not** been rerun with that
+instrumentation, so their obsolete-work breakdown is unknown. The
+[study guide](../vote-diffusion-study.md#measuring-obsolete-vote-work) explains
+what the new counters measure and why they are subsets of the existing totals.
+
 ## Transport terminology
 
 **Push** means sending the vote body directly to peers, without waiting for a
@@ -235,7 +241,7 @@ mkdir /tmp/leios-results-check
 tar -xzf inputs.tar.gz -C /tmp/leios-results-check
 tar -xzf summary-logs.tar.gz -C /tmp/leios-results-check
 cp runs.csv revision.txt upstream-revision.txt binary.sha256 /tmp/leios-results-check/
-python3 extract-results.py /tmp/leios-results-check
+python3 extract-results.py --archive /tmp/leios-results-check
 ```
 
 Raw simulator runs used the frozen executable at revision `0769c073` with no tracked source diff. Inputs and executable checksums were verified before execution and again after the batch. All 108 logs have final protocol/network summaries, no logged error/panic, consistent acceptance accounting and consistent quorum/deadline counts. Parsed results were independently regenerated from the published archives. `passed` means the simulation completed successfully, not that every EB reached quorum.

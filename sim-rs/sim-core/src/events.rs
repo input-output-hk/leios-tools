@@ -356,6 +356,30 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
+    /// Additional classification of an arrival whose EBs are all locally
+    /// pruned. Its bytes are already included in the normal received totals.
+    VTBundleObsoleteReceived {
+        id: VoteBundleId<Node>,
+        node: Node,
+        msg_size_bytes: u64,
+    },
+    /// A completed verification whose EBs are all locally pruned at completion.
+    /// `already_held` describes the cache before the normal insertion; this
+    /// event neither skips that insertion nor changes subsequent forwarding.
+    VTBundleObsoleteValidated {
+        id: VoteBundleId<Node>,
+        node: Node,
+        already_held: bool,
+    },
+    /// Obsolete outgoing bodies or announcements, already in normal wire totals.
+    /// One event can summarize all recipients of a diffusion invocation.
+    VTBundleObsoleteSent {
+        id: VoteBundleId<Node>,
+        node: Node,
+        bodies: u64,
+        announcements: u64,
+        msg_size_bytes: u64,
+    },
     VTBundleReceived {
         id: VoteBundleId<Node>,
         slot: u64,
@@ -485,7 +509,10 @@ impl Event {
             | Self::VTBundleRequestReceived { recipient, .. }
             | Self::VTBundleAccepted { recipient, .. } => Some(recipient.id),
             Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
-            Self::EBQuorumReached { node, .. } => Some(node.id),
+            Self::EBQuorumReached { node, .. }
+            | Self::VTBundleObsoleteReceived { node, .. }
+            | Self::VTBundleObsoleteValidated { node, .. }
+            | Self::VTBundleObsoleteSent { node, .. } => Some(node.id),
             Self::VoteGenerated { voter, .. } => Some(voter.id),
             Self::VoteSent { sender, .. } => Some(sender.id),
             Self::VoteReceived { recipient, .. } => Some(recipient.id),
@@ -1114,6 +1141,49 @@ impl EventTracker {
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
             msg_size_bytes: votes.bytes,
+        });
+    }
+
+    pub fn track_obsolete_votes_received(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleObsoleteReceived {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_obsolete_votes_validated(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        already_held: bool,
+    ) {
+        self.send(Event::VTBundleObsoleteValidated {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            already_held,
+        });
+    }
+
+    pub fn track_obsolete_votes_sent(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        bodies: u64,
+        announcements: u64,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleObsoleteSent {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            bodies,
+            announcements,
+            msg_size_bytes,
         });
     }
 

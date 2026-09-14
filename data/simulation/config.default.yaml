@@ -271,7 +271,8 @@ committee-selection-algorithm: "wfa-ls"
 committee-stake-fraction-threshold: 0.95
 # Committee size for "top-stake-seats", following the open CIP-0164 PR #1250
 # (proposed value: 900). The top N stake-holding pools are seated, ties broken
-# by pool identifier ascending. Each vote carries its pool's active stake.
+# by node identifier ascending (topology name order, standing in for pool IDs).
+# Each vote carries its pool's active stake.
 # If fewer pools exist, all are seated. The quorum denominator is total
 # active stake, including stake outside the selected committee.
 committee-seat-count: 900
@@ -288,8 +289,9 @@ vote-diffusion-strategy: "peer-order"
 #   announce-then-request  announce the bundle id, wait for the peer to ask,
 #                          then send the body.  Each body crosses the network
 #                          exactly once per node, so there are no duplicates.
-#                          Historic behaviour, and the default so that earlier
-#                          studies stay reproducible.
+#                          Retains the historic transport as the default.
+#                          Voting gate and deadline fixes still change behavior;
+#                          reproduce older studies with their source revision.
 #   push                   send the body straight to peers, forwarding a bundle
 #                          only the first time it is seen.  What both Leios node
 #                          implementations do.  Traffic is bounded by links
