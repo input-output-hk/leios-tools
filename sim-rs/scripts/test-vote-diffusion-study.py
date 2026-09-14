@@ -164,6 +164,7 @@ class StudyInterfaceTests(unittest.TestCase):
             overlay = (output / (row['run'] + '.yaml')).read_text()
             self.assertIn(f'vote-transport: "{row["transport"]}"', overlay)
             self.assertIn(f'vote-push-fanout: {"null" if row["fanout"] == "all" else row["fanout"]}', overlay)
+            self.assertIn('vote-push-fanout-protects-producers: true', overlay)
 
 
 if __name__ == '__main__':

@@ -2018,11 +2018,21 @@ fn no_vote_is_cast_before_the_gate() {
     );
 }
 
-/// A star, so the centre has `spokes` consumers to choose between.
+/// A star, so the centre has `spokes` relay consumers to choose between.
+/// The spokes hold no stake, so the fanout cap applies to every one of
+/// them; see `new_mixed_star_topology` for the producer links the cap
+/// leaves alone.
 fn new_star_topology(spokes: usize) -> RawTopology {
+    new_mixed_star_topology(0, spokes)
+}
+
+/// A hub whose first `producers` consumers hold stake (block producers)
+/// and whose remaining `relays` consumers do not.
+fn new_mixed_star_topology(producers: usize, relays: usize) -> RawTopology {
     let mut nodes = vec![("node-1", new_node(Some(1000), vec![]))];
-    for name in SPOKE_NAMES.iter().take(spokes) {
-        nodes.push((*name, new_node(Some(1000), vec!["node-1"])));
+    for (i, name) in SPOKE_NAMES.iter().take(producers + relays).enumerate() {
+        let stake = if i < producers { Some(1000) } else { None };
+        nodes.push((*name, new_node(stake, vec!["node-1"])));
     }
     new_topology(nodes)
 }
@@ -2113,6 +2123,71 @@ fn no_fanout_limit_pushes_to_every_consumer() {
     sim.produce_vote_bundle(node1);
 
     assert_eq!(vote_push_targets(&sim, node1).len(), 4);
+}
+
+/// The cap is a relay-to-relay limit.  A consumer that holds stake is a
+/// block producer: it has no path into the network but its own relays, so
+/// a relay always pushes to it and draws the limit from its other peers.
+/// Sampling the producer like any other consumer skips it with
+/// probability about `1 - k/d` at each of its two relays, and a producer
+/// that misses that many votes has no quorum: a plausible reason every
+/// bounded arm of the 2026-09-10 study lost Q95.
+#[test]
+fn bounded_fanout_always_pushes_to_a_stake_holding_consumer() {
+    let config = new_sim_config_with(new_mixed_star_topology(1, 5), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(2);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+    let producer = sim.id_for("node-2");
+
+    sim.produce_vote_bundle(node1);
+
+    let targets = vote_push_targets(&sim, node1);
+    assert!(
+        targets.contains(&producer),
+        "the producer must always get the body, got {targets:?}"
+    );
+    assert_eq!(
+        targets.len(),
+        3,
+        "expected the producer plus 2 of the 5 relays, got {targets:?}"
+    );
+}
+
+/// The limit is spent on relay links only, so a limit that covers every
+/// relay is no limit at all: the producer is not what it was counting.
+#[test]
+fn fanout_covering_every_relay_pushes_to_every_consumer() {
+    let config = new_sim_config_with(new_mixed_star_topology(1, 5), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(5);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 6);
+}
+
+/// With the protection off every consumer is sampled alike, which is the
+/// rule the fanout rows of the 2026-09-10 study measured: the limit then
+/// counts the producer link like any other.
+#[test]
+fn unprotected_fanout_samples_the_producer_like_any_other_consumer() {
+    let config = new_sim_config_with(new_mixed_star_topology(1, 5), |params| {
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(2);
+        params.vote_push_fanout_protects_producers = false;
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let node1 = sim.id_for("node-1");
+
+    sim.produce_vote_bundle(node1);
+
+    assert_eq!(vote_push_targets(&sim, node1).len(), 2);
 }
 
 /// A limit that cannot take effect is rejected rather than ignored: a run

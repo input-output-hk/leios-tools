@@ -751,9 +751,13 @@
       "type": "boolean"
     },
     "vote-push-fanout": {
-      "description": "Push a vote body to at most this many peers instead of every consumer. Unset means every consumer, which is what both node implementations do. A proposal, not a CIP-0164 rule: the specification caps distinct votes relayed per committee member per slot, not copies of one vote. Push transports only.",
+      "description": "Push a vote body to at most this many peers instead of every consumer. Unset means every consumer, which is what both node implementations do. A proposal, not a CIP-0164 rule: the specification caps distinct votes relayed per committee member per slot, not copies of one vote. Push transports only. See vote-push-fanout-protects-producers for which consumers the limit is drawn from.",
       "type": ["integer", "null"],
       "minimum": 1
+    },
+    "vote-push-fanout-protects-producers": {
+      "description": "Whether vote-push-fanout is a relay-to-relay limit. true (default): consumers that hold stake count as block producers and are always pushed to; the limit is drawn from the remaining consumers. false: every consumer is sampled alike, the rule the fanout rows of the 2026-09-10 study measured.",
+      "type": "boolean"
     },
     "vote-generation-cpu-time-ms-constant": {
       "description": "Grandfathered for Haskell sim.",

@@ -83,6 +83,10 @@ def main():
         if value != 'all':
             positive(value)
     slots = positive(os.environ.get('VOTE_STUDY_SLOTS', '400'))
+    protects = choices('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'true', {'true', 'false'})
+    if len(protects) != 1:
+        raise ValueError('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS must be true or false')
+    protects = protects[0]
     seeds = args.seeds or ['0']
     if any(not s.isascii() or not s.isdigit() for s in seeds):
         raise ValueError('Seeds must be nonnegative integers')
@@ -134,7 +138,8 @@ def main():
                     (root / (name + '.yaml')).write_text(
                         f'committee-selection-algorithm: "{committee}"\ncommittee-seat-count: 900\n'
                         f'quorum-weight-fraction: 0.75\nseed: {seed}\nvote-transport: "{transport}"\n'
-                        f'vote-push-fanout: {cap}\nvote-transport-echo-to-source: false\n')
+                        f'vote-push-fanout: {cap}\nvote-push-fanout-protects-producers: {protects}\n'
+                        f'vote-transport-echo-to-source: false\n')
                     rows.append(dict(zip(FIELDS, [name, seed, size, committee, transport, fanout, slots,
                                                 'planned', '', '', '', ''])))
     save_runs(root, rows)

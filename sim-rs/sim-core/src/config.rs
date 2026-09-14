@@ -362,8 +362,24 @@ pub struct RawParameters {
     /// copies are what cost verification time.  Applies to the push
     /// transports only: `announce-then-request` sends bodies solely on
     /// request, so a push fanout cap does not apply.
+    ///
+    /// See `vote_push_fanout_protects_producers` for which consumers the
+    /// limit is drawn from.
     #[serde(default)]
     pub vote_push_fanout: Option<u64>,
+    /// Whether the fanout limit is a relay-to-relay limit.  When set (the
+    /// default), a consumer that holds stake counts as a block producer
+    /// and is always pushed to, and `k` is drawn from the remaining
+    /// consumers.  When unset, every consumer is sampled alike, which is
+    /// the rule the fanout rows of the 2026-09-10 study measured.
+    ///
+    /// The topology carries no owner link between a producer and its
+    /// relays, so stake is the proxy: on the study topologies every
+    /// stake-holding node is a producer whose only links are its own two
+    /// relays.  On a topology where every node holds stake the limit
+    /// does nothing while this is set.
+    #[serde(default = "default_vote_push_fanout_protects_producers")]
+    pub vote_push_fanout_protects_producers: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
     /// Committee size for `top-stake-seats`, following CIP-0164 PR #1250
@@ -1471,6 +1487,8 @@ pub struct SimConfiguration {
     /// Push a vote body to at most this many peers.  `None` means every
     /// consumer.  See `RawParameters::vote_push_fanout`.
     pub vote_push_fanout: Option<u64>,
+    /// See `RawParameters::vote_push_fanout_protects_producers`.
+    pub vote_push_fanout_protects_producers: bool,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
     /// TopStakeFraction / TopStakeSeats: total active stake, including
@@ -1898,6 +1916,7 @@ impl SimConfiguration {
             vote_transport: params.vote_transport,
             vote_transport_echo_to_source: params.vote_transport_echo_to_source,
             vote_push_fanout: params.vote_push_fanout,
+            vote_push_fanout_protects_producers: params.vote_push_fanout_protects_producers,
             expected_total_weight,
             vote_slot_length: params.leios_stage_active_voting_slots,
             eb_include_txs_from_previous_stage: params.eb_include_txs_from_previous_stage,
@@ -1979,6 +1998,10 @@ fn default_parallel_threshold() -> usize {
 }
 
 fn default_retry_vote_in_window() -> bool {
+    true
+}
+
+fn default_vote_push_fanout_protects_producers() -> bool {
     true
 }
 

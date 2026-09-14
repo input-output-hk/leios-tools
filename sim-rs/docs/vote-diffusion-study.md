@@ -88,6 +88,18 @@ measurements of the fixed simulator; earlier figures below are historical.
 - Producers now wait for the voting gate. Both validation and signing completion
   are checked against the deadline. These behavior changes require rerunning
   comparisons before quoting the old timings as measurements of current code.
+- The bounded-fanout cap sampled a relay's block producer like any other
+  consumer. Every stake pool in both study topologies is a producer with
+  exactly two relays, so at fanout k each relay skipped it with probability
+  about 1 − k/d for its d consumers. From the topology alone, the stake at
+  producers expected to fall below the quorum line exceeds 5% at every tested
+  cap, while relays have 25 to 50 inbound links each. That is a plausible
+  mechanism for the Q95 losses, not a measured cause: the summary logs carry no
+  per-node data, and the bundle-delivery statistic counts nodes, not stake. The
+  cap now defaults to `vote-push-fanout-protects-producers: true`, which always
+  pushes to stake-holding consumers and applies the limit between relays;
+  `false` reproduces the rule of the 2026-09-10 fanout rows. Those rows need a
+  rerun with both settings before any fanout conclusion is drawn.
 
 The earlier everyone-votes comparison reported 1500-node quorum timings of
 about 3.525s for push versus 4.002s for announce/request at Q95 (quorum available
@@ -104,7 +116,8 @@ three seeds, but Q95 attainment fell from 37/72 EBs to zero. The stake-weighted 
 lost Q95 with every tested bounded fanout. See the corrected report for the full
 matrix, missed-quorum counts and the distinction between nodes having enough
 votes for a quorum and individual vote bodies being delivered. These results do
-not establish a safe fanout limit.
+not establish a safe fanout limit. They do not establish an unsafe one either:
+the cap they measured could skip block producers, as described above.
 
 ## Measuring obsolete vote work
 
@@ -235,13 +248,17 @@ Defaults:
 | `VOTE_STUDY_SIZES` | `750 1500` |
 | `VOTE_STUDY_COMMITTEES` | `everyone top-stake-seats` |
 | `VOTE_STUDY_FANOUTS` | `all 22 16 8` |
+| `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `true` |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
 | `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
 
 For each size, committee and seed, the runner executes announce/request once,
 then both `push` and `push-late-dedupe` at every fanout. Echo-to-source is held
-false for this matrix. The default is **36 runs per seed**, or 108 for the
+false for this matrix. `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS=false` writes the
+sampling rule of the 2026-09-10 fanout rows into every overlay instead of the
+default relay-to-relay limit; run the matrix once with each value, into
+separate output directories, to compare the two rules. The default is **36 runs per seed**, or 108 for the
 three-seed command above. Runs execute sequentially and can take many hours.
 Use a smaller matrix first, or preview it without building or running:
 
