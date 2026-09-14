@@ -1,31 +1,35 @@
 //! `eb-burst` — withhold a batch of EBs, then release them simultaneously (T23).
 //!
-//! Implements the "withhold then release large number of EBs" threat. Sets three
+//! Implements the "withhold then release large number of EBs" threat. Sets the
 //! Leios control fields so the actuator runs a two-phase attack:
-//!   * `eb_burst_withhold_slots` — the silent accumulation window (slots).
-//!   * `eb_burst_count` — how many Dummy EBs to fabricate + buffer (`>= 1`).
-//!   * `eb_burst_n_txs` — fabricated tx-closure size per buffered EB.
+//!   * `eb_burst_count` — how many REAL, self-produced EBs to withhold + buffer
+//!     before the single-tick release (`>= 1`).
+//!   * `eb_burst_withhold_slots` / `eb_burst_n_txs` — legacy spec fields, unused
+//!     by the real-EB actuator (release is driven by `count` alone; each EB
+//!     carries its own real tx closure).
 //!
-//! During the withhold window net-rs fabricates + pins `count` Dummy EBs (each an
-//! `n_txs`-tx *servable* closure) into a release buffer **without announcing**;
-//! when the window elapses it flushes every buffered `(announcement, body,
-//! closure)` in one tick — a concentrated fetch storm of old-but-servable EBs
-//! that probes the (proposed, not-yet-landed) freshest-first delivery discipline.
-//! Returns `Running` while installed.
+//! During the accumulation phase net-rs forges its own EBs on its VRF/EB-election
+//! wins (valid txs from the mempool) but **withholds their diffusion**, buffering
+//! each with its real tx closure. Once `count` such EBs are held it flushes every
+//! buffered `(announcement, body, closure)` in one tick — a concentrated burst of
+//! valid-but-withheld EBs that probes the (proposed, not-yet-landed) freshest-first
+//! delivery discipline. Returns `Running` while installed.
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
-/// Withhold `count` Dummy EBs over `withhold_slots`, then release them together.
+/// Withhold `count` REAL, self-produced EBs, then release them together.
 #[derive(Debug, Clone, Copy)]
 pub struct EbBurst {
-    /// Silent accumulation window in slots before the single-tick release.
+    /// Legacy spec field (accumulation window in slots); unused by the real-EB
+    /// actuator, which releases once `count` EBs are buffered.
     pub withhold_slots: u32,
-    /// Dummy EBs to fabricate + buffer, released together (`>= 1`).
+    /// Self-produced EBs to withhold + buffer, released together (`>= 1`).
     pub count: u32,
-    /// Fabricated tx-closure size per buffered EB.
+    /// Legacy spec field (fabricated tx-closure size); unused by the real-EB
+    /// actuator, which buffers each EB's own real tx closure.
     pub n_txs: u32,
 }
 

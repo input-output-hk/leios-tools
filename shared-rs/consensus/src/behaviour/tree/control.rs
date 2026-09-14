@@ -152,15 +152,17 @@ pub struct LeiosControl {
     /// `seenVotes`/`pointStates` growth on receivers. `0` keeps
     /// `ControlSignal::default()` honest.
     pub vote_flood_count: u32,
-    /// eb-burst (T23): silent accumulation window in slots before the batch is
-    /// released. Only meaningful with `eb_burst_count > 0`; default `0`.
+    /// eb-burst (T23): legacy spec field (accumulation window in slots); unused
+    /// by the real-EB actuator, which releases once `eb_burst_count` EBs are
+    /// buffered. Default `0`.
     pub eb_burst_withhold_slots: u32,
-    /// eb-burst (T23): number of Dummy EBs to fabricate + buffer during the
-    /// withhold window and release together in one tick. `0` keeps
+    /// eb-burst (T23): number of REAL, self-produced EBs to withhold + buffer
+    /// during the accumulation phase and release together in one tick. `0` keeps
     /// `ControlSignal::default()` honest (no burst).
     pub eb_burst_count: u32,
-    /// eb-burst (T23): fabricated tx-closure size per buffered EB (each EB drags
-    /// an `n_txs`-tx servable fetch behind it at release). Default `0`.
+    /// eb-burst (T23): legacy spec field (fabricated tx-closure size); unused by
+    /// the real-EB actuator, which buffers each EB's own real tx closure.
+    /// Default `0`.
     pub eb_burst_n_txs: u32,
 }
 

@@ -128,8 +128,9 @@ pub enum ActionSpec {
         #[serde(default = "default_flood_count")]
         count: u32,
     },
-    /// eb-burst (T23) — withhold `count` Dummy EBs (each an `n_txs`-tx closure)
-    /// over `withhold_slots`, then release the whole batch in one tick.
+    /// eb-burst (T23) — withhold `count` REAL, self-produced EBs, then release
+    /// the whole batch in one tick. (`withhold_slots`/`n_txs` are legacy spec
+    /// fields, unused by the real-EB actuator.)
     #[serde(rename = "eb-burst")]
     EbBurst {
         #[serde(default = "default_withhold_slots")]
