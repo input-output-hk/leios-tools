@@ -158,10 +158,18 @@ impl LeiosBlockInfo {
 
         // Extract the opaque leios_certificate bytes, era-aware.
         let (cert_start, cert_end) = if era >= LEIOS_ERA {
-            // Era-8 Leios: block = [header, block_body]; block_body =
-            //   [invalid_transactions/nil, transactions, leios_certificate/nil,
-            //    peras_certificate/nil]
-            // The certificate is block_body[2]; nil means no cert.
+            // Era-8 Leios: block = [header, block_body].
+            //
+            // Two block_body layouts exist and are told apart by arity, so a
+            // chain from either era parses:
+            //   w36+ (3 fields): [transactions, leios_certificate/nil,
+            //                     peras_certificate/nil]
+            //   pre-w36 (4):     [invalid_transactions/nil, transactions,
+            //                     leios_certificate/nil, peras_certificate/nil]
+            // In both the certificate is the field just after `transactions`;
+            // nil means no cert. Keying off arity matters because the 4-field
+            // reader applied to a 3-field body silently returns the
+            // PERAS certificate as if it were the Leios one.
             if block_len < 2 {
                 return Err(DecodeError::message("era-8 block missing block_body"));
             }
@@ -170,16 +178,21 @@ impl LeiosBlockInfo {
                 Some(n) => n,
                 None => return Err(DecodeError::message("indefinite block_body")),
             };
-            if bb_len < 3 {
-                return Err(DecodeError::message("block_body missing leios_certificate slot"));
+            let tx_field_index = match bb_len {
+                3 => 0, // w36+: transactions first
+                n if n >= 4 => 1, // pre-w36: invalid_transactions leads
+                _ => {
+                    return Err(DecodeError::message("block_body missing leios_certificate slot"))
+                }
+            };
+            for _ in 0..=tx_field_index {
+                inner.skip()?; // up to and including `transactions`
             }
-            inner.skip()?; // [0] invalid_transactions
-            inner.skip()?; // [1] transactions
             if inner.datatype()? == minicbor::data::Type::Null {
                 return Err(DecodeError::message("no leios certificate"));
             }
             let start = inner.position();
-            inner.skip()?; // [2] leios_certificate
+            inner.skip()?; // leios_certificate
             (start, inner.position())
         } else {
             // Era-7 (flat Conway) backward-compat: block =
