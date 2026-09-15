@@ -271,8 +271,8 @@ impl NodeImpl for LinearLeiosNode {
             Message::EB(rb) => self.receive_eb(from, rb),
 
             // Vote propagation
-            Message::AnnounceVotes(id) => self.receive_announce_votes(from, id),
-            Message::RequestVotes(id) => self.receive_request_votes(from, id),
+            Message::AnnounceVotes(id, bytes) => self.receive_announce_votes(from, id, bytes),
+            Message::RequestVotes(id, bytes) => self.receive_request_votes(from, id, bytes),
             Message::Votes(votes) => self.receive_votes(from, votes),
 
             // Per-vote variants are emitted exclusively by the shared-consensus
@@ -1657,7 +1657,7 @@ impl LinearLeiosNode {
     /// `from` is the peer it arrived from, and is skipped unless
     /// `vote-transport-echo-to-source` is set on a push transport; `None`
     /// when we produced it.  Under `announce-then-request` this sends the
-    /// 8-byte id and the peer asks for the body; under the push strategies
+    /// identifier at its configured size and the peer asks for the body; under the push strategies
     /// it sends the body.
     fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
         let obsolete = match self.leios.votes.get(&id) {
@@ -1742,7 +1742,8 @@ impl LinearLeiosNode {
                     self.queued.send_to(*peer, Message::Votes(votes.clone()));
                 }
                 None => {
-                    let announcement = Message::AnnounceVotes(id);
+                    let announcement =
+                        Message::AnnounceVotes(id, self.sim_config.vote_announcement_size_bytes);
                     self.tracker.track_votes_announced(
                         id,
                         self.id,
@@ -1759,7 +1760,7 @@ impl LinearLeiosNode {
                 None => (
                     0,
                     recipients,
-                    recipients * Message::AnnounceVotes(id).bytes_size(),
+                    recipients * self.sim_config.vote_announcement_size_bytes,
                 ),
             };
             self.tracker
@@ -1767,13 +1768,9 @@ impl LinearLeiosNode {
         }
     }
 
-    fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId) {
-        self.tracker.track_votes_announcement_received(
-            id,
-            from,
-            self.id,
-            Message::AnnounceVotes(id).bytes_size(),
-        );
+    fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId, bytes: u64) {
+        self.tracker
+            .track_votes_announcement_received(id, from, self.id, bytes);
         let should_request = match self.leios.votes.get(&id) {
             None => true,
             Some(VoteBundleView::Requested) => {
@@ -1783,20 +1780,16 @@ impl LinearLeiosNode {
         };
         if should_request {
             self.leios.votes.insert(id, VoteBundleView::Requested);
-            let request = Message::RequestVotes(id);
+            let request = Message::RequestVotes(id, self.sim_config.vote_request_size_bytes);
             self.tracker
                 .track_votes_requested(id, self.id, from, request.bytes_size());
             self.queued.send_to(from, request);
         }
     }
 
-    fn receive_request_votes(&mut self, from: NodeId, id: VoteBundleId) {
-        self.tracker.track_votes_request_received(
-            id,
-            from,
-            self.id,
-            Message::RequestVotes(id).bytes_size(),
-        );
+    fn receive_request_votes(&mut self, from: NodeId, id: VoteBundleId, bytes: u64) {
+        self.tracker
+            .track_votes_request_received(id, from, self.id, bytes);
         if let Some(VoteBundleView::Received { votes }) = self.leios.votes.get(&id) {
             if self.vote_bundle_is_obsolete(votes) {
                 self.tracker

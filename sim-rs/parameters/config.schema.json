@@ -742,6 +742,18 @@
       "$ref": "#/definitions/DiffusionStrategy",
       "description": "Only supported by Haskell simulation."
     },
+    "vote-announcement-size-bytes": {
+      "description": "Linear vote-bundle announcement size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 8
+    },
+    "vote-request-size-bytes": {
+      "description": "Linear vote-bundle request size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 8
+    },
     "vote-transport": {
       "$ref": "#/definitions/VoteTransport",
       "description": "How a vote bundle reaches a peer in the Rust simulator: announce-then-request, push, or push-late-dedupe."

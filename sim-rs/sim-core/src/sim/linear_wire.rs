@@ -74,8 +74,9 @@ pub enum Message {
     // Vote propagation — bundle path used by `linear_leios.rs`.
     // Aggregates multiple votes for one voter into a single message;
     // sim-only, not in the CIP.
-    AnnounceVotes(VoteBundleId),
-    RequestVotes(VoteBundleId),
+    // The size travels with the message so scheduling and arrival accounting agree.
+    AnnounceVotes(VoteBundleId, u64),
+    RequestVotes(VoteBundleId, u64),
     Votes(Arc<VoteBundle>),
 
     // Vote propagation — per-vote path used by `shared_consensus.rs`.  One BLS
@@ -108,8 +109,8 @@ impl SimMessage for Message {
             Self::RequestEBTxs(_, _) => MiniProtocol::EB,
             Self::EBTxs(_, _) => MiniProtocol::EB,
 
-            Self::AnnounceVotes(_) => MiniProtocol::Vote,
-            Self::RequestVotes(_) => MiniProtocol::Vote,
+            Self::AnnounceVotes(..) => MiniProtocol::Vote,
+            Self::RequestVotes(..) => MiniProtocol::Vote,
             Self::Votes(_) => MiniProtocol::Vote,
 
             Self::AnnounceVote(_) => MiniProtocol::Vote,
@@ -143,8 +144,8 @@ impl SimMessage for Message {
             Self::RequestEBTxs(_, bitmap) => 40 + 10 * bitmap.len() as u64,
             Self::EBTxs(_, txs) => 40 + txs.iter().map(|tx| tx.bytes).sum::<u64>(),
 
-            Self::AnnounceVotes(_) => 8,
-            Self::RequestVotes(_) => 8,
+            Self::AnnounceVotes(_, bytes) => *bytes,
+            Self::RequestVotes(_, bytes) => *bytes,
             Self::Votes(v) => v.bytes,
 
             Self::AnnounceVote(_) => 8,

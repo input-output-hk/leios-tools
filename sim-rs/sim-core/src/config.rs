@@ -342,6 +342,12 @@ pub struct RawParameters {
     pub committee_selection_algorithm: CommitteeSelectionAlgorithm,
     #[serde(default)]
     pub vote_transport: VoteTransport,
+    /// Linear vote-bundle announcements and requests, including identifier and
+    /// application framing, excluding TCP/IP. Legacy studies use 8 bytes each.
+    #[serde(default = "default_vote_control_size_bytes")]
+    pub vote_announcement_size_bytes: u64,
+    #[serde(default = "default_vote_control_size_bytes")]
+    pub vote_request_size_bytes: u64,
     /// Push a vote body back to the peer it arrived from.  Pure waste, and
     /// off by default, but the Haskell node's notify server has no per-peer
     /// provenance and so does exactly this.
@@ -1489,6 +1495,8 @@ pub struct SimConfiguration {
     /// `quorum_weight_fraction × expected_total_weight`.
     pub quorum_weight_fraction: f64,
     pub vote_transport: VoteTransport,
+    pub vote_announcement_size_bytes: u64,
+    pub vote_request_size_bytes: u64,
     pub vote_transport_echo_to_source: bool,
     /// Push a vote body to at most this many peers.  `None` means every
     /// consumer.  See `RawParameters::vote_push_fanout`.
@@ -1824,6 +1832,19 @@ impl SimConfiguration {
             CommitteeSelectionAlgorithm::TopStakeFraction
             | CommitteeSelectionAlgorithm::TopStakeSeats => total_stake,
         };
+        if params.vote_announcement_size_bytes == 0 || params.vote_request_size_bytes == 0 {
+            bail!("vote-announcement-size-bytes and vote-request-size-bytes must be positive");
+        }
+        if (params.vote_announcement_size_bytes != 8 || params.vote_request_size_bytes != 8)
+            && !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            )
+        {
+            bail!(
+                "configurable vote announcement/request sizes support the linear Leios variants only"
+            );
+        }
         // A knob that is silently ignored is worse than one that is
         // absent, because a run still produces numbers and nothing says
         // they came from the default.  Bounded fanout is read in one
@@ -1957,6 +1978,8 @@ impl SimConfiguration {
             non_persistent_voters: params.non_persistent_voters,
             quorum_weight_fraction: params.quorum_weight_fraction,
             vote_transport: params.vote_transport,
+            vote_announcement_size_bytes: params.vote_announcement_size_bytes,
+            vote_request_size_bytes: params.vote_request_size_bytes,
             vote_transport_echo_to_source: params.vote_transport_echo_to_source,
             vote_push_fanout: params.vote_push_fanout,
             vote_push_fanout_protects_producers: params.vote_push_fanout_protects_producers,
@@ -2038,6 +2061,10 @@ fn default_shard_max_size_pct() -> u64 {
 
 fn default_parallel_threshold() -> usize {
     10
+}
+
+fn default_vote_control_size_bytes() -> u64 {
+    8
 }
 
 fn default_retry_vote_in_window() -> bool {

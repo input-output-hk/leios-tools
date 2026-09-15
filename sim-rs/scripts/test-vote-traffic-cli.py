@@ -68,6 +68,17 @@ tx-size-bytes-distribution: {distribution: constant, value: 1500}
             self.assertEqual(result.returncode, 0, result.stderr)
             (self.root / 'traffic.json').unlink()
 
+    def test_configured_control_bytes_reconcile_in_real_capture(self):
+        (self.root / 'sizes.yaml').write_text('vote-transport: announce-then-request\nvote-announcement-size-bytes: 40\nvote-request-size-bytes: 64\n')
+        result = self.run_cli('-p', 'sizes.yaml', '--vote-traffic', 'traffic.json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads((self.root / 'traffic.json').read_text())
+        for direction in ['sent', 'received']:
+            for kind, size in [('announcements', 40), ('requests', 64)]:
+                counts = [n[direction][kind] for n in report['nodes']]
+                self.assertGreater(sum(c['messages'] for c in counts), 0)
+                self.assertTrue(all(c['bytes'] == c['messages'] * size for c in counts))
+
     def test_actor_capture_completes(self):
         (self.root / 'engine.yaml').write_text('engine: actor\n')
         result = self.run_cli('-p', 'engine.yaml', '--vote-traffic', 'traffic.json')

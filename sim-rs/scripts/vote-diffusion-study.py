@@ -16,7 +16,7 @@ import time
 
 HERE = Path(__file__).resolve().parents[1]
 FIELDS = ['run', 'seed', 'nodes', 'committee', 'transport', 'fanout', 'slots',
-          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers']
+          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers', 'announcement_bytes', 'request_bytes']
 
 
 def atomic(path, text):
@@ -119,12 +119,12 @@ def study_topology(size):
     return topology
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config', type=Path)
     parser.add_argument('output', type=Path)
     parser.add_argument('seeds', nargs='*', default=['0'])
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     sizes = choices('VOTE_STUDY_SIZES', '750 1500', {'750', '1500'})
     committees = choices('VOTE_STUDY_COMMITTEES', 'everyone top-stake-seats', {'everyone', 'top-stake-seats'})
     fanouts = os.environ.get('VOTE_STUDY_FANOUTS', 'all 22 16 8').split()
@@ -138,6 +138,8 @@ def main():
                          {'announce-then-request', 'push', 'push-late-dedupe'})
     capture = flag('VOTE_STUDY_NODE_TRAFFIC', '0', '1', '0')
     protects = flag('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'false', 'true', 'false')
+    announcement_bytes = positive(os.environ.get('VOTE_STUDY_ANNOUNCEMENT_BYTES', '8'))
+    request_bytes = positive(os.environ.get('VOTE_STUDY_REQUEST_BYTES', '8'))
     seeds = args.seeds or ['0']
     if any(not s.isascii() or not s.isdigit() for s in seeds):
         raise ValueError('Seeds must be nonnegative integers')
@@ -176,24 +178,30 @@ def main():
             for committee in committees:
                 for transport, fanout in arms:
                     protection = str(protects and transport != 'announce-then-request' and fanout != 'all').lower()
-                    name = f'{size}-{committee}-{transport}-f{fanout}-bp{protection}-s{seed}'
+                    name = f'{size}-{committee}-{transport}-f{fanout}-bp{protection}-a{announcement_bytes}-r{request_bytes}-s{seed}'
                     cap = 'null' if fanout == 'all' else str(int(fanout))
                     (root / (name + '.yaml')).write_text(
                         f'committee-selection-algorithm: "{committee}"\ncommittee-seat-count: 900\n'
                         f'quorum-weight-fraction: 0.75\nseed: {seed}\nvote-transport: "{transport}"\n'
                         f'vote-push-fanout: {cap}\nvote-push-fanout-protects-producers: {protection}\n'
-                        f'vote-transport-echo-to-source: false\n')
+                        f'vote-transport-echo-to-source: false\n'
+                        f'vote-announcement-size-bytes: {announcement_bytes}\nvote-request-size-bytes: {request_bytes}\n')
                     rows.append(dict(zip(FIELDS, [name, seed, size, committee, transport, fanout, slots,
-                                                'planned', '', '', '', '', protection])))
+                                                'planned', '', '', '', '', protection, announcement_bytes, request_bytes])))
     save_runs(root, rows)
-    inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch'])
+    inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch', 'runner.py'])
     write_json(root / 'input-sha256.json', inputs)
-    logs = {}
-    traffic_reports = {}
-    write_json(root / 'log-sha256.json', logs)
+    write_json(root / 'log-sha256.json', {})
     if dry_run:
         print(f'Planned {len(rows)} runs in {root}', flush=True)
         return 0
+    return execute(root, rows, inputs, capture, revision)
+
+
+def execute(root, rows, inputs, capture, revision):
+    """Execute a fully frozen matrix with one executable."""
+    logs = {}
+    traffic_reports = {}
     binary = build_binary(root, revision)
     binary_hash = digest(binary)
     atomic(root / 'binary.sha256', binary_hash + '\n')

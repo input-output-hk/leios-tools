@@ -162,7 +162,7 @@ class StudyInterfaceTests(unittest.TestCase):
             rows = list(csv.DictReader(stream))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['status'], 'passed')
-        self.assertEqual(rows[0]['run'], '1500-top-stake-seats-push-fall-bpfalse-s0')
+        self.assertEqual(rows[0]['run'], '1500-top-stake-seats-push-fall-bpfalse-a8-r8-s0')
         name = rows[0]['run'] + '.vote-traffic.json'
         self.assertEqual(json.loads((output / name).read_text()), {'captured': True})
         checksums = json.loads((output / 'vote-traffic-sha256.json').read_text())
@@ -217,6 +217,40 @@ class StudyInterfaceTests(unittest.TestCase):
                                  for link in n['producers'].values()), 432)
         self.assertNotEqual(*names)
 
+    def test_control_sizes_are_recorded_in_run_identity_and_inputs(self):
+        names = []
+        for announce, request in [(8, 8), (40, 64)]:
+            output = self.root / f'{announce}-{request}'
+            env = dict(os.environ, VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='750',
+                       VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_TRANSPORTS='announce-then-request',
+                       VOTE_STUDY_ANNOUNCEMENT_BYTES=str(announce), VOTE_STUDY_REQUEST_BYTES=str(request))
+            result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'), str(output)],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (output / 'runs.csv').open() as stream:
+                row, = csv.DictReader(stream)
+            names.append(row['run'])
+            self.assertEqual(row['announcement_bytes'], str(announce))
+            self.assertEqual(row['request_bytes'], str(request))
+            overlay = (output / (row['run'] + '.yaml')).read_text()
+            self.assertIn(f'vote-announcement-size-bytes: {announce}', overlay)
+            self.assertIn(f'vote-request-size-bytes: {request}', overlay)
+        self.assertNotEqual(*names)
+
+    def test_extractor_keeps_different_control_sizes(self):
+        row = self.subset()
+        rows = []
+        for size in ['8', '40', '64']:
+            r = dict(row, run=row['run'] + '-a' + size, announcement_bytes=size, request_bytes=size)
+            shutil.copyfile(self.root / (row['run'] + '.txt'), self.root / (r['run'] + '.txt'))
+            rows.append(r)
+        self.write_rows(rows)
+        self.manifest('log-sha256.json', [r['run'] + '.txt' for r in rows])
+        result = self.extract()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        results = json.loads((self.root / 'results.json').read_text())['results']
+        self.assertEqual({r['announcement_bytes'] for r in results}, {'8', '40', '64'})
+
     def test_extractor_keeps_both_protection_rules(self):
         row = self.subset()
         rows = []
@@ -231,6 +265,24 @@ class StudyInterfaceTests(unittest.TestCase):
         results = json.loads((self.root / 'results.json').read_text())['results']
         self.assertEqual({r['protects_producers'] for r in results}, {'false', 'true'})
 
+    def test_focused_plan_has_ten_distinct_matched_cases(self):
+        output = self.root / 'focused'
+        env = dict(os.environ, VOTE_STUDY_DRY_RUN='1')
+        result = subprocess.run([sys.executable, str(HERE / 'scripts/vote-diffusion-followup.py'),
+                                 str(self.archive / 'study-config.yaml'), str(output), '0'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 10)
+        self.assertEqual(len({r['run'] for r in rows}), 10)
+        self.assertTrue(all((r['nodes'], r['committee'], r['seed']) == ('1500', 'top-stake-seats', '0') for r in rows))
+        for cap in ['22', '16', '8']:
+            self.assertEqual({r['protects_producers'] for r in rows if r['fanout'] == cap}, {'true', 'false'})
+        self.assertEqual({(r['announcement_bytes'], r['request_bytes']) for r in rows if r['transport'] == 'announce-then-request'}, {('8','8'), ('40','40'), ('64','64')})
+        self.assertTrue(all(r['status'] == 'planned' for r in rows))
+        runner.verify(output, json.loads((output / 'input-sha256.json').read_text()))
+
     def test_runner_plans_complete_matrix_with_extractor_schema(self):
         output = self.root / 'plan'
         env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}
@@ -240,7 +292,7 @@ class StudyInterfaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with (output / 'runs.csv').open() as stream:
             reader = csv.DictReader(stream)
-            self.assertEqual(reader.fieldnames, list(self.rows[0]) + ['protects_producers'])
+            self.assertEqual(reader.fieldnames, list(self.rows[0]) + ['protects_producers', 'announcement_bytes', 'request_bytes'])
             rows = list(reader)
         self.assertEqual(len(rows), 108)
         self.assertEqual(len({r['run'] for r in rows}), 108)

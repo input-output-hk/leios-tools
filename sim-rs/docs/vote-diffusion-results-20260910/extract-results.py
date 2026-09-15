@@ -107,13 +107,15 @@ for row in runs:
 def result_key(r):
     protection=r.get('protects_producers','false')
     if protection not in ['true','false']: raise ValueError('Invalid protects_producers setting')
-    return (r['nodes'],r['committee'],r['seed'],r['transport'],r['fanout'],protection)
+    announcement_bytes=int(r.get('announcement_bytes',8));request_bytes=int(r.get('request_bytes',8))
+    if min(announcement_bytes,request_bytes)<=0: raise ValueError('Invalid control-message size')
+    return (r['nodes'],r['committee'],r['seed'],r['transport'],r['fanout'],protection,announcement_bytes,request_bytes)
 index={result_key(r):r for r in results}
 if len(index)!=len(results): raise ValueError('Duplicate experimental configuration in runs.csv')
 pairs=[]
 for r in results:
     if r['transport']=='announce-then-request': continue
-    baseline=index.get((r['nodes'],r['committee'],r['seed'],'announce-then-request','all','false'))
+    baseline=index.get((r['nodes'],r['committee'],r['seed'],'announce-then-request','all','false',int(r.get('announcement_bytes',8)),int(r.get('request_bytes',8))))
     if not baseline: continue
     a=r['quorum_p95'];b=baseline['quorum_p95']
     pairs.append({'run':r['run'],'baseline':baseline['run'],'wire_ratio':r['wire_mb_rounded']/baseline['wire_mb_rounded'] if baseline['wire_mb_rounded'] else None,'q95_mean_delta_s':a['mean_s']-b['mean_s'] if a['mean_s'] is not None and b['mean_s'] is not None else None,'q95_reached_delta':a['reached']-b['reached'],'q95_by_7s_delta':a['by_vote_deadline']-b['by_vote_deadline'],'l1_endorsements_delta':r['l1_endorsements']-baseline['l1_endorsements'],'votes_generated_delta':r['votes_generated']-baseline['votes_generated'],'caveat':'Timing means are conditional on reaching quorum and may cover different EBs; equal counts do not prove equal EB identities.'})
@@ -123,10 +125,10 @@ atomic('results.json',json.dumps(payload,indent=2)+'\n')
 upstream=(root/'upstream-revision.txt').read_text().strip() if (root/'upstream-revision.txt').exists() else 'unknown (see saved inputs)'
 lines=['# Corrected Linear Leios vote study','',f"Updated {payload['updated_utc']}. **{len(results)}/{len(runs)} runs completed and parsed.**",'',f"Simulator `{payload['revision']}`; upstream config `{upstream}`.",'','Run lengths are recorded in runs.csv; configuration and topology bytes are preserved alongside the logs. This extraction verifies the input and log checksums. Quorum deadlines are read from each final summary.','', '**Interpretation:** this is simulator evidence. Pending/failed runs are excluded. Q95 times are means of per-EB times when nodes holding 95% of network stake each have a quorum, conditional on attainment. Fixed end-of-run truncation can leave the newest EBs unfinished. Equal endorsement counts do not establish identical EB identities. Vote-credit and header approximations limit transfer to Haskell.','', '| Nodes | Stake pools | Eligible in fixed-size arm | Stake coverage | Links |','|---:|---:|---:|---:|---:|']
 for n,t in topologies.items(): lines.append(f"| {n} | {t['pools']} | {min(900,t['pools'])} | {t['seated_stake']/t['total_stake']:.1%} | {t['links']} |")
-lines+=['','## Completed runs','','`stake` = top-stake-seats; `all-nodes` = everyone. Traffic is decimal GB, rounded in the simulator log. Q95 means nodes collectively holding 95% of network stake each have a quorum. This receiving-node percentage is separate from the 75% voting threshold for a certificate.','', '| Nodes | Committee | Seed | Transport | Fanout | Protect BP | EBs | L1 endorsements | Q95 reached | Q95 by vote deadline | Q95 mean s | Wire GB | Verify/accepted | Pending | Runtime min |','|---:|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+lines+=['','## Completed runs','','`stake` = top-stake-seats; `all-nodes` = everyone. Traffic is decimal GB, rounded in the simulator log. Q95 means nodes collectively holding 95% of network stake each have a quorum. This receiving-node percentage is separate from the 75% voting threshold for a certificate.','', '| Nodes | Committee | Seed | Transport | Fanout | Protect BP | Announce/request B | EBs | L1 endorsements | Q95 reached | Q95 by vote deadline | Q95 mean s | Wire GB | Verify/accepted | Pending | Runtime min |','|---:|---|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
 for r in results:
     q=r['quorum_p95'];mean='—' if q['mean_s'] is None else f"{q['mean_s']:.3f}";amp='—' if r['verifications_per_accepted'] is None else f"{r['verifications_per_accepted']:.2f}"
-    lines.append(f"| {r['nodes']} | {'stake' if r['committee']=='top-stake-seats' else 'all-nodes'} | {r['seed']} | {r['transport']} | {r['fanout']} | {r.get('protects_producers','false')} | {r['ebs_generated']} | {r['l1_endorsements']} | {q['reached']}/{q['total']} | {q['by_vote_deadline']}/{q['total']} | {mean} | {r['wire_mb_rounded']/1000:.3f} | {amp} | {r['pending']} | {r['elapsed_s']/60:.1f} |")
+    lines.append(f"| {r['nodes']} | {'stake' if r['committee']=='top-stake-seats' else 'all-nodes'} | {r['seed']} | {r['transport']} | {r['fanout']} | {r.get('protects_producers','false')} | {r.get('announcement_bytes','8')}/{r.get('request_bytes','8')} | {r['ebs_generated']} | {r['l1_endorsements']} | {q['reached']}/{q['total']} | {q['by_vote_deadline']}/{q['total']} | {mean} | {r['wire_mb_rounded']/1000:.3f} | {amp} | {r['pending']} | {r['elapsed_s']/60:.1f} |")
 if errors:
     lines+=['','## Parsing issues','']+[f"- {e['run']}: {e['error']}" for e in errors]
 if any('obsolete_work' in r for r in results):

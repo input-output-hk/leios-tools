@@ -308,6 +308,11 @@ vote-diffusion-strategy: "peer-order"
 # "oldest-first" belong to vote-diffusion-strategy above; they are not aliases
 # of anything here, and setting one of them here fails to load the config.
 vote-transport: "announce-then-request"
+# Linear vote control messages: identifier plus application framing, without
+# TCP/IP. These sizes affect link transmission time and reported bytes. The
+# 8-byte defaults preserve historical studies, not a concrete wire encoding.
+vote-announcement-size-bytes: 8
+vote-request-size-bytes: 8
 
 # Push a vote body back to the peer it arrived from.  Pure waste, and off here,
 # but the Haskell node's notify server has no per-peer provenance and so does

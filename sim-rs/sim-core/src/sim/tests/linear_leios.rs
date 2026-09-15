@@ -349,8 +349,16 @@ impl TestDriver {
 
     fn deliver_vote_bundle(&mut self, from: NodeId, to: NodeId, votes: Arc<VoteBundle>) {
         if !self.config.vote_transport.is_push() {
-            self.expect_message(from, to, Message::AnnounceVotes(votes.id));
-            self.expect_message(to, from, Message::RequestVotes(votes.id));
+            self.expect_message(
+                from,
+                to,
+                Message::AnnounceVotes(votes.id, self.config.vote_announcement_size_bytes),
+            );
+            self.expect_message(
+                to,
+                from,
+                Message::RequestVotes(votes.id, self.config.vote_request_size_bytes),
+            );
         }
         self.expect_message(from, to, Message::Votes(votes));
     }
@@ -1322,6 +1330,91 @@ fn announce_then_request_should_not_push_vote_bundle() {
     );
 }
 
+#[test]
+fn configured_control_sizes_drive_link_delay_and_both_traffic_directions() {
+    use crate::{network::connection::Connection, sim::SimMessage as _};
+    for (announce_bytes, request_bytes) in [(8, 8), (40, 64)] {
+        let topology = new_topology(vec![
+            ("node-1", new_node(Some(1000), vec!["node-2"])),
+            ("node-2", new_node(Some(1000), vec!["node-1"])),
+        ]);
+        let config = new_sim_config_with(topology, |params| {
+            params.vote_announcement_size_bytes = announce_bytes;
+            params.vote_request_size_bytes = request_bytes;
+        });
+        let mut sim = TestDriver::new_with_config(config);
+        let node1 = sim.id_for("node-1");
+        let node2 = sim.id_for("node-2");
+        let votes = sim.produce_vote_bundle(node1);
+        for (from, to, expected_bytes) in [
+            (node1, node2, announce_bytes),
+            (node2, node1, request_bytes),
+        ] {
+            let message = sim.queued[&from]
+                .messages
+                .iter()
+                .find(|(peer, m)| {
+                    *peer == to
+                        && matches!(m, Message::AnnounceVotes(..) | Message::RequestVotes(..))
+                })
+                .unwrap()
+                .1
+                .clone();
+            let mut link = Connection::new(Duration::from_millis(10), Some(1000));
+            let start = Timestamp::zero();
+            link.send(
+                message.clone(),
+                message.bytes_size(),
+                message.protocol(),
+                start,
+            );
+            assert_eq!(
+                link.next_arrival_time(),
+                Some(start + Duration::from_millis(10 + expected_bytes))
+            );
+            sim.expect_message(from, to, message);
+        }
+        sim.expect_message(node1, node2, Message::Votes(votes.clone()));
+        let events = sim.drain_tracked_events();
+        assert_eq!(
+            vote_wire_reports(&events),
+            vec![
+                ("announce", node1, node2, announce_bytes),
+                ("request", node2, node1, request_bytes),
+                ("body", node1, node2, votes.bytes),
+            ]
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::VTBundleAnnouncementReceived { msg_size_bytes, .. } if *msg_size_bytes == announce_bytes)));
+        assert!(events.iter().any(|e| matches!(e, Event::VTBundleRequestReceived { msg_size_bytes, .. } if *msg_size_bytes == request_bytes)));
+    }
+}
+
+#[test]
+fn configurable_vote_control_sizes_reject_zero_and_unsupported_variants() {
+    use crate::config::{LeiosVariant, RawParameters};
+    for (variant, announce, request) in [
+        (LeiosVariant::LinearWithTxReferences, 0, 8),
+        (LeiosVariant::LinearWithTxReferences, 8, 0),
+        (LeiosVariant::Short, 40, 8),
+        (LeiosVariant::SharedConsensus, 8, 40),
+    ] {
+        let mut params: RawParameters =
+            serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+                .unwrap();
+        params.leios_variant = variant;
+        params.vote_announcement_size_bytes = announce;
+        params.vote_request_size_bytes = request;
+        let topology = new_topology(vec![("node-1", new_node(Some(1000), vec![]))]);
+        let error = SimConfiguration::build(params, topology.into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("must be positive") || error.contains("linear Leios variants only"),
+            "{error}"
+        );
+    }
+}
+
 /// The push arms send the body and nothing else, so their message count is
 /// their body count.  That is the comparison the announcement and request
 /// counters exist to make honest.
@@ -1365,7 +1458,7 @@ fn push_should_send_vote_bundle_body_directly() {
 
     let votes = sim.produce_vote_bundle(node1);
 
-    sim.expect_no_message(node1, node2, Message::AnnounceVotes(votes.id));
+    sim.expect_no_message(node1, node2, Message::AnnounceVotes(votes.id, 8));
     sim.expect_message(node1, node2, Message::Votes(votes.clone()));
     sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes));
 }
@@ -1462,7 +1555,7 @@ fn announce_then_request_should_ignore_the_echo_flag() {
     sim.expect_vote_bundle_sent(node1, node2, votes.clone());
 
     // Node 2 announces onwards to node 3 and says nothing back to node 1.
-    sim.expect_no_message(node2, node1, Message::AnnounceVotes(votes.id));
+    sim.expect_no_message(node2, node1, Message::AnnounceVotes(votes.id, 8));
     sim.expect_no_message(node2, node1, Message::Votes(votes.clone()));
     assert_eq!(
         vote_wire_reports(&sim.drain_tracked_events()),
@@ -1650,17 +1743,17 @@ fn request_from_all_should_report_the_body_it_verified_and_did_not_need() {
     let votes = sim.produce_vote_bundle(node1);
 
     // Node 2 goes first, so that it holds the body and can serve it on.
-    sim.expect_message(node1, node2, Message::AnnounceVotes(votes.id));
-    sim.expect_message(node2, node1, Message::RequestVotes(votes.id));
+    sim.expect_message(node1, node2, Message::AnnounceVotes(votes.id, 8));
+    sim.expect_message(node2, node1, Message::RequestVotes(votes.id, 8));
     sim.expect_message(node1, node2, Message::Votes(votes.clone()));
     sim.expect_cpu_task(node2, CpuTask::VTBundleValidated(node1, votes.clone()));
 
     // Node 3 hears about the bundle from both peers before either answers,
     // and asks both.
-    sim.expect_message(node1, node3, Message::AnnounceVotes(votes.id));
-    sim.expect_message(node2, node3, Message::AnnounceVotes(votes.id));
-    sim.expect_message(node3, node1, Message::RequestVotes(votes.id));
-    sim.expect_message(node3, node2, Message::RequestVotes(votes.id));
+    sim.expect_message(node1, node3, Message::AnnounceVotes(votes.id, 8));
+    sim.expect_message(node2, node3, Message::AnnounceVotes(votes.id, 8));
+    sim.expect_message(node3, node1, Message::RequestVotes(votes.id, 8));
+    sim.expect_message(node3, node2, Message::RequestVotes(votes.id, 8));
 
     // Two bodies arrive, and both are verified.
     let _ = sim.drain_tracked_events();
@@ -1880,7 +1973,7 @@ fn check_obsolete_vote(transport: VoteTransport, queued_before_prune: bool) {
         .nodes
         .get_mut(&node2)
         .unwrap()
-        .handle_message(node1, Message::RequestVotes(votes_3.id));
+        .handle_message(node1, Message::RequestVotes(votes_3.id, 8));
     assert_eq!(
         response.messages.len(),
         1,

@@ -736,7 +736,7 @@ impl NodeImpl for SharedConsensus {
             Message::EBTxs(id, txs) => {
                 self.receive_eb_txs(&mut out, from, id, txs);
             }
-            Message::AnnounceVotes(_) | Message::RequestVotes(_) | Message::Votes(_) => {
+            Message::AnnounceVotes(..) | Message::RequestVotes(..) | Message::Votes(_) => {
                 // shared-consensus adapter emits per-vote, never bundles — every
                 // node in a sim run uses the same adapter, so the
                 // bundle variants can't reach this handler.

@@ -250,6 +250,8 @@ Defaults:
 | `VOTE_STUDY_COMMITTEES` | `everyone top-stake-seats` |
 | `VOTE_STUDY_FANOUTS` | `all 22 16 8` |
 | `VOTE_STUDY_TRANSPORTS` | `announce-then-request push push-late-dedupe` |
+| `VOTE_STUDY_ANNOUNCEMENT_BYTES` | `8` |
+| `VOTE_STUDY_REQUEST_BYTES` | `8` |
 | `VOTE_STUDY_NODE_TRAFFIC` | `0` (set `1` to save per-node vote traffic) |
 | `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `false` |
 | `VOTE_STUDY_SLOTS` | `400` |
@@ -273,8 +275,8 @@ compatibility with the archived unrestricted-push overlay; unlimited push alread
 forwards to every consumer. Node/peer roles are prepared once per node.
 
 Run once with each protection value into separate output directories. Run names
-include `bptrue` or `bpfalse`, `runs.csv` includes `protects_producers`, and the
-extractor distinguishes both settings. Unlimited push and announce/request use
+include protection and both control-message sizes, `runs.csv` records all three,
+and the extractor distinguishes these settings. Unlimited push and announce/request use
 `bpfalse` because no bounded selection applies. The default is **36 runs per seed**, or 108 for the
 three-seed command above. Runs execute sequentially and can take many hours.
 `VOTE_STUDY_TRANSPORTS` selects a subset, including a single transport.
@@ -373,9 +375,9 @@ VOTE_STUDY_CONFIG_REVISION=f307ed5fa7077a32eb470ca3832a34092882bfe3 \
   scripts/vote-diffusion-study.sh /tmp/study-config.yaml /tmp/vote-node-traffic 0
 
 python3 scripts/summarize-vote-traffic.py \
-  /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-s0.vote-traffic.json \
+  /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-a8-r8-s0.vote-traffic.json \
   --duration 400 \
-  --log /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-s0.txt \
+  --log /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-a8-r8-s0.txt \
   --output /tmp/vote-node-traffic/breakdown
 ```
 
@@ -400,3 +402,37 @@ path aliases, monitor failure, interruption and retry:
 python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
 python3 scripts/test-summarize-vote-traffic.py
 ```
+
+## Focused fanout and control-size follow-up
+
+`vote-announcement-size-bytes` and `vote-request-size-bytes` independently set
+Linear Leios vote-bundle control-message sizes. Both default to 8. Sizes include
+the identifier and application framing and exclude TCP/IP. They are carried by
+the messages through the network scheduler and arrival accounting, so changing
+them changes transmission time as well as the reported bytes. Other protocol
+messages keep their existing sizes. Nondefault sizes on unsupported Leios
+variants and zero sizes are rejected.
+
+The generic runner exposes these as `VOTE_STUDY_ANNOUNCEMENT_BYTES` and
+`VOTE_STUDY_REQUEST_BYTES`. Every run name, overlay, runs.csv row and extraction
+key records both sizes; paired comparisons use a matching control-size baseline.
+Old CSVs are interpreted with the historical 8/8 defaults.
+
+The focused runner freezes ten cases per seed into one matrix and runs them with
+one checked executable: push at fanout 22/16/8 with and without BP protection,
+unlimited push, and announce/request at 8/8, 40/40 and 64/64 bytes. Sizes above 8
+are sensitivity assumptions, not verified encodings. Its scope is 1500 nodes
+and stake-weighted voting; it does not repeat the everyone-votes stress test.
+
+```sh
+# First extract study-config.yaml from the original input archive.
+VOTE_STUDY_CONFIG_REVISION=f307ed5fa7077a32eb470ca3832a34092882bfe3 \
+  python3 scripts/vote-diffusion-followup.py /tmp/study-config.yaml /tmp/vote-followup 0
+python3 docs/vote-diffusion-results-20260910/extract-results.py /tmp/vote-followup
+```
+
+The default duration is 400 slots; `VOTE_STUDY_SLOTS` changes it. A dry run uses
+`VOTE_STUDY_DRY_RUN=1`. Per-node capture defaults on for this focused matrix and
+can be disabled with `VOTE_STUDY_NODE_TRAFFIC=0`. All inputs, scripts, row names,
+logs, capture files and the executable checksum are retained. One seed is a
+pilot comparison; repeat promising cases across seeds before broad claims.
