@@ -1,17 +1,11 @@
 //! Optional vote-only accounting. It observes events without retaining the event
 //! stream or changing simulated node behavior. Buckets tolerate out-of-order
 //! events from simulation shards; no timestamp-based eviction is required.
-use std::collections::HashMap;
 
-use anyhow::{Context, Result};
 use serde::Serialize;
 use sim_core::{clock::Timestamp, config::SimConfiguration, events::Event};
 
-use super::VoteBundleId;
-
-fn bundle_key(id: &VoteBundleId) -> (u64, u64, usize) {
-    (id.slot, id.pipeline, id.producer.id.to_inner())
-}
+use super::vote_accounting::{self, VoteMessageKind as MessageKind};
 
 #[derive(Default, Serialize)]
 struct MessageTotals {
@@ -47,14 +41,12 @@ pub(super) struct VoteTraffic {
     window_seconds: u64,
     accounting: &'static str,
     nodes: Vec<NodeTraffic>,
-    #[serde(skip)]
-    body_sizes: HashMap<(u64, u64, usize), u64>,
 }
 
 impl VoteTraffic {
     pub fn new(config: &SimConfiguration) -> Self {
         Self {
-            format_version: 1,
+            format_version: 2,
             seed: config.seed,
             requested_slots: config.slots,
             observed_until_s: Timestamp::zero(),
@@ -72,58 +64,30 @@ impl VoteTraffic {
                     seconds: Vec::new(),
                 })
                 .collect(),
-            body_sizes: HashMap::new(),
         }
     }
 
-    pub fn process(&mut self, event: &Event, time: Timestamp) -> Result<()> {
+    pub fn process(&mut self, event: &Event, time: Timestamp) {
         self.observed_until_s = self.observed_until_s.max(time);
-        // Classification events (duplicates, obsolete work, accepted votes) do
-        // not add bytes: their original sends/arrivals already account for them.
-        let (node, receiving, kind, bytes) = match event {
-            Event::VTBundleGenerated { id, size_bytes, .. } => {
-                self.body_sizes.insert(bundle_key(id), *size_bytes);
-                return Ok(());
-            }
-            Event::VTBundleSent {
-                sender,
-                msg_size_bytes,
-                ..
-            } => (sender, false, 0, *msg_size_bytes),
-            Event::VTBundleReceived { id, recipient, .. } => {
-                let bytes = *self
-                    .body_sizes
-                    .get(&bundle_key(id))
-                    .context("vote arrival has no generated body size")?;
-                (recipient, true, 0, bytes)
-            }
-            Event::VTBundleAnnounced {
-                sender,
-                msg_size_bytes,
-                ..
-            } => (sender, false, 1, *msg_size_bytes),
-            Event::VTBundleAnnouncementReceived {
-                recipient,
-                msg_size_bytes,
-                ..
-            } => (recipient, true, 1, *msg_size_bytes),
-            Event::VTBundleRequested {
-                sender,
-                msg_size_bytes,
-                ..
-            } => (sender, false, 2, *msg_size_bytes),
-            Event::VTBundleRequestReceived {
-                recipient,
-                msg_size_bytes,
-                ..
-            } => (recipient, true, 2, *msg_size_bytes),
-            _ => return Ok(()),
-        };
-        self.record(node.id.to_inner(), receiving, kind, bytes, time);
-        Ok(())
+        if let Some(message) = vote_accounting::message(event) {
+            self.record(
+                message.node.id.to_inner(),
+                message.receiving,
+                message.kind,
+                message.bytes,
+                time,
+            );
+        }
     }
 
-    fn record(&mut self, id: usize, receiving: bool, kind: usize, bytes: u64, time: Timestamp) {
+    fn record(
+        &mut self,
+        id: usize,
+        receiving: bool,
+        kind: MessageKind,
+        bytes: u64,
+        time: Timestamp,
+    ) {
         let node = &mut self.nodes[id]; // Configured node IDs are contiguous vector indices.
         let totals = if receiving {
             &mut node.received
@@ -131,9 +95,9 @@ impl VoteTraffic {
             &mut node.sent
         };
         let messages = match kind {
-            0 => &mut totals.bodies,
-            1 => &mut totals.announcements,
-            _ => &mut totals.requests,
+            MessageKind::Body => &mut totals.bodies,
+            MessageKind::Announcement => &mut totals.announcements,
+            MessageKind::Request => &mut totals.requests,
         };
         messages.messages += 1;
         messages.bytes += bytes;
@@ -147,6 +111,7 @@ impl VoteTraffic {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VoteBundleId;
     use super::*;
     use sim_core::{
         config::{NodeId, RawParameters, RawTopology},
@@ -174,7 +139,6 @@ mod tests {
             pipeline: 0,
             producer: bp.clone(),
         };
-        report.body_sizes.insert(bundle_key(&id), 94);
         let sent = Event::VTBundleSent {
             id: id.clone(),
             slot: 0,
@@ -191,58 +155,49 @@ mod tests {
             producer: bp.clone(),
             sender: bp.clone(),
             recipient: relay.clone(),
+            msg_size_bytes: 94,
         };
         // Cross-shard arrival order must not change fixed time bins.
-        report.process(&received, Timestamp::from_secs(2)).unwrap();
-        report.process(&received, Timestamp::from_secs(2)).unwrap();
-        report
-            .process(&sent, Timestamp::from_secs(1) - Duration::from_millis(1))
-            .unwrap();
-        report.process(&sent, Timestamp::from_secs(1)).unwrap();
-        report
-            .process(
-                &Event::VTBundleDuplicate {
-                    id: id.clone(),
-                    producer: bp.clone(),
-                    sender: bp.clone(),
-                    recipient: relay.clone(),
-                    msg_size_bytes: 94,
-                },
-                Timestamp::from_secs(2),
-            )
-            .unwrap();
-        report
-            .process(
-                &Event::VTBundleObsoleteReceived {
-                    id: id.clone(),
-                    node: relay.clone(),
-                    msg_size_bytes: 94,
-                },
-                Timestamp::from_secs(2),
-            )
-            .unwrap();
-        report
-            .process(
-                &Event::VTBundleAnnounced {
-                    id: id.clone(),
-                    sender: bp.clone(),
-                    recipient: relay.clone(),
-                    msg_size_bytes: 8,
-                },
-                Timestamp::from_secs(0),
-            )
-            .unwrap();
-        report
-            .process(
-                &Event::VTBundleRequestReceived {
-                    id,
-                    sender: relay,
-                    recipient: bp,
-                    msg_size_bytes: 40,
-                },
-                Timestamp::from_secs(1),
-            )
-            .unwrap();
+        report.process(&received, Timestamp::from_secs(2));
+        report.process(&received, Timestamp::from_secs(2));
+        report.process(&sent, Timestamp::from_secs(1) - Duration::from_millis(1));
+        report.process(&sent, Timestamp::from_secs(1));
+        report.process(
+            &Event::VTBundleDuplicate {
+                id: id.clone(),
+                producer: bp.clone(),
+                sender: bp.clone(),
+                recipient: relay.clone(),
+                msg_size_bytes: 94,
+            },
+            Timestamp::from_secs(2),
+        );
+        report.process(
+            &Event::VTBundleObsoleteReceived {
+                id: id.clone(),
+                node: relay.clone(),
+                msg_size_bytes: 94,
+            },
+            Timestamp::from_secs(2),
+        );
+        report.process(
+            &Event::VTBundleAnnounced {
+                id: id.clone(),
+                sender: bp.clone(),
+                recipient: relay.clone(),
+                msg_size_bytes: 8,
+            },
+            Timestamp::from_secs(0),
+        );
+        report.process(
+            &Event::VTBundleRequestReceived {
+                id,
+                sender: relay,
+                recipient: bp,
+                msg_size_bytes: 40,
+            },
+            Timestamp::from_secs(1),
+        );
         assert_eq!(report.nodes[0].sent.bodies.bytes, 188);
         assert_eq!(report.nodes[1].received.bodies.messages, 2);
         assert_eq!(report.nodes[0].seconds, vec![[102, 0], [94, 40]]);

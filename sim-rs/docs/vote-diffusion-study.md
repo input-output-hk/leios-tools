@@ -96,10 +96,10 @@ measurements of the fixed simulator; earlier figures below are historical.
   cap, while relays have 25 to 50 inbound links each. That is a plausible
   mechanism for the Q95 losses, not a measured cause: the summary logs carry no
   per-node data, and the bundle-delivery statistic counts nodes, not stake. The
-  cap now defaults to `vote-push-fanout-protects-producers: true`, which always
-  pushes to stake-holding consumers and applies the limit between relays;
-  `false` reproduces the rule of the 2026-09-10 fanout rows. Those rows need a
-  rerun with both settings before any fanout conclusion is drawn.
+  new `vote-push-fanout-protects-producers: true` rule prioritizes explicitly
+  marked BP connections within the same total cap. The default remains `false`,
+  preserving the rule of the 2026-09-10 fanout rows. Those rows need a rerun
+  with both settings before drawing a conclusion about protecting BP links.
 
 The earlier everyone-votes comparison reported 1500-node quorum timings of
 about 3.525s for push versus 4.002s for announce/request at Q95 (quorum available
@@ -250,17 +250,29 @@ Defaults:
 | `VOTE_STUDY_FANOUTS` | `all 22 16 8` |
 | `VOTE_STUDY_TRANSPORTS` | `announce-then-request push push-late-dedupe` |
 | `VOTE_STUDY_NODE_TRAFFIC` | `0` (set `1` to save per-node vote traffic) |
-| `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `true` |
+| `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `false` |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
 | `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
 
 For each size, committee and seed, the runner normally executes announce/request once,
 then both `push` and `push-late-dedupe` at every fanout. Echo-to-source is held
-false for this matrix. `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS=false` writes the
-sampling rule of the 2026-09-10 fanout rows into every overlay instead of the
-default relay-to-relay limit; run the matrix once with each value, into
-separate output directories, to compare the two rules. The default is **36 runs per seed**, or 108 for the
+false for this matrix. `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS=false` preserves
+sampling across all consumers, as in the 2026-09-10 fanout rows. With `true`,
+protected BP connections take places within the same total cap: one protected
+BP at fanout 22 leaves 21 places for other consumers. Source exclusion still
+applies. A node with more protected consumers than the cap is rejected.
+
+The runner marks each BP's two upstream entries with `always-forward-votes: true`
+in both saved study topologies. Routing uses those explicit markers, not stake.
+For other topologies, mark the consumer's own relay entries under `producers`.
+Enabling protection with a bounded cap requires marked links and at least one
+unprotected consumer. Node/peer roles are prepared once per node.
+
+Run once with each protection value into separate output directories. Run names
+include `bptrue` or `bpfalse`, `runs.csv` includes `protects_producers`, and the
+extractor distinguishes both settings. Unlimited push and announce/request use
+`bpfalse` because no bounded selection applies. The default is **36 runs per seed**, or 108 for the
 three-seed command above. Runs execute sequentially and can take many hours.
 `VOTE_STUDY_TRANSPORTS` selects a subset, including a single transport.
 Use a smaller matrix first, or preview it without building or running:
@@ -327,17 +339,21 @@ variants. Each configured node has body, announcement and request counts/bytes
 in both directions, plus fixed one-second byte buckets indexed from simulation
 time zero. Duplicate and obsolete bodies remain included in those totals;
 classification events do not add the same traffic twice. State scales with
-node-seconds and generated bundles, rather than the number of message copies.
-The destination must not already exist.
+node-seconds rather than the number of message copies. Body sizes are carried
+on arrivals, so the recorder needs no bundle-size cache.
+The destination must not already exist or alias the event output. A temporary
+file is opened before the simulation starts and published only after successful
+completion. Monitor failures cancel the simulation, and failed/interrupted
+captures leave the destination available for retry.
 
 Send timestamps mean **queued for transmission**; receive timestamps mean
 **delivered**. A peak is the busiest fixed one-second bucket, not instantaneous
 NIC throughput or a sliding-window maximum. Sending to multiple links can
 produce a node-wide rate above one link's bandwidth. These are modeled vote
 mini-protocol bytes only; they exclude TCP/IP framing and other protocols.
-The report records the requested slot count and last observed event time;
-confirm normal run completion before using the configured duration as a rate
-denominator. Stake distinguishes BPs from relays only in topologies that model
+The report records the requested slot count and last observed event time.
+The summarizer requires a final completion marker and an exactly matching
+finite duration before computing mean rates. Stake distinguishes BPs from relays only in topologies that model
 the BP as a separate node.
 
 For one run with the original study inputs, use the study configuration extracted
@@ -351,15 +367,30 @@ VOTE_STUDY_CONFIG_REVISION=f307ed5fa7077a32eb470ca3832a34092882bfe3 \
   scripts/vote-diffusion-study.sh /tmp/study-config.yaml /tmp/vote-node-traffic 0
 
 python3 scripts/summarize-vote-traffic.py \
-  /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-s0.vote-traffic.json \
+  /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-s0.vote-traffic.json \
   --duration 400 \
-  --log /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-s0.txt \
+  --log /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-bpfalse-s0.txt \
   --output /tmp/vote-node-traffic/breakdown
 ```
 
 The runner hashes captured reports in `vote-traffic-sha256.json`. The summarizer
 checks per-node time buckets against totals and reconciles send counts/bytes
-and body arrivals against the global log. It writes `nodes.csv` and `summary.md`,
+and body arrivals against the final global log summary. Version 1 archives
+also require the original successful `runs.csv` through `--legacy-runs`; their
+logs predate the completion marker. It writes `nodes.csv` and `summary.md`,
 with BP/relay totals and percentiles across nodes. Its input also accepts `.json.gz`.
 A report from one unrestricted-push run explains traffic distribution for that
 case; it does not test whether the protected-BP fanout rule restores quorum.
+
+The runner checks the executable's embedded revision against `revision.txt`,
+rebuilds the CLI if a cached version is stale, and stops if they still differ.
+The build script tracks common Git refs in linked worktrees. Historical binary
+metadata remains unchanged in archived results.
+
+Capture regression checks exercise the actual CLI, including existing outputs,
+path aliases, monitor failure, interruption and retry:
+
+```sh
+python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
+python3 scripts/test-summarize-vote-traffic.py
+```

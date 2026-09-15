@@ -147,6 +147,8 @@ pub struct LinearLeiosNode {
     clock: Clock,
     lottery: LotteryConfig,
     consumers: Vec<NodeId>,
+    vote_consumers: Vec<(NodeId, bool)>,
+    vote_fanout_rank: Vec<(bool, u64, NodeId)>,
     current_slot: u64,
     txs: BTreeMap<TransactionId, TransactionView>,
     mempool: Mempool,
@@ -188,6 +190,18 @@ impl NodeImpl for LinearLeiosNode {
 
         Self {
             id: config.id,
+            vote_consumers: config
+                .consumers
+                .iter()
+                .map(|peer| {
+                    (
+                        *peer,
+                        sim_config.vote_push_fanout_protects_producers
+                            && config.protected_vote_consumers.contains(peer),
+                    )
+                })
+                .collect(),
+            vote_fanout_rank: Vec::with_capacity(config.consumers.len()),
             sim_config,
             queued: EventResult::default(),
             tracker,
@@ -1682,54 +1696,43 @@ impl LinearLeiosNode {
         // and shard layouts, and independent of arrival order and of how
         // many draws this node has already made -- none of which is true
         // of drawing from a per-node stream.  Keying on the bundle means
-        // each vote takes its own subgraph, so the union over a committee
-        // still covers the network even though one vote does not.
+        // each vote takes its own subgraph. Neither per-vote delivery nor
+        // quorum coverage is guaranteed by this selection rule.
         //
-        // With `vote-push-fanout-protects-producers` (the default) the cap
-        // is a relay-to-relay limit.  In a deployment a block producer is
-        // a local root of its relays and the peer they exist to serve, so
-        // a relay would be expected to forward to it rather than sample
-        // it.  The topology carries no owner link, so stake is the proxy:
-        // stake-holding consumers are always pushed to and `k` is drawn
-        // from the rest.  Sampling the producer like any other consumer
-        // skips it with probability about 1 - k/d per relay; on the study
-        // topologies every producer has exactly two relays, which is a
-        // plausible reason every bounded arm of the 2026-09-10 study lost
-        // Q95 while the relay mesh delivered nearly everything.  A rerun
-        // with both settings is what tests that.
-        let selected: Option<BTreeSet<NodeId>> = match (&body, self.sim_config.vote_push_fanout) {
-            (Some(_), Some(k)) => {
-                let protect = self.sim_config.vote_push_fanout_protects_producers;
-                let (always, sampled): (Vec<NodeId>, Vec<NodeId>) = self
-                    .consumers
-                    .iter()
-                    .copied()
-                    .filter(|peer| echo || Some(*peer) != from)
-                    .partition(|peer| protect && self.sim_config.nodes[peer.to_inner()].stake > 0);
-                if sampled.len() as u64 <= k {
-                    None
-                } else {
-                    let rng = Rng::new(self.sim_config.seed);
-                    let mut ranked: Vec<(u64, NodeId)> = sampled
-                        .into_iter()
-                        .map(|peer| (rng.draw_u64_with_context(&(self.id, id, peer)), peer))
-                        .collect();
-                    ranked.sort_unstable();
-                    Some(
-                        always
-                            .into_iter()
-                            .chain(ranked.into_iter().take(k as usize).map(|(_, p)| p))
-                            .collect(),
-                    )
+        // Protected connections consume places in the same total cap. Rank
+        // them first, then sample the remaining places with the original hash.
+        // The topology classification and ranking allocation are reused.
+        let bounded = if let (Some(_), Some(k)) = (&body, self.sim_config.vote_push_fanout) {
+            self.vote_fanout_rank.clear();
+            let rng = Rng::new(self.sim_config.seed);
+            for &(peer, protected) in &self.vote_consumers {
+                if echo || Some(peer) != from {
+                    self.vote_fanout_rank.push((
+                        !protected,
+                        rng.draw_u64_with_context(&(self.id, id, peer)),
+                        peer,
+                    ));
                 }
             }
-            _ => None,
+            self.vote_fanout_rank.sort_unstable();
+            self.vote_fanout_rank
+                .truncate(usize::try_from(k).unwrap_or(usize::MAX));
+            self.vote_fanout_rank
+                .sort_unstable_by_key(|&(_, _, peer)| peer);
+            true
+        } else {
+            false
         };
         for peer in &self.consumers {
             if !echo && Some(*peer) == from {
                 continue;
             }
-            if selected.as_ref().is_some_and(|set| !set.contains(peer)) {
+            if bounded
+                && self
+                    .vote_fanout_rank
+                    .binary_search_by_key(peer, |&(_, _, p)| p)
+                    .is_err()
+            {
                 continue;
             }
             recipients += 1;

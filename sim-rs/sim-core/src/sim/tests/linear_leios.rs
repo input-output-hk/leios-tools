@@ -108,6 +108,7 @@ fn new_node(stake: Option<u64>, producers: Vec<&'static str>) -> RawNode {
                 (
                     n.to_string(),
                     RawLinkInfo {
+                        always_forward_votes: false,
                         latency_ms: 0.0,
                         bandwidth_bytes_per_second: None,
                         tcp_envelope: None,
@@ -2032,7 +2033,12 @@ fn new_mixed_star_topology(producers: usize, relays: usize) -> RawTopology {
     let mut nodes = vec![("node-1", new_node(Some(1000), vec![]))];
     for (i, name) in SPOKE_NAMES.iter().take(producers + relays).enumerate() {
         let stake = if i < producers { Some(1000) } else { None };
-        nodes.push((*name, new_node(stake, vec!["node-1"])));
+        let mut node = new_node(stake, vec!["node-1"]);
+        node.producers
+            .get_mut("node-1")
+            .unwrap()
+            .always_forward_votes = i < producers;
+        nodes.push((*name, node));
     }
     new_topology(nodes)
 }
@@ -2125,51 +2131,76 @@ fn no_fanout_limit_pushes_to_every_consumer() {
     assert_eq!(vote_push_targets(&sim, node1).len(), 4);
 }
 
-/// The cap is a relay-to-relay limit.  A consumer that holds stake is a
-/// block producer: it has no path into the network but its own relays, so
-/// a relay always pushes to it and draws the limit from its other peers.
-/// Sampling the producer like any other consumer skips it with
-/// probability about `1 - k/d` at each of its two relays, and a producer
-/// that misses that many votes has no quorum: a plausible reason every
-/// bounded arm of the 2026-09-10 study lost Q95.
+/// Protected consumers occupy places inside the cap, even when a marked
+/// consumer has no stake and an unmarked relay does hold stake.
 #[test]
-fn bounded_fanout_always_pushes_to_a_stake_holding_consumer() {
-    let config = new_sim_config_with(new_mixed_star_topology(1, 5), |params| {
-        params.vote_transport = VoteTransport::Push;
-        params.vote_push_fanout = Some(2);
-    });
-    let mut sim = TestDriver::new_with_config(config);
-    let node1 = sim.id_for("node-1");
-    let producer = sim.id_for("node-2");
-
-    sim.produce_vote_bundle(node1);
-
-    let targets = vote_push_targets(&sim, node1);
-    assert!(
-        targets.contains(&producer),
-        "the producer must always get the body, got {targets:?}"
-    );
-    assert_eq!(
-        targets.len(),
-        3,
-        "expected the producer plus 2 of the 5 relays, got {targets:?}"
-    );
+fn bounded_fanout_protects_explicit_links_within_the_total_budget() {
+    for transport in [VoteTransport::Push, VoteTransport::PushLateDedupe] {
+        for protects in [false, true] {
+            let mut topology = new_mixed_star_topology(1, 5);
+            topology.nodes.get_mut("node-2").unwrap().stake = None;
+            topology.nodes.get_mut("node-3").unwrap().stake = Some(1000);
+            let config = new_sim_config_with(topology, |params| {
+                params.vote_transport = transport;
+                params.vote_push_fanout = Some(2);
+                params.vote_push_fanout_protects_producers = protects;
+            });
+            let mut sim = TestDriver::new_with_config(config);
+            let node1 = sim.id_for("node-1");
+            let producer = sim.id_for("node-2");
+            sim.produce_vote_bundle(node1);
+            let targets = vote_push_targets(&sim, node1);
+            assert_eq!(targets.len(), 2);
+            if protects {
+                assert!(targets.contains(&producer));
+            }
+        }
+    }
 }
 
-/// The limit is spent on relay links only, so a limit that covers every
-/// relay is no limit at all: the producer is not what it was counting.
 #[test]
-fn fanout_covering_every_relay_pushes_to_every_consumer() {
+fn protected_fanout_covering_every_consumer_pushes_to_every_consumer() {
     let config = new_sim_config_with(new_mixed_star_topology(1, 5), |params| {
         params.vote_transport = VoteTransport::Push;
-        params.vote_push_fanout = Some(5);
+        params.vote_push_fanout = Some(6);
+        params.vote_push_fanout_protects_producers = true;
     });
     let mut sim = TestDriver::new_with_config(config);
     let node1 = sim.id_for("node-1");
-
     sim.produce_vote_bundle(node1);
-
     assert_eq!(vote_push_targets(&sim, node1).len(), 6);
+}
+
+#[test]
+fn protected_fanout_frees_the_source_place_unless_echo_is_enabled() {
+    for echo in [false, true] {
+        for transport in [VoteTransport::Push, VoteTransport::PushLateDedupe] {
+            let mut topology = new_mixed_star_topology(1, 5);
+            topology.nodes.get_mut("node-1").unwrap().producers.insert(
+                "node-2".into(),
+                RawLinkInfo {
+                    always_forward_votes: false,
+                    latency_ms: 0.0,
+                    bandwidth_bytes_per_second: None,
+                    tcp_envelope: None,
+                },
+            );
+            let config = new_sim_config_with(topology, |params| {
+                params.vote_transport = transport;
+                params.vote_push_fanout = Some(2);
+                params.vote_push_fanout_protects_producers = true;
+                params.vote_transport_echo_to_source = echo;
+            });
+            let mut sim = TestDriver::new_with_config(config);
+            let hub = sim.id_for("node-1");
+            let bp = sim.id_for("node-2");
+            let votes = sim.produce_vote_bundle(bp);
+            sim.expect_vote_bundle_sent(bp, hub, votes);
+            let targets = vote_push_targets(&sim, hub);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets.contains(&bp), echo);
+        }
+    }
 }
 
 /// With the protection off every consumer is sampled alike, which is the
@@ -2235,6 +2266,44 @@ fn sim_config_rejects_a_fanout_limit_that_could_not_apply() {
             "{name}: expected an error mentioning {expected:?}, got {msg:?}"
         );
     }
+}
+
+#[test]
+fn producer_protection_rejects_missing_markers_and_impossible_budgets() {
+    for (producers, relays, cap, expected) in [
+        (0, 4, 2, "requires topology links"),
+        (3, 2, 2, "exceeding vote-push-fanout"),
+        (4, 0, 4, "every vote consumer is protected"),
+    ] {
+        let mut params: crate::config::RawParameters =
+            serde_yaml::from_slice(include_bytes!("../../../../parameters/config.default.yaml"))
+                .unwrap();
+        params.leios_variant = crate::config::LeiosVariant::LinearWithTxReferences;
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(cap);
+        params.vote_push_fanout_protects_producers = true;
+        let error =
+            SimConfiguration::build(params, new_mixed_star_topology(producers, relays).into())
+                .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn default_fanout_still_caps_an_all_stake_topology() {
+    let mut topology = new_star_topology(4);
+    for node in topology.nodes.values_mut() {
+        node.stake = Some(1000);
+    }
+    let config = new_sim_config_with(topology, |params| {
+        assert!(!params.vote_push_fanout_protects_producers);
+        params.vote_transport = VoteTransport::Push;
+        params.vote_push_fanout = Some(2);
+    });
+    let mut sim = TestDriver::new_with_config(config);
+    let hub = sim.id_for("node-1");
+    sim.produce_vote_bundle(hub);
+    assert_eq!(vote_push_targets(&sim, hub).len(), 2);
 }
 
 /// Arrival before the deadline does not excuse validation finishing after it.

@@ -330,17 +330,12 @@ vote-transport-echo-to-source: false
 # drawn from.
 vote-push-fanout: null
 
-# Whether vote-push-fanout is a relay-to-relay limit.  true (the default): a
-# consumer that holds stake counts as a block producer and is always pushed
-# to; the limit is drawn from the remaining consumers.  In a deployment the
-# producer is a local root of its relays, and the topology has no owner link,
-# so stake is the proxy: on the study topologies every stake-holding node is
-# a producer whose only links are its own two relays.  On a topology where
-# every node holds stake the limit then does nothing.
-# false: every consumer is sampled alike, which skips a producer with
-# probability about 1 - k/d at each of its relays.  This is the rule the
-# fanout rows of the 2026-09-10 study measured; set it to reproduce them.
-vote-push-fanout-protects-producers: true
+# Prioritize topology connections marked always-forward-votes within the total
+# fanout budget. A BP marks its own relay entries under producers with this flag.
+# Protected connections count toward k; remaining places are sampled by hash.
+# Rejects missing markers, an entirely protected topology, and protected counts
+# exceeding k. false preserves the rule used by the 2026-09-10 archived overlays.
+vote-push-fanout-protects-producers: false
 
 # Haskell prototype relay mini-protocol parameters.  Not read by this simulator;
 # kept for parity with the Haskell simulator's configuration.

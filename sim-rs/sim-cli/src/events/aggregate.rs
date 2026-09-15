@@ -51,6 +51,17 @@ impl TraceAggregator {
     }
 
     pub fn process(&mut self, event: OutputEvent) -> Option<AggregatedData> {
+        if let Some(message) = super::vote_accounting::message(&event.message) {
+            let kind = match message.kind {
+                super::vote_accounting::VoteMessageKind::Body => MessageKind::Votes,
+                _ => MessageKind::VoteControl,
+            };
+            if message.receiving {
+                self.track_wire_received(kind, message.node.clone(), message.bytes);
+            } else {
+                self.track_wire_sent(kind, message.node.clone(), message.bytes);
+            }
+        }
         match event.message {
             Event::TXGenerated {
                 id,
@@ -174,12 +185,6 @@ impl TraceAggregator {
             } => {
                 self.track_data_generated(MessageId::Votes(id), producer, size_bytes);
             }
-            Event::VTBundleSent { id, sender, .. } => {
-                self.track_data_sent(MessageId::Votes(id), sender);
-            }
-            Event::VTBundleReceived { id, recipient, .. } => {
-                self.track_data_received(MessageId::Votes(id), recipient);
-            }
             Event::VTBundleDuplicate {
                 recipient,
                 msg_size_bytes,
@@ -193,30 +198,6 @@ impl TraceAggregator {
                 // stream cannot tell the push arms from the announce arm,
                 // since what separates them is precisely the copies.
                 self.track_redundant(MessageKind::Votes, recipient, msg_size_bytes);
-            }
-            Event::VTBundleAnnounced {
-                sender,
-                msg_size_bytes,
-                ..
-            }
-            | Event::VTBundleRequested {
-                sender,
-                msg_size_bytes,
-                ..
-            } => {
-                self.track_control_sent(MessageKind::VoteControl, sender, msg_size_bytes);
-            }
-            Event::VTBundleAnnouncementReceived {
-                recipient,
-                msg_size_bytes,
-                ..
-            }
-            | Event::VTBundleRequestReceived {
-                recipient,
-                msg_size_bytes,
-                ..
-            } => {
-                self.track_control_received(MessageKind::VoteControl, recipient, msg_size_bytes);
             }
             Event::EBQuorumReached { node, .. } => {
                 // Not a message, so it has no place in the byte counts: it is
@@ -377,9 +358,8 @@ impl TraceAggregator {
         stats.bytes += bytes;
     }
 
-    /// A control message that carries no body of its own, so its size is on
-    /// the event rather than in the `bytes` map keyed by the body's id.
-    fn track_control_sent(&mut self, kind: MessageKind, sender: Node, bytes: u64) {
+    /// A wire message whose size is carried directly by its event.
+    fn track_wire_sent(&mut self, kind: MessageKind, sender: Node, bytes: u64) {
         self.nodes_updated.insert(sender.clone());
         let sender_data = self.nodes.entry(sender).or_default();
         let sent = sender_data.sent.entry(kind).or_default();
@@ -388,7 +368,7 @@ impl TraceAggregator {
         sender_data.bytes_sent += bytes;
     }
 
-    fn track_control_received(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
+    fn track_wire_received(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
         self.nodes_updated.insert(recipient.clone());
         let recipient_data = self.nodes.entry(recipient).or_default();
         let received = recipient_data.received.entry(kind).or_default();

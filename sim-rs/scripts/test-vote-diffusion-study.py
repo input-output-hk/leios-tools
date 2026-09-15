@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression checks for the runner/extractor interface; uses the archived logs."""
 import csv
+import importlib.util
+from unittest.mock import patch
 import hashlib
 import json
 import os
@@ -16,6 +18,10 @@ HERE = Path(__file__).resolve().parents[1]
 REPORT = HERE / 'docs/vote-diffusion-results-20260910'
 EXTRACT = REPORT / 'extract-results.py'
 RUNNER = HERE / 'scripts/vote-diffusion-study.sh'
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location('runner', RUNNER.with_suffix('.py'))
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
 
 
 class StudyInterfaceTests(unittest.TestCase):
@@ -141,19 +147,73 @@ class StudyInterfaceTests(unittest.TestCase):
         actual = json.loads((self.root / 'results.json').read_text())
         self.assertIn('do not reconcile', actual['parse_errors'][0]['error'])
 
-    def test_runner_can_select_one_transport_and_capture_node_traffic(self):
+    def test_runner_executes_capture_and_records_its_checksum(self):
         output = self.root / 'one-run'
-        env = dict(os.environ, VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+        fake_binary = self.root / 'sim-cli'
+        fake_binary.write_text("#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\np = Path(sys.argv[sys.argv.index('--vote-traffic') + 1])\np.write_text('{\"captured\":true}\\n')\n")
+        fake_binary.chmod(0o755)
+        env = dict(os.environ, VOTE_STUDY_DRY_RUN='0', VOTE_STUDY_SIZES='1500',
                    VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_FANOUTS='all',
                    VOTE_STUDY_TRANSPORTS='push', VOTE_STUDY_NODE_TRAFFIC='1')
-        result = subprocess.run([str(HERE / 'scripts/vote-diffusion-study.sh'),
-                                 str(self.archive / 'study-config.yaml'), str(output), '0'],
-                                env=env, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        with patch.dict(os.environ, env, clear=True), patch.object(runner, 'build_binary', return_value=fake_binary), \
+                patch.object(sys, 'argv', [str(RUNNER), str(self.archive / 'study-config.yaml'), str(output), '0']):
+            self.assertEqual(runner.main(), 0)
         with (output / 'runs.csv').open() as stream:
             rows = list(csv.DictReader(stream))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]['run'], '1500-top-stake-seats-push-fall-s0')
+        self.assertEqual(rows[0]['status'], 'passed')
+        self.assertEqual(rows[0]['run'], '1500-top-stake-seats-push-fall-bpfalse-s0')
+        name = rows[0]['run'] + '.vote-traffic.json'
+        self.assertEqual(json.loads((output / name).read_text()), {'captured': True})
+        checksums = json.loads((output / 'vote-traffic-sha256.json').read_text())
+        self.assertEqual(checksums[name], runner.digest(output / name))
+
+    def test_stale_binary_rebuilt_and_rejected_if_still_stale(self):
+        revision = 'abcdef0123456789'
+        target = self.root / 'target'
+        (target / 'release').mkdir(parents=True)
+        (target / 'release/sim-cli').write_text('executable fixture')
+        with patch.dict(os.environ, CARGO_TARGET_DIR=str(target)), patch.object(runner.subprocess, 'run') as run:
+            with patch.object(runner.subprocess, 'check_output', side_effect=['sim-cli 2.0.1-1234567\n', 'sim-cli 2.0.1-abcdef0\n']):
+                runner.build_binary(self.root, revision)
+            self.assertEqual([c.args[0][1] for c in run.call_args_list], ['build', 'clean', 'build'])
+            with patch.object(runner.subprocess, 'check_output', return_value='sim-cli 2.0.1-1234567\n'):
+                with self.assertRaisesRegex(ValueError, 'Executable revision differs'):
+                    runner.build_binary(self.root, revision)
+
+    def test_protection_is_named_and_recorded_in_both_rules(self):
+        names = []
+        for protection in ['false', 'true']:
+            output = self.root / protection
+            env = dict(os.environ, VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='750',
+                       VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_FANOUTS='8',
+                       VOTE_STUDY_TRANSPORTS='push', VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS=protection)
+            result = subprocess.run([str(RUNNER), str(self.archive / 'study-config.yaml'), str(output)],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (output / 'runs.csv').open() as stream:
+                row, = csv.DictReader(stream)
+            names.append(row['run'])
+            self.assertEqual(row['protects_producers'], protection)
+            self.assertIn(f'vote-push-fanout-protects-producers: {protection}', (output / (row['run'] + '.yaml')).read_text())
+            nodes = json.loads((output / 'topology-750.yaml').read_text())['nodes']
+            self.assertEqual(sum(link.get('always-forward-votes', False) for n in nodes.values()
+                                 for link in n['producers'].values()), 432)
+        self.assertNotEqual(*names)
+
+    def test_extractor_keeps_both_protection_rules(self):
+        row = self.subset()
+        rows = []
+        for protection in ['false', 'true']:
+            r = dict(row, run=row['run'] + '-bp' + protection, protects_producers=protection)
+            shutil.copyfile(self.root / (row['run'] + '.txt'), self.root / (r['run'] + '.txt'))
+            rows.append(r)
+        self.write_rows(rows)
+        self.manifest('log-sha256.json', [r['run'] + '.txt' for r in rows])
+        result = self.extract()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        results = json.loads((self.root / 'results.json').read_text())['results']
+        self.assertEqual({r['protects_producers'] for r in results}, {'false', 'true'})
 
     def test_runner_plans_complete_matrix_with_extractor_schema(self):
         output = self.root / 'plan'
@@ -164,7 +224,7 @@ class StudyInterfaceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         with (output / 'runs.csv').open() as stream:
             reader = csv.DictReader(stream)
-            self.assertEqual(reader.fieldnames, list(self.rows[0]))
+            self.assertEqual(reader.fieldnames, list(self.rows[0]) + ['protects_producers'])
             rows = list(reader)
         self.assertEqual(len(rows), 108)
         self.assertEqual(len({r['run'] for r in rows}), 108)
@@ -178,7 +238,7 @@ class StudyInterfaceTests(unittest.TestCase):
             overlay = (output / (row['run'] + '.yaml')).read_text()
             self.assertIn(f'vote-transport: "{row["transport"]}"', overlay)
             self.assertIn(f'vote-push-fanout: {"null" if row["fanout"] == "all" else row["fanout"]}', overlay)
-            self.assertIn('vote-push-fanout-protects-producers: true', overlay)
+            self.assertIn('vote-push-fanout-protects-producers: false', overlay)
 
 
 if __name__ == '__main__':

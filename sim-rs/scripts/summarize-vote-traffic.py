@@ -19,10 +19,13 @@ def load(path):
 
 
 def summarize(report, duration):
-    if report['format_version'] != 1 or report['window_seconds'] != 1:
-        raise ValueError('Expected version 1 with one-second buckets')
-    if duration <= 0 or report['observed_until_s'] > duration:
-        raise ValueError('Duration must cover the observed simulation interval')
+    if report['format_version'] not in (1, 2) or report['window_seconds'] != 1:
+        raise ValueError('Expected version 1 or 2 with one-second buckets')
+    if not math.isfinite(duration) or duration <= 0 or duration != report.get('requested_slots'):
+        raise ValueError('Duration must equal the requested slot count of the completed run')
+    observed = report['observed_until_s']
+    if not math.isfinite(observed) or not 0 <= observed <= duration:
+        raise ValueError('Invalid observed simulation interval')
     rows = []
     ids = set()
     for node in report['nodes']:
@@ -37,6 +40,8 @@ def summarize(report, duration):
                 row[f'{direction}_{kind}_messages'] = counts['messages']
                 row[f'{direction}_{kind}_bytes'] = counts['bytes']
                 total += counts['bytes']
+            if len(node['seconds']) > math.ceil(duration):
+                raise ValueError('Traffic bucket falls outside the completed run')
             buckets = [pair[index] for pair in node['seconds']]
             if sum(buckets) != total:
                 raise ValueError(f"Node {node['id']}: {direction} buckets do not reconcile")
@@ -51,10 +56,28 @@ def summarize(report, duration):
     return rows
 
 
-def reconcile(rows, log):
+def reconcile(rows, log, duration, legacy=False):
+    log = re.sub(r'\x1b\[[0-9;]*m', '', log)
+    protocol = log.rfind('Final protocol stats:')
+    network = log.rfind('Final network stats:')
+    if protocol < 0 or network < protocol:
+        raise ValueError('Missing final protocol/network summaries')
+    completions = re.findall(r'Simulation completed: (\d+) slots\.', log[network:])
+    if completions and int(completions[-1]) != duration:
+        raise ValueError('Completion duration differs from the requested duration')
+    if not completions:
+        if not legacy:
+            raise ValueError('Missing completion marker for the requested duration')
+        slots = re.findall(r'Slot (\d+) has begun\.', log[:protocol])
+        if not slots or int(slots[-1]) + 1 != duration:
+            raise ValueError('Legacy log did not reach the requested final slot')
+    log = log[network:]
     lines = re.findall(r'Vote mini-protocol traffic sent: .*', log)
     if not lines:
-        raise ValueError('Missing global vote-traffic summary')
+        if any(r['sent_bytes'] for r in rows):
+            raise ValueError('Missing global vote-traffic summary')
+        # The monitor omits the wire breakdown when no votes were sent.
+        lines = ['Vote mini-protocol traffic sent: 0 message(s), 0.00 MB = 0 bodies (0.00 MB) + 0 announcement(s) (0.00 MB) + 0 request(s) (0.00 MB).']
     match = re.fullmatch(r'Vote mini-protocol traffic sent: (\d+) message\(s\), ([\d.]+) MB = (\d+) bod(?:y|ies) \(([\d.]+) MB\) \+ (\d+) announcement\(s\) \(([\d.]+) MB\) \+ (\d+) request\(s\) \(([\d.]+) MB\)\.', lines[-1])
     if not match:
         raise ValueError('Unrecognized global vote-traffic summary')
@@ -107,9 +130,23 @@ def main():
     parser.add_argument('--duration', type=float, required=True, help='Actual simulated duration of the completed run, in seconds')
     parser.add_argument('--log', type=Path, required=True, help='Reconcile counts with the simulator summary')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--legacy-runs', type=Path,
+                        help='For version 1 archives only: runs.csv proving this run exited successfully')
     args = parser.parse_args()
-    rows = summarize(load(args.report), args.duration)
-    reconcile(rows, args.log.read_text())
+    report = load(args.report)
+    legacy = report['format_version'] == 1
+    if legacy:
+        if not args.legacy_runs:
+            raise ValueError('Version 1 requires archived runs.csv via --legacy-runs')
+        with args.legacy_runs.open() as stream:
+            runs = list(csv.DictReader(stream))
+        candidates = [r for r in runs if int(r['seed']) == report['seed']
+                      and int(r['nodes']) == len(report['nodes'])
+                      and int(r['slots']) == args.duration]
+        if len(candidates) != 1 or candidates[0]['status'] != 'passed' or candidates[0]['exit_code'] != '0':
+            raise ValueError('Legacy run must have one matching successful completion record')
+    rows = summarize(report, args.duration)
+    reconcile(rows, args.log.read_text(), args.duration, legacy=legacy)
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / 'nodes.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")

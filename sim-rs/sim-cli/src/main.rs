@@ -19,7 +19,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{level_filters::LevelFilter, warn};
+use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt};
 
 mod events;
@@ -150,6 +150,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = read_config(&args)?;
 
+    let slots = config.slots;
     let (events_sink, events_source) = mpsc::unbounded_channel();
     let monitor = EventMonitor::new(&config, events_source, args.output)
         .with_vote_traffic_output(&config, args.vote_traffic)?;
@@ -158,13 +159,40 @@ async fn main() -> Result<()> {
 
     let simulation = Simulation::new(config, events_sink).await?;
 
-    select! {
-        result = simulation.run(token) => { result? }
-        result = &mut monitor => { return result?; }
-        _ = ctrlc_source => {}
+    // Keep the simulation future alive while cancelling: dropping a future
+    // cannot stop the sequential engine's spawn_blocking worker.
+    let simulation = simulation.run(token.child_token());
+    pin!(simulation);
+    let (result, monitored) = select! {
+        result = &mut simulation => {
+            if result.is_err() { token.cancel(); }
+            (result, monitor.await)
+        }
+        monitored = &mut monitor => {
+            if !matches!(&monitored, Ok(Ok(_))) { token.cancel(); }
+            (simulation.await, monitored)
+        }
+        _ = ctrlc_source => {
+            token.cancel();
+            (simulation.await, monitor.await)
+        }
     };
-
-    monitor.await??;
+    let (completed_slots, report) = monitored??;
+    result?;
+    anyhow::ensure!(
+        !token.is_cancelled(),
+        "simulation interrupted; traffic capture discarded"
+    );
+    anyhow::ensure!(
+        slots.is_none_or(|slots| slots == completed_slots),
+        "simulation ended before all requested slots were observed"
+    );
+    if let Some(report) = report {
+        report.publish()?;
+    }
+    if let Some(slots) = slots {
+        info!("Simulation completed: {slots} slots.");
+    }
     Ok(())
 }
 

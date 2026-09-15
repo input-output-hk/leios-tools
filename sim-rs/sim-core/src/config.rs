@@ -367,18 +367,11 @@ pub struct RawParameters {
     /// limit is drawn from.
     #[serde(default)]
     pub vote_push_fanout: Option<u64>,
-    /// Whether the fanout limit is a relay-to-relay limit.  When set (the
-    /// default), a consumer that holds stake counts as a block producer
-    /// and is always pushed to, and `k` is drawn from the remaining
-    /// consumers.  When unset, every consumer is sampled alike, which is
-    /// the rule the fanout rows of the 2026-09-10 study measured.
-    ///
-    /// The topology carries no owner link between a producer and its
-    /// relays, so stake is the proxy: on the study topologies every
-    /// stake-holding node is a producer whose only links are its own two
-    /// relays.  On a topology where every node holds stake the limit
-    /// does nothing while this is set.
-    #[serde(default = "default_vote_push_fanout_protects_producers")]
+    /// Prioritize topology links marked `always-forward-votes` within the
+    /// total fanout budget. These identify a relay's own BP consumers without
+    /// inferring ownership from stake. Remaining places are sampled by hash.
+    /// Defaults to false, preserving the 2026-09-10 forwarding rule.
+    #[serde(default)]
     pub vote_push_fanout_protects_producers: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
@@ -858,6 +851,10 @@ pub enum RawNodeLocation {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawLinkInfo {
+    /// On this consumer's upstream connection, always forward votes from the
+    /// upstream node to this consumer when producer protection is enabled.
+    #[serde(default)]
+    pub always_forward_votes: bool,
     pub latency_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_bytes_per_second: Option<u64>,
@@ -1056,6 +1053,7 @@ impl Topology {
                     tx_conflict_fraction: node.tx_conflict_fraction,
                     tx_generation_weight: node.tx_generation_weight,
                     consumers: vec![],
+                    protected_vote_consumers: vec![],
                     behaviours,
                 },
             );
@@ -1071,6 +1069,13 @@ impl Topology {
                     .unwrap()
                     .consumers
                     .push(consumer_id);
+                if producer_info.always_forward_votes {
+                    nodes
+                        .get_mut(&producer_id)
+                        .unwrap()
+                        .protected_vote_consumers
+                        .push(consumer_id);
+                }
                 let mut ids = [consumer_id, producer_id];
                 ids.sort();
                 let latency = duration_ms(producer_info.latency_ms);
@@ -1851,6 +1856,36 @@ impl SimConfiguration {
                 );
             }
         }
+        if let Some(fanout) = params.vote_push_fanout
+            && params.vote_push_fanout_protects_producers
+        {
+            if topology
+                .nodes
+                .iter()
+                .all(|node| node.protected_vote_consumers.is_empty())
+            {
+                bail!(
+                    "vote-push-fanout-protects-producers requires topology links marked always-forward-votes"
+                );
+            }
+            for node in &topology.nodes {
+                if node.protected_vote_consumers.len() as u64 > fanout {
+                    bail!(
+                        "node {} has {} protected vote consumers, exceeding vote-push-fanout {}",
+                        node.name,
+                        node.protected_vote_consumers.len(),
+                        fanout
+                    );
+                }
+            }
+            if topology
+                .nodes
+                .iter()
+                .all(|node| node.protected_vote_consumers.len() == node.consumers.len())
+            {
+                bail!("every vote consumer is protected; vote-push-fanout would have no effect");
+            }
+        }
         if (params.vote_transport.is_push() || params.vote_transport_echo_to_source)
             && !matches!(
                 params.leios_variant,
@@ -2001,10 +2036,6 @@ fn default_retry_vote_in_window() -> bool {
     true
 }
 
-fn default_vote_push_fanout_protects_producers() -> bool {
-    true
-}
-
 fn default_rb_apply_cpu_time_ms() -> f64 {
     0.5
 }
@@ -2031,6 +2062,7 @@ pub struct NodeConfiguration {
     pub tx_conflict_fraction: Option<f64>,
     pub tx_generation_weight: Option<u64>,
     pub consumers: Vec<NodeId>,
+    pub protected_vote_consumers: Vec<NodeId>,
     pub behaviours: NodeBehaviours,
 }
 
@@ -2082,6 +2114,7 @@ mod consensus_behaviour_tests {
             tx_conflict_fraction: None,
             tx_generation_weight: None,
             consumers: Vec::new(),
+            protected_vote_consumers: Vec::new(),
             behaviours: NodeBehaviours::default(),
         }
     }
@@ -2235,6 +2268,7 @@ mod tcp_envelope_tests {
         b_producers.insert(
             "a".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 50.0,
                 bandwidth_bytes_per_second: Some(1_000_000),
                 tcp_envelope: None,
@@ -2360,6 +2394,7 @@ mod partition_tests {
                 producers.insert(
                     peer.to_string(),
                     RawLinkInfo {
+                        always_forward_votes: false,
                         latency_ms: 10.0,
                         bandwidth_bytes_per_second: None,
                         tcp_envelope: None,
@@ -2561,6 +2596,7 @@ mod partition_tests {
         b_producers.insert(
             "a".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 10.0,
                 bandwidth_bytes_per_second: None,
                 tcp_envelope: None,
@@ -2569,6 +2605,7 @@ mod partition_tests {
         b_producers.insert(
             "c".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 10.0,
                 bandwidth_bytes_per_second: None,
                 tcp_envelope: None,

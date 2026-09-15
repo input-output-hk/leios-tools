@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,7 +16,7 @@ import time
 
 HERE = Path(__file__).resolve().parents[1]
 FIELDS = ['run', 'seed', 'nodes', 'committee', 'transport', 'fanout', 'slots',
-          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code']
+          'status', 'started_utc', 'finished_utc', 'elapsed_s', 'exit_code', 'protects_producers']
 
 
 def atomic(path, text):
@@ -68,6 +69,56 @@ def choices(variable, default, allowed):
     return values
 
 
+def flag(variable, default, true, false):
+    values = choices(variable, default, {true, false})
+    if len(values) != 1:
+        raise ValueError(f'{variable} must be {true} or {false}')
+    return values[0] == true
+
+
+def build_binary(root, revision):
+    manifest_path = str(HERE / 'Cargo.toml')
+    target = Path(os.environ.get('CARGO_TARGET_DIR', HERE / 'target')).resolve()
+    built = target / 'release/sim-cli'
+    env = dict(os.environ)
+    env.pop('VERGEN_GIT_SHA', None)
+    for attempt in range(2):
+        if attempt:
+            # Older build scripts miss common refs in linked worktrees.
+            subprocess.run(['cargo', 'clean', '--release', '-p', 'sim-cli',
+                            '--manifest-path', manifest_path], check=True, env=env)
+        subprocess.run(['cargo', 'build', '--release', '--locked', '--manifest-path',
+                        manifest_path, '--bin', 'sim-cli'], check=True, env=env)
+        version = subprocess.check_output([str(built), '--version'], text=True)
+        embedded = re.search(r'-([0-9a-f]{7,40})\s*$', version)
+        if embedded and revision.strip().startswith(embedded[1]):
+            binary = root / 'sim-cli'
+            shutil.copy2(built, binary)
+            atomic(root / 'binary.txt', version)
+            return binary
+    raise ValueError(f'Executable revision differs from source {revision.strip()}: {version.strip()}')
+
+
+def study_topology(size):
+    source = 'topology-v2-cip.yaml' if size == '750' else 'topology-v2-1500.yaml'
+    topology = json.loads((HERE.parent / 'data/simulation/pseudo-mainnet' / source).read_text())
+    nodes = topology['nodes']
+    for name, node in nodes.items():
+        if size == '1500':
+            node['cpu-core-count'] = 4
+            for peer in node.get('producers', {}).values():
+                peer['bandwidth-bytes-per-second'] = 1250000
+        # These two study fixtures separate BPs and their two upstream relays.
+        # Make that assumption explicit in the saved topology, not in routing.
+        if node.get('stake', 0):
+            peers = node.get('producers', {})
+            if len(peers) != 2 or any(nodes[p].get('stake', 0) for p in peers):
+                raise ValueError(f'{name}: expected a BP with two non-staking upstream relays')
+            for peer in peers.values():
+                peer['always-forward-votes'] = True
+    return topology
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('config', type=Path)
@@ -85,23 +136,15 @@ def main():
     slots = positive(os.environ.get('VOTE_STUDY_SLOTS', '400'))
     transports = choices('VOTE_STUDY_TRANSPORTS', 'announce-then-request push push-late-dedupe',
                          {'announce-then-request', 'push', 'push-late-dedupe'})
-    capture = choices('VOTE_STUDY_NODE_TRAFFIC', '0', {'0', '1'})
-    if len(capture) != 1:
-        raise ValueError('VOTE_STUDY_NODE_TRAFFIC must be 0 or 1')
-    capture = capture == ['1']
-    protects = choices('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'true', {'true', 'false'})
-    if len(protects) != 1:
-        raise ValueError('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS must be true or false')
-    protects = protects[0]
+    capture = flag('VOTE_STUDY_NODE_TRAFFIC', '0', '1', '0')
+    protects = flag('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'false', 'true', 'false')
     seeds = args.seeds or ['0']
     if any(not s.isascii() or not s.isdigit() for s in seeds):
         raise ValueError('Seeds must be nonnegative integers')
     seeds = [str(int(s)) for s in seeds]
     if len(seeds) != len(set(seeds)):
         raise ValueError('Seeds must be distinct')
-    dry_run = choices('VOTE_STUDY_DRY_RUN', '0', {'0', '1'}) == ['1']
-    if len(os.environ.get('VOTE_STUDY_DRY_RUN', '0').split()) != 1:
-        raise ValueError('VOTE_STUDY_DRY_RUN must be 0 or 1')
+    dry_run = flag('VOTE_STUDY_DRY_RUN', '0', '1', '0')
     cfg = args.config.resolve(strict=True)
     root = args.output.resolve()
     root.mkdir()  # Never overwrite a previous study.
@@ -123,15 +166,7 @@ def main():
     atomic(root / 'upstream-revision.txt', upstream + '\n')
     shutil.copyfile(Path(__file__), root / 'runner.py')
     for size in sizes:
-        if size == '750':
-            shutil.copyfile(HERE.parent / 'data/simulation/pseudo-mainnet/topology-v2-cip.yaml', root / 'topology-750.yaml')
-        else:
-            topology = json.loads((HERE.parent / 'data/simulation/pseudo-mainnet/topology-v2-1500.yaml').read_text())
-            for node in topology['nodes'].values():
-                node['cpu-core-count'] = 4
-                for peer in node.get('producers', {}).values():
-                    peer['bandwidth-bytes-per-second'] = 1250000
-            (root / 'topology-1500.yaml').write_text(json.dumps(topology))
+        (root / f'topology-{size}.yaml').write_text(json.dumps(study_topology(size)))
     rows = []
     arms = [('announce-then-request', 'all')] if 'announce-then-request' in transports else []
     arms += [(transport, fanout) for fanout in fanouts
@@ -140,15 +175,16 @@ def main():
         for size in sizes:
             for committee in committees:
                 for transport, fanout in arms:
-                    name = f'{size}-{committee}-{transport}-f{fanout}-s{seed}'
+                    protection = str(protects and transport != 'announce-then-request' and fanout != 'all').lower()
+                    name = f'{size}-{committee}-{transport}-f{fanout}-bp{protection}-s{seed}'
                     cap = 'null' if fanout == 'all' else str(int(fanout))
                     (root / (name + '.yaml')).write_text(
                         f'committee-selection-algorithm: "{committee}"\ncommittee-seat-count: 900\n'
                         f'quorum-weight-fraction: 0.75\nseed: {seed}\nvote-transport: "{transport}"\n'
-                        f'vote-push-fanout: {cap}\nvote-push-fanout-protects-producers: {protects}\n'
+                        f'vote-push-fanout: {cap}\nvote-push-fanout-protects-producers: {protection}\n'
                         f'vote-transport-echo-to-source: false\n')
                     rows.append(dict(zip(FIELDS, [name, seed, size, committee, transport, fanout, slots,
-                                                'planned', '', '', '', ''])))
+                                                'planned', '', '', '', '', protection])))
     save_runs(root, rows)
     inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch'])
     write_json(root / 'input-sha256.json', inputs)
@@ -158,14 +194,9 @@ def main():
     if dry_run:
         print(f'Planned {len(rows)} runs in {root}', flush=True)
         return 0
-    subprocess.run(['cargo', 'build', '--release', '--locked', '--manifest-path', str(HERE / 'Cargo.toml'),
-                    '--bin', 'sim-cli'], check=True)
-    target = Path(os.environ.get('CARGO_TARGET_DIR', HERE / 'target'))
-    binary = root / 'sim-cli'
-    shutil.copy2(target / 'release/sim-cli', binary)
+    binary = build_binary(root, revision)
     binary_hash = digest(binary)
     atomic(root / 'binary.sha256', binary_hash + '\n')
-    atomic(root / 'binary.txt', subprocess.check_output([str(binary), '--version'], text=True))
     for index, row in enumerate(rows, 1):
         verify(root, inputs)
         if digest(binary) != binary_hash:

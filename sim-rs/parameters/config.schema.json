@@ -756,7 +756,7 @@
       "minimum": 1
     },
     "vote-push-fanout-protects-producers": {
-      "description": "Whether vote-push-fanout is a relay-to-relay limit. true (default): consumers that hold stake count as block producers and are always pushed to; the limit is drawn from the remaining consumers. false: every consumer is sampled alike, the rule the fanout rows of the 2026-09-10 study measured.",
+      "description": "Prioritize connections marked always-forward-votes in the topology within the total fanout cap. Protected consumers count toward k; remaining places are sampled by hash. false (default) preserves the forwarding rule of the 2026-09-10 study.",
       "type": "boolean"
     },
     "vote-generation-cpu-time-ms-constant": {

@@ -46,6 +46,8 @@ The [per-node CSV](nodes.csv) includes separate body/control counts, sent/receiv
   Its [embedded version](binary.txt) says `5a88d7a`: Cargo reused the identical
   executable built with the capture changes immediately before their commit.
   `revision.txt` records the committed source that supplied those changes.
+  This is a historical provenance limitation. The current runner verifies the
+  embedded revision, rebuilds stale executables, and rejects a remaining mismatch.
 - Study configuration, topology, workload and engine inputs are byte-identical to
   the [published inputs](../vote-diffusion-results-20260910/inputs.tar.gz).
   The overlay adds `vote-push-fanout-protects-producers: true`, which has no effect
@@ -67,6 +69,8 @@ target/release/sim-cli /tmp/vote-inputs/topology-1500.yaml -s 400 \
   --vote-traffic /tmp/vote-traffic.json > /tmp/vote-traffic.log 2>&1
 python3 scripts/summarize-vote-traffic.py /tmp/vote-traffic.json \
   --duration 400 --log /tmp/vote-traffic.log --output /tmp/vote-breakdown
+# When summarizing the archived version 1 report with the current script, add:
+# --legacy-runs docs/vote-traffic-20260915/runs.csv
 ```
 
 The study runner can perform the same capture with

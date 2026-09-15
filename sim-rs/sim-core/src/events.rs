@@ -387,6 +387,7 @@ pub enum Event {
         producer: Node,
         sender: Node,
         recipient: Node,
+        msg_size_bytes: u64,
     },
     /// A node's tally of votes for an endorser block first reached the
     /// quorum threshold.  Emitted once per (node, EB), when the votes are
@@ -1195,6 +1196,7 @@ impl EventTracker {
             producer: self.to_node(votes.id.producer),
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
+            msg_size_bytes: votes.bytes,
         });
     }
 
