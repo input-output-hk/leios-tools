@@ -14,7 +14,7 @@ what the new counters measure and why they are subsets of the existing totals.
 request. **Mark seen** means remembering a vote's identifier so later copies can
 be discarded. Both push modes verify the first copy before accepting its vote.
 
-| Term used in the figures | Simulator setting | What happens when copies arrive? |
+| Term used below | Simulator setting | What happens when copies arrive? |
 |---|---|---|
 | Announce / request | `announce-then-request` | Announce the identifier; send the body when the peer requests it. |
 | Push: mark seen on arrival | `push` | Remember the identifier immediately, so copies arriving while verification is queued or running are discarded too. |
@@ -88,13 +88,13 @@ endorsement changes below therefore apply to the simulator.
 - **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; Q50 attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but Q50 attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
 - **None of the tested bounded fanouts preserves quorum availability at nodes holding 95% of stake.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained Q50, while 16 and 8 never reached Q50 in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
 
-**Caveat added after the run, fanout rows only.** The cap used for these runs sampled a relay's block producer like any other consumer. Every stake pool in both topologies is a producer with exactly two relays, so each relay skipped it with probability about 1 − k/d for its d consumers. From the topology alone, the stake at producers expected to fall below the quorum line exceeds 5% at every tested cap. That is a plausible mechanism for the Q95 losses, not a measured cause: these summaries carry no per-node data, and the bundle-delivery statistic counts nodes, not stake. The simulator keeps `vote-push-fanout-protects-producers: false` as the default, reproducing the rule used here. The optional protected rule uses explicit topology markers and counts protected BP connections within the same total cap (see the [study guide](../vote-diffusion-study.md#corrections-and-status-of-earlier-findings)). The fanout rows are superseded pending a rerun with both settings. The announce/request and unlimited push rows are unaffected.
+**Caveat added after the run, fanout rows only.** The cap used for these runs sampled a relay's block producer like any other consumer. Every stake pool in both topologies is a producer with exactly two relays, so each relay skipped it with probability about 1 − k/d for its d consumers. From the topology alone, the stake at producers expected to fall below the quorum line exceeds 5% at every tested cap. That is a plausible mechanism for the Q95 losses, not a measured cause: these summaries carry no per-node data, and the bundle-delivery statistic counts nodes, not stake. The simulator keeps `vote-push-fanout-protects-producers: false` as the default, reproducing the rule used here. The optional protected rule uses explicit topology markers and counts protected BP connections within the same total cap (see the [study guide](../vote-diffusion-study.md#forwarding-and-accounting)). The original fanout rows describe the unprotected rule only; the matched protected comparison is reported separately in the follow-up. The announce/request and unlimited push rows are unaffected.
 
 These results support unlimited simple vote streaming as feasible under the modeled load, with a bandwidth/latency trade-off. They do not establish a safe bounded-fanout setting or predict the Haskell node's exact performance. Lower fanout reduces verification work but, in this matrix, does not preserve the broad availability of unrestricted diffusion.
 
 ## Reading the measurements
 
-`t0` is the start of the ranking-block slot that announced the EB. Chart times
+`t0` is the start of the ranking-block slot that announced the EB. Reported times
 and deadlines are measured from that point.
 
 A **quorum at one node** requires verified votes totaling 75% of active stake in
@@ -121,15 +121,6 @@ Counts include every generated EB; missed quorums remain in the denominator. Tim
 
 ## Availability versus verification cost at 1500 nodes
 
-![Verification work and Q50/Q95 quorum availability versus fanout, for the two 1500-node committees](figures/fanout-overview.png)
-
-**Figure 1.** Reducing fanout lowers completed verifications per accepted arrival
-in both committees (top panels). At fanout 22, Q50 attainment rises only in the
-everyone-votes stress arm; Q95 falls to zero in both committees (bottom panels).
-The small hollow marks show individual seeds and the labeled lines pool all
-three. The shaded column highlights fanout 22. Lines connect tested settings;
-they do not establish behavior between those settings.
-
 The table sums each arm's three seeds (72 generated EBs). Q50/Q95 counts are attainment by 14s; the same counts were attained by 7s. `Verify / accepted` divides total completed verifications by total accepted arrivals.
 
 | Committee | Transport | Fanout | First-node quorum | Q50 | Q95 | L1 endorsements | Verify / accepted |
@@ -145,14 +136,7 @@ The table sums each arm's three seeds (72 generated EBs). Q50/Q95 counts are att
 
 ## Transport comparisons
 
-![Paired quorum times and vote traffic for announce/request versus unrestricted push](figures/transport-comparison.png)
-
-**Figure 2.** Each segment compares the same seed. Push consistently moves Q95
-earlier (left), while sending about eight times the vote mini-protocol bytes
-(right). The row labels retain missed EBs: the time advantage is conditional on
-attainment, not a claim that every EB met the deadline.
-
-These compare unlimited-fanout push with announce/request for the same topology, committee and seed. Time differences are between conditional per-EB Q95 means; matching counts do not prove matching EB identities.
+These use 8-byte announcements and requests against 94-byte bodies and compare unlimited-fanout push with announce/request for the same topology, committee and seed. Time differences are between conditional per-EB Q95 means; matching counts do not prove matching EB identities.
 
 | Nodes | Committee | Push / announce traffic | Push − announce Q95 mean (s) | Equal Q95 attainment counts | Equal L1 endorsement counts |
 |---:|---|---:|---:|---:|---:|
@@ -163,16 +147,11 @@ These compare unlimited-fanout push with announce/request for the same topology,
 
 ## Endorsements and validation order
 
-![L1 endorsement counts at each fanout, split by committee and duplicate-check order](figures/endorsement-comparison.png)
-
-**Figure 3.** Under unrestricted push, marking votes seen after verification
-reduces endorsements from 25 to 13 in the everyone-votes stress arm, while the stake-weighted reference
-retains 25 with either setting. Fanout 22 raises the stress arm's count with that
-policy to 18, but reduces the reference to 19. This explains why the local recovery
-in the overloaded arm is insufficient to recommend fanout 22: Figure 1 also
-shows its loss of Q95 availability. Bars sum three seeds and count generated L1
-blocks carrying endorsements. They do not measure inclusion on the final
-canonical chain.
+Under unrestricted push, marking votes seen after verification reduces L1
+endorsements from 25 to 13 in the everyone-votes stress arm; the stake-weighted
+reference retains 25 with either setting. These are totals across three seeds
+for the original forwarding rule. The tables above retain the corresponding
+quorum counts and verification costs.
 
 ## Fanout and validation order
 
@@ -233,7 +212,7 @@ Each row combines three seeds. Q95 attainment is the sum of per-run EB counts. T
 
 Upstream config: `ouroboros-leios` `f307ed5fa7077a32eb470ca3832a34092882bfe3`. Binary SHA-256: `cafe6ca9f9f4b36432a9682cbb23f001b3dac93f8679867e887e5201282ba873`. Offered load: 6 ms interarrival (~167 tx/s), 1500-byte transactions starting at 60s. Each simulation ran 400 slots with echo disabled, four cores per node and 10 Mb/s links. Runs executed sequentially using a frozen executable and checksum-verified inputs.
 
-The [study guide](../vote-diffusion-study.md) documents the matrix. [results.json](results.json) contains all per-run metrics and matched comparisons; [runs.csv](runs.csv) records completed runs. Reproducibility artifacts:
+The [study guide](../vote-diffusion-study.md) documents the matrix. [results.json.gz](results.json.gz) contains all per-run metrics and matched comparisons; [runs.csv](runs.csv) records completed runs. Reproducibility artifacts:
 
 - [inputs.tar.gz](inputs.tar.gz): all 113 original input files (including both topologies and all 108 per-run overlays), plus the empty tracked-source patch. [input-sha256.json](input-sha256.json) checks the original bytes inside this archive. Extract this archive to inspect the exact configurations used.
 - [summary-logs.tar.gz](summary-logs.tar.gz): the 108 original summary logs, checked by [log-sha256.json](log-sha256.json). These are summaries, not per-event traces.
@@ -251,20 +230,6 @@ python3 extract-results.py --archive /tmp/leios-results-check
 ```
 
 Raw simulator runs used the frozen executable at revision `0769c073` with no tracked source diff. Inputs and executable checksums were verified before execution and again after the batch. All 108 logs have final protocol/network summaries, no logged error/panic, consistent acceptance accounting and consistent quorum/deadline counts. Parsed results were independently regenerated from the published archives. `passed` means the simulation completed successfully, not that every EB reached quorum.
-
-### Regenerating the figures
-
-[plot-results.py](plot-results.py) reads only the committed `results.json` and
-writes the three PNGs in `figures/`. It uses per-seed paired comparisons, summed
-counts, and `sum(verifications) / sum(accepted)` for pooled verification cost;
-no plotted measurements are entered manually. The figures were rendered with
-Python 3.13 and Matplotlib 3.11.2:
-
-```sh
-python3 -m venv /tmp/leios-figure-env
-/tmp/leios-figure-env/bin/pip install matplotlib==3.11.2
-/tmp/leios-figure-env/bin/python plot-results.py
-```
 
 The source revision above remains the provenance of the 108 experiments. The
 subsequent PR scope cleanup removes an unused transport mode and limits complete

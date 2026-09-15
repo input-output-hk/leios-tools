@@ -8,7 +8,7 @@ node parity is not a prerequisite for this experiment.
 ## Transport terminology
 
 The [transport definitions in the report](vote-diffusion-results-20260910/README.md#transport-terminology)
-map figure labels to the exact configuration values. `push` marks a vote's ID
+map terminology to the exact configuration values. `push` marks a vote's ID
 seen on arrival and suppresses copies even while verification is pending.
 `push-late-dedupe` marks it seen after verification, so copies received while the
 first check is pending can trigger additional checks. Both discard copies of
@@ -68,57 +68,29 @@ separate `L_diff` allowance; the summary prints the inclusion boundary as well.
 A quorum-by-7s metric measures earlier attainment, not the entire inclusion
 allowance.
 
-## Corrections and status of earlier findings
+## Forwarding and accounting
 
-Results previously reported on PR #1 came from revision `6e24ebe8`. The
-[corrected 108-run study](vote-diffusion-results-20260910/README.md) now provides
-measurements of the fixed simulator; earlier figures below are historical.
+Bounded push ranks consumers using a hash of the seed, sender, vote bundle and
+peer. Each vote takes its own subgraph. The rule has no repair mechanism and
+does not guarantee delivery to every node.
 
-- `top-stake-seats` previously gave each pool weight 1 and used filled seats
-  as its quorum denominator. It now uses pool stake and total active stake.
-- Accepted arrivals are counted from completed first acceptance, excluding
-  locally generated votes, redundant copies and votes for pruned EBs. Pending
-  arrivals are reported separately. `received - duplicates` previously counted
-  unfinished verifications as accepted and understated verification cost per
-  acceptance. The obsolete-vote classification preserves existing relay behavior.
-- Vote announcement/request receives are emitted on delivery. Aggregate output
-  no longer credits the recipient when the sender merely queues a message.
-- The matrix runner sets fanout and transport independently in each generated
-  overlay, so a fanout sweep cannot override `push-late-dedupe` with `push`.
-- Producers now wait for the voting gate. Both validation and signing completion
-  are checked against the deadline. These behavior changes require rerunning
-  comparisons before quoting the old timings as measurements of current code.
-- The bounded-fanout cap sampled a relay's block producer like any other
-  consumer. Every stake pool in both study topologies is a producer with
-  exactly two relays, so at fanout k each relay skipped it with probability
-  about 1 − k/d for its d consumers. From the topology alone, the stake at
-  producers expected to fall below the quorum line exceeds 5% at every tested
-  cap, while relays have 25 to 50 inbound links each. That is a plausible
-  mechanism for the Q95 losses, not a measured cause: the summary logs carry no
-  per-node data, and the bundle-delivery statistic counts nodes, not stake. The
-  new `vote-push-fanout-protects-producers: true` rule prioritizes explicitly
-  marked BP connections within the same total cap. The default remains `false`,
-  preserving the rule of the 2026-09-10 fanout rows. Those rows need a rerun
-  with both settings before drawing a conclusion about protecting BP links.
+`vote-push-fanout-protects-producers: true` prioritizes links explicitly marked
+`always-forward-votes` in the topology. Protected links count toward the same
+total cap: one protected BP at cap 22 leaves 21 places for other consumers.
+The study runner marks each BP's two upstream connections. Source exclusion
+still applies. Protection defaults to false, retaining the archived forwarding
+rule. Protection without a cap is accepted with a warning because unrestricted
+push already forwards to all consumers.
 
-The earlier everyone-votes comparison reported 1500-node quorum timings of
-about 3.525s for push versus 4.002s for announce/request at Q95 (quorum available
-at nodes collectively holding 95% of network stake),
-and a traffic ratio of about 7.9, using flat 8-byte announcements and requests
-against 94-byte vote bodies. Those remain historical observations for their
-configured arms; changing control sizes can change congestion and timing too. Equal certified-block counts do not prove identical certified
-EB identities; that claim requires comparing identifiers in traces.
+The original fanout results measured a rule that could omit BP recipients.
+Those measurements describe that rule, rather than a general requirement to
+send to every peer. The matched follow-up tests protection at the same caps.
 
-The old fanout conclusion is **superseded by the corrected matrix**. Fanout 22
-can retain Q50 (quorum at nodes holding 50% of stake) while losing Q95 entirely.
-In the 1500-node everyone-votes arm that marks seen after verification, it
-reduced verification work and increased L1 endorsements from 13 to 18 across
-three seeds, but Q95 attainment fell from 37/72 EBs to zero. The stake-weighted reference likewise
-lost Q95 with every tested bounded fanout. See the corrected report for the full
-matrix, missed-quorum counts and the distinction between nodes having enough
-votes for a quorum and individual vote bodies being delivered. These results do
-not establish a safe fanout limit. They do not establish an unsafe one either:
-the cap they measured could skip block producers, as described above.
+Accepted arrivals count completed first acceptance, excluding locally generated
+votes, redundant copies and votes for pruned EBs. Pending arrivals are separate;
+received bodies reconcile as redundant plus accepted plus pending. Verification
+counts include actual completed work, including obsolete work. Announcement and
+request receives are recorded on delivery, not when the sender queues them.
 
 ## Measuring obsolete vote work
 
@@ -157,44 +129,22 @@ how much pruning affected the published 108 runs; those archived logs lack this
 breakdown. A full matrix rerun is deferred until review or targeted evidence
 justifies it, especially before making a behavior change or new effect-size claim.
 
-## Validation of the published study
+## Validation
 
-- `cargo test --workspace --locked --offline`: 155 passed, one ignored (after removing the unused no-deduplication mode and its test).
-- Twenty 8-node, 40-slot smoke runs: two seeds, both committee modes,
-  announce/request, and both push dedupe orders with unlimited and bounded
-  fanout. These check execution and accounting, not mainnet-scale feasibility.
-- An overloaded trace reconciled exactly with its summary: 56 distinct relevant
-  acceptances, 14 pending arrivals and 98 completed verifications.
-- An uneven-stake trace counted eight generated vote bodies separately from
-  2400 total voting weight. All 16 reported node quorums met 750 stake out
-  of 1000 total active stake.
-- A dry-run check covered 40 planned matrix entries, checking that fanout and
-  validation order were crossed under matching seeds, sizes and committees.
+The implementation passes 168 Rust tests (one ignored), 17 runner/extractor
+tests, four traffic-summary tests and nine real CLI tests. The checks cover
+stake quorum, timing gates, duplicate and obsolete processing, exact archived
+result extraction, message-size transmission/accounting, output aliases,
+cancellation, capture completion and retry. The original 108 numeric results
+still re-extract unchanged, and the historical per-node tables reproduce byte
+for byte from their bundled evidence.
 
-The [750/1500-node performance study](vote-diffusion-results-20260910/README.md)
-is now complete. The checks above established correctness before those reruns.
-
-## Validation of the review changes
-
-- `cargo test --workspace --locked --offline`: 158 passed, one ignored.
-- `python3 scripts/test-vote-diffusion-study.py`: nine checks cover the runner's
-  108-row plan, smaller matrices, manifests, parse failures, obsolete-work
-  reconciliation, and exact re-extraction of the published results.
-- A real 750-node, one-slot smoke matrix completed and parsed all three transport
-  arms. This checks the runner/extractor interface, not voting feasibility.
-- Ten paired 8-node, 80-slot runs against PR head `00d6983` match every existing
-  protocol and network summary line. They cover both committee modes, all three
-  transports and bounded push fanout, with 500 ms vote verification to exercise
-  queued duplicate checks.
-- Node regression tests exercise arrivals after pruning, validations spanning a
-  prune, obsolete forwarding and later requests, and held-copy deduplication in
-  all three transports. Monitor tests separate first processing, duplicate
-  completions and cache reinsertions, including a node's own generated votes.
-
-The 108-run matrix has not been repeated for this instrumentation-only change.
-The additional fields in new logs measure existing work rather than replacing
-or revising the archived results. Quantifying that breakdown at mainnet scale
-remains a separate experiment.
+```sh
+cargo test --workspace --locked --offline
+python3 scripts/test-vote-diffusion-study.py
+python3 scripts/test-summarize-vote-traffic.py
+python3 scripts/test-vote-traffic-cli.py --binary target/release/sim-cli
+```
 
 ## Running the matrix
 
@@ -216,7 +166,7 @@ The runner writes all planned rows before execution, then records start/end UTC,
 elapsed seconds, exit code and status after each run. Input and log checksum
 manifests accompany the output; the frozen executable and inputs are checked
 before each run and the full set is checked after the batch. Run status `passed`
-means the simulator exited successfully, not that all EBs achieved quorum. A
+means the configured simulation finished successfully, not that all EBs achieved quorum. A
 failed simulation makes the script exit nonzero.
 
 Set `VOTE_STUDY_CONFIG_REVISION` to the source revision of an exported base

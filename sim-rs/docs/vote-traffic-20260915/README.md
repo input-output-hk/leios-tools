@@ -13,7 +13,7 @@ Median received traffic was **1.581 MB per BP** and **30.577 MB per relay**.
 
 The body sends/arrivals, accepted votes, completed verifications, generated EBs
 and votes, L1 endorsements, and first/Q50/Q95 quorum summaries match the archived
-case exactly; see [comparison.json](comparison.json).
+case exactly; see `comparison.json` in the evidence archive.
 
 Duration: 400 simulated seconds. Decimal GB/MB and Mbit/s. BP means a stake-holding node in a topology that separates BPs from relays.
 
@@ -33,51 +33,37 @@ Percentiles below are across nodes, using each node’s own busiest one-second w
 | relay | 10.287 | 20.846 | 60.649 | 12.111 | 14.435 | 16.424 |
 | all | 9.614 | 18.858 | 60.649 | 11.301 | 14.105 | 16.424 |
 
-The [per-node CSV](nodes.csv) includes separate body/control counts, sent/received totals, mean rates, and each peak’s window start. Raw JSON retains every node’s one-second buckets.
+## Evidence and provenance
 
-## Capture and provenance
+[Download the original evidence archive](evidence.tar.gz). It preserves the
+original README, per-node CSV, raw report, logs, inputs, run record, comparison,
+revision information and checksums byte for byte. They are bundled to keep the
+PR focused on simulator changes and findings.
 
-- [Per-node CSV](nodes.csv): one row per node, with counts, bytes, mean rates and peaks.
-- [Raw per-node report](vote-traffic.json.gz): counts and one-second buckets.
-- [Simulator log](run.log.gz), [run manifest](runs.csv), [input archive](inputs.tar.gz),
-  and [input checksums](input-sha256.json).
-- Source revision: `9ff6600f44c07816498aca9db31c23c557e99be2`; the source patch in the input archive is empty.
-  [Binary checksum](binary.sha256) identifies the frozen executable.
-  Its [embedded version](binary.txt) says `5a88d7a`: Cargo reused the identical
-  executable built with the capture changes immediately before their commit.
-  `revision.txt` records the committed source that supplied those changes.
-  This is a historical provenance limitation. The current runner verifies the
-  embedded revision, rebuilds stale executables, and rejects a remaining mismatch.
-- Study configuration, topology, workload and engine inputs are byte-identical to
-  the [published inputs](../vote-diffusion-results-20260910/inputs.tar.gz).
-  The overlay adds `vote-push-fanout-protects-producers: true`, which has no effect
-  with unlimited fanout. Vote bodies are 94 bytes. There are no vote control
-  messages in this push case; announce/request still uses 8-byte controls.
-- [Artifact checksums](artifact-sha256.json) cover every other file in this directory.
+The recorded source is `9ff6600f44c07816498aca9db31c23c557e99be2`, while the
+executable reports `5a88d7a`. This historical version mismatch remains disclosed
+in the saved README; the current runner rejects such mismatches. The source
+patch is empty and the binary hash is retained. Protection was set true in this
+unrestricted-push capture, where it has no effect. Bodies are 94 bytes and this
+case sends no control messages.
 
-## Reproduce
+The archive SHA-256 is
+`96ebe7c6e8d1cb1611539e84eb38ea9cb0166a9812498dc408d32ea30e99b3c4`.
+The `artifact-sha256.json` inside it verifies every original file, including the
+original README rather than this wrapper.
 
-Build the recorded source revision, extract `inputs.tar.gz` to a new directory,
-then run from `sim-rs` (substitute that directory for `/tmp/vote-inputs`):
+To reproduce the tables with the current summarizer, from `sim-rs`:
 
 ```sh
-cargo build --release --locked --bin sim-cli
-target/release/sim-cli /tmp/vote-inputs/topology-1500.yaml -s 400 \
-  -p /tmp/vote-inputs/study-config.yaml -p /tmp/vote-inputs/workload.yaml \
-  -p /tmp/vote-inputs/engine.yaml \
-  -p /tmp/vote-inputs/1500-top-stake-seats-push-fall-s0.yaml \
-  --vote-traffic /tmp/vote-traffic.json > /tmp/vote-traffic.log 2>&1
-python3 scripts/summarize-vote-traffic.py /tmp/vote-traffic.json \
-  --duration 400 --log /tmp/vote-traffic.log --output /tmp/vote-breakdown
-# When summarizing the archived version 1 report with the current script, add:
-# --legacy-runs docs/vote-traffic-20260915/runs.csv
+capture_dir=$(mktemp -d)
+tar -xzf docs/vote-traffic-20260915/evidence.tar.gz -C "$capture_dir"
+gzip -dc "$capture_dir/run.log.gz" > "$capture_dir/run.log"
+python3 scripts/summarize-vote-traffic.py "$capture_dir/vote-traffic.json.gz" \
+  --duration 400 --log "$capture_dir/run.log" \
+  --legacy-runs "$capture_dir/runs.csv" --output "$capture_dir/reproduced"
 ```
 
-The study runner can perform the same capture with
-`VOTE_STUDY_TRANSPORTS=push VOTE_STUDY_FANOUTS=all VOTE_STUDY_NODE_TRAFFIC=1`;
-see the [complete command](../vote-diffusion-study.md#per-node-vote-traffic).
-
-Validation: 162 Rust tests passed (one ignored), ten runner/extractor checks,
-and two report-summary checks. Two paired 8-node, 80-slot tests covered push and
-announce/request with capture enabled/disabled; every existing protocol and
-network summary matched, and per-node traffic reconciled with both logs.
+The generated `nodes.csv` and `summary.md` match the saved tables byte for byte.
+See the [study guide](../vote-diffusion-study.md#per-node-vote-traffic) for current
+capture commands. The original 108 runs remain in the
+[main archive](../vote-diffusion-results-20260910/README.md).

@@ -129,7 +129,7 @@ def summarize(root, output):
                                     push_q95_mean_advantage_s=b-a if a is not None and b is not None else None))
     payload = dict(revision=extracted['revision'], binary_sha256=extracted['binary_sha256'],
                    seeds=seeds, slots=next(iter(durations)), results=combined, control_comparisons=comparisons)
-    original = json.loads((SCRIPTS.parent / 'docs/vote-diffusion-results-20260910/results.json').read_text())
+    original = traffic.load(SCRIPTS.parent / 'docs/vote-diffusion-results-20260910/results.json.gz')
     legacy = {(r['seed'], r['transport'], r['fanout']): r for r in original['results']
               if r['nodes'] == 1500 and r['committee'] == 'top-stake-seats'}
     # Compare protocol outcomes, not wall-clock duration or new instrumentation.

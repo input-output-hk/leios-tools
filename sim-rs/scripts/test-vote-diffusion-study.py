@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for the runner/extractor interface; uses the archived logs."""
 import csv
+import gzip
 import importlib.util
 from unittest.mock import patch
 import hashlib
@@ -76,7 +77,8 @@ class StudyInterfaceTests(unittest.TestCase):
         result = self.extract(self.archive, '--archive')
         self.assertEqual(result.returncode, 0, result.stderr)
         actual = json.loads((self.archive / 'results.json').read_text())
-        expected = json.loads((REPORT / 'results.json').read_text())
+        with gzip.open(REPORT / 'results.json.gz', 'rt') as stream:
+            expected = json.load(stream)
         self.assertEqual(actual['results'], expected['results'])
         self.assertEqual(actual['paired_comparisons'], expected['paired_comparisons'])
         self.assertEqual(actual['completed'], 108)
