@@ -23,6 +23,7 @@ use tracing::{info, info_span};
 
 mod aggregate;
 mod liveness;
+mod vote_traffic;
 
 type InputBlockId = sim_core::model::InputBlockId<Node>;
 type EndorserBlockId = sim_core::model::EndorserBlockId<Node>;
@@ -62,6 +63,7 @@ pub struct EventMonitor {
     events_source: LivenessMonitor,
     output_path: Option<PathBuf>,
     aggregate: bool,
+    vote_traffic: Option<(vote_traffic::VoteTraffic, PathBuf)>,
 }
 
 impl EventMonitor {
@@ -97,12 +99,44 @@ impl EventMonitor {
             events_source: LivenessMonitor::new(config, events_source),
             output_path,
             aggregate: config.aggregate_events,
+            vote_traffic: None,
         }
+    }
+
+    pub fn with_vote_traffic_output(
+        mut self,
+        config: &SimConfiguration,
+        path: Option<PathBuf>,
+    ) -> Result<Self> {
+        if let Some(path) = path {
+            anyhow::ensure!(
+                matches!(
+                    self.variant,
+                    LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+                ),
+                "--vote-traffic currently supports the Linear Leios variants only"
+            );
+            anyhow::ensure!(
+                self.output_path.as_ref() != Some(&path),
+                "traffic and event outputs must be different files"
+            );
+            self.vote_traffic = Some((vote_traffic::VoteTraffic::new(config), path));
+        }
+        Ok(self)
     }
 
     // Monitor and report any events emitted by the simulation,
     // including any aggregated stats at the end.
     pub async fn run(mut self) -> Result<()> {
+        // Reserve the destination before running; never overwrite an older report.
+        let mut vote_traffic_file = if let Some((_, path)) = &self.vote_traffic {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent).await?;
+            }
+            Some(File::create_new(path).await?)
+        } else {
+            None
+        };
         let mut blocks_published: BTreeMap<NodeId, u64> = BTreeMap::new();
         let mut blocks_rejected: BTreeMap<NodeId, u64> = BTreeMap::new();
         let mut blocks: BTreeMap<u64, (NodeId, u64)> = BTreeMap::new();
@@ -217,6 +251,9 @@ impl EventMonitor {
 
         while let Some((event, time)) = self.events_source.recv().await {
             last_timestamp = time;
+            if let Some((traffic, _)) = &mut self.vote_traffic {
+                traffic.process(&event, time)?;
+            }
             if has_output {
                 let output_event = OutputEvent {
                     time_s: time,
@@ -642,6 +679,11 @@ impl EventMonitor {
         flush_buffered(&mut buffered, Timestamp::max(), &mut output).await?;
 
         output.flush().await?;
+        if let (Some((traffic, _)), Some(file)) = (&self.vote_traffic, &mut vote_traffic_file) {
+            file.write_all(&serde_json::to_vec(traffic)?).await?;
+            file.write_all(b"\n").await?;
+            file.flush().await?;
+        }
 
         let mut finalized_txs = 0;
         let mut finalized_tx_bytes = 0;

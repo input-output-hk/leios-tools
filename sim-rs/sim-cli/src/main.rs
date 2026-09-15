@@ -38,6 +38,9 @@ struct Args {
     #[clap(default_value = None)]
     topology: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// Save per-node Linear Leios vote traffic and fixed one-second byte buckets.
+    #[clap(long)]
+    vote_traffic: Option<PathBuf>,
     #[clap(short, long)]
     parameters: Vec<PathBuf>,
     #[clap(long)]
@@ -148,7 +151,9 @@ async fn main() -> Result<()> {
     let config = read_config(&args)?;
 
     let (events_sink, events_source) = mpsc::unbounded_channel();
-    let monitor = tokio::spawn(EventMonitor::new(&config, events_source, args.output).run());
+    let monitor = EventMonitor::new(&config, events_source, args.output)
+        .with_vote_traffic_output(&config, args.vote_traffic)?;
+    let monitor = tokio::spawn(monitor.run());
     pin!(monitor);
 
     let simulation = Simulation::new(config, events_sink).await?;
@@ -177,6 +182,7 @@ mod tests {
             let args = Args {
                 topology: Some(topology?.path()),
                 output: None,
+                vote_traffic: None,
                 parameters: vec![],
                 trace_node: vec![],
                 slots: None,

@@ -248,18 +248,21 @@ Defaults:
 | `VOTE_STUDY_SIZES` | `750 1500` |
 | `VOTE_STUDY_COMMITTEES` | `everyone top-stake-seats` |
 | `VOTE_STUDY_FANOUTS` | `all 22 16 8` |
+| `VOTE_STUDY_TRANSPORTS` | `announce-then-request push push-late-dedupe` |
+| `VOTE_STUDY_NODE_TRAFFIC` | `0` (set `1` to save per-node vote traffic) |
 | `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS` | `true` |
 | `VOTE_STUDY_SLOTS` | `400` |
 | `VOTE_STUDY_DRY_RUN` | `0` |
 | `VOTE_STUDY_CONFIG_REVISION` | Detected from base config, or explicitly unknown |
 
-For each size, committee and seed, the runner executes announce/request once,
+For each size, committee and seed, the runner normally executes announce/request once,
 then both `push` and `push-late-dedupe` at every fanout. Echo-to-source is held
 false for this matrix. `VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS=false` writes the
 sampling rule of the 2026-09-10 fanout rows into every overlay instead of the
 default relay-to-relay limit; run the matrix once with each value, into
 separate output directories, to compare the two rules. The default is **36 runs per seed**, or 108 for the
 three-seed command above. Runs execute sequentially and can take many hours.
+`VOTE_STUDY_TRANSPORTS` selects a subset, including a single transport.
 Use a smaller matrix first, or preview it without building or running:
 
 ```sh
@@ -307,3 +310,53 @@ well as absolute rates. Header and flow-control sensitivity are follow-up
 checks for transferring quantitative backlog or certification claims to the
 node. The present matrix answers voting-strategy feasibility within the stated
 model; it does not predict the prototype's exact certification loss.
+
+## Per-node vote traffic
+
+The archived 108 runs saved network totals, not individual-node traffic. The
+report's [Wire GB range](vote-diffusion-results-20260910/README.md#fanout-and-validation-order)
+is the sum sent across the network, with each send counted once. It is not a
+per-node value or a sum of sends plus receives.
+
+`sim-cli --vote-traffic report.json` saves an optional, vote-only report without
+retaining or serializing a full event trace. It supports the two Linear Leios
+variants. Each configured node has body, announcement and request counts/bytes
+in both directions, plus fixed one-second byte buckets indexed from simulation
+time zero. Duplicate and obsolete bodies remain included in those totals;
+classification events do not add the same traffic twice. State scales with
+node-seconds and generated bundles, rather than the number of message copies.
+The destination must not already exist.
+
+Send timestamps mean **queued for transmission**; receive timestamps mean
+**delivered**. A peak is the busiest fixed one-second bucket, not instantaneous
+NIC throughput or a sliding-window maximum. Sending to multiple links can
+produce a node-wide rate above one link's bandwidth. These are modeled vote
+mini-protocol bytes only; they exclude TCP/IP framing and other protocols.
+The report records the requested slot count and last observed event time;
+confirm normal run completion before using the configured duration as a rate
+denominator. Stake distinguishes BPs from relays only in topologies that model
+the BP as a separate node.
+
+For one run with the original study inputs, use the study configuration extracted
+from `vote-diffusion-results-20260910/inputs.tar.gz` as the first argument:
+
+```sh
+VOTE_STUDY_SIZES=1500 VOTE_STUDY_COMMITTEES=top-stake-seats \
+VOTE_STUDY_TRANSPORTS=push VOTE_STUDY_FANOUTS=all \
+VOTE_STUDY_NODE_TRAFFIC=1 VOTE_STUDY_SLOTS=400 \
+VOTE_STUDY_CONFIG_REVISION=f307ed5fa7077a32eb470ca3832a34092882bfe3 \
+  scripts/vote-diffusion-study.sh /tmp/study-config.yaml /tmp/vote-node-traffic 0
+
+python3 scripts/summarize-vote-traffic.py \
+  /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-s0.vote-traffic.json \
+  --duration 400 \
+  --log /tmp/vote-node-traffic/1500-top-stake-seats-push-fall-s0.txt \
+  --output /tmp/vote-node-traffic/breakdown
+```
+
+The runner hashes captured reports in `vote-traffic-sha256.json`. The summarizer
+checks per-node time buckets against totals and reconciles send counts/bytes
+and body arrivals against the global log. It writes `nodes.csv` and `summary.md`,
+with BP/relay totals and percentiles across nodes. Its input also accepts `.json.gz`.
+A report from one unrestricted-push run explains traffic distribution for that
+case; it does not test whether the protected-BP fanout rule restores quorum.

@@ -141,6 +141,20 @@ class StudyInterfaceTests(unittest.TestCase):
         actual = json.loads((self.root / 'results.json').read_text())
         self.assertIn('do not reconcile', actual['parse_errors'][0]['error'])
 
+    def test_runner_can_select_one_transport_and_capture_node_traffic(self):
+        output = self.root / 'one-run'
+        env = dict(os.environ, VOTE_STUDY_DRY_RUN='1', VOTE_STUDY_SIZES='1500',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_FANOUTS='all',
+                   VOTE_STUDY_TRANSPORTS='push', VOTE_STUDY_NODE_TRAFFIC='1')
+        result = subprocess.run([str(HERE / 'scripts/vote-diffusion-study.sh'),
+                                 str(self.archive / 'study-config.yaml'), str(output), '0'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with (output / 'runs.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['run'], '1500-top-stake-seats-push-fall-s0')
+
     def test_runner_plans_complete_matrix_with_extractor_schema(self):
         output = self.root / 'plan'
         env = {k: v for k, v in os.environ.items() if not k.startswith('VOTE_STUDY_')}

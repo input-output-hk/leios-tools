@@ -83,6 +83,12 @@ def main():
         if value != 'all':
             positive(value)
     slots = positive(os.environ.get('VOTE_STUDY_SLOTS', '400'))
+    transports = choices('VOTE_STUDY_TRANSPORTS', 'announce-then-request push push-late-dedupe',
+                         {'announce-then-request', 'push', 'push-late-dedupe'})
+    capture = choices('VOTE_STUDY_NODE_TRAFFIC', '0', {'0', '1'})
+    if len(capture) != 1:
+        raise ValueError('VOTE_STUDY_NODE_TRAFFIC must be 0 or 1')
+    capture = capture == ['1']
     protects = choices('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS', 'true', {'true', 'false'})
     if len(protects) != 1:
         raise ValueError('VOTE_STUDY_FANOUT_PROTECTS_PRODUCERS must be true or false')
@@ -127,8 +133,9 @@ def main():
                     peer['bandwidth-bytes-per-second'] = 1250000
             (root / 'topology-1500.yaml').write_text(json.dumps(topology))
     rows = []
-    arms = [('announce-then-request', 'all')]
-    arms += [(transport, fanout) for fanout in fanouts for transport in ['push', 'push-late-dedupe']]
+    arms = [('announce-then-request', 'all')] if 'announce-then-request' in transports else []
+    arms += [(transport, fanout) for fanout in fanouts
+             for transport in ['push', 'push-late-dedupe'] if transport in transports]
     for seed in seeds:
         for size in sizes:
             for committee in committees:
@@ -146,6 +153,7 @@ def main():
     inputs = manifest(root, [p.name for p in root.glob('*.yaml')] + ['source.patch'])
     write_json(root / 'input-sha256.json', inputs)
     logs = {}
+    traffic_reports = {}
     write_json(root / 'log-sha256.json', logs)
     if dry_run:
         print(f'Planned {len(rows)} runs in {root}', flush=True)
@@ -165,20 +173,26 @@ def main():
         row.update(status='running', started_utc=utc())
         save_runs(root, rows)
         started = time.monotonic()
+        traffic_name = row['run'] + '.vote-traffic.json'
+        traffic_args = ['--vote-traffic', str(root / traffic_name)] if capture else []
         with (root / (row['run'] + '.txt')).open('w') as log:
             completed = subprocess.run([str(binary), str(root / f"topology-{row['nodes']}.yaml"),
                                         '-s', str(row['slots']),
                                         '-p', str(root / 'study-config.yaml'),
                                         '-p', str(root / 'workload.yaml'), '-p', str(root / 'engine.yaml'),
-                                        '-p', str(root / (row['run'] + '.yaml'))], stdout=log, stderr=subprocess.STDOUT)
+                                        '-p', str(root / (row['run'] + '.yaml'))] + traffic_args, stdout=log, stderr=subprocess.STDOUT)
         row.update(status='passed' if completed.returncode == 0 else 'failed',
                    finished_utc=utc(), elapsed_s=f'{time.monotonic() - started:.3f}', exit_code=completed.returncode)
+        if capture and completed.returncode == 0:
+            traffic_reports[traffic_name] = digest(root / traffic_name)
+            write_json(root / 'vote-traffic-sha256.json', traffic_reports)
         logs[row['run'] + '.txt'] = digest(root / (row['run'] + '.txt'))
         write_json(root / 'log-sha256.json', logs)
         save_runs(root, rows)
         print(f"[{index}/{len(rows)}] {row['run']}: {row['status']} ({row['elapsed_s']}s)", flush=True)
     verify(root, inputs)
     verify(root, logs)
+    verify(root, traffic_reports)
     if digest(binary) != binary_hash:
         raise ValueError('Frozen executable changed')
     return int(any(row['status'] != 'passed' for row in rows))
