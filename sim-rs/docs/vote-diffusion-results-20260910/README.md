@@ -176,6 +176,10 @@ canonical chain.
 
 ## Fanout and validation order
 
+For individual-node traffic, see the [one-run BP/relay breakdown](../vote-traffic-20260915/README.md).
+It reproduces the 1500-node, stake-weighted, unrestricted-push seed-0 case and
+adds sent/received bytes and fixed one-second rates for all 1500 nodes.
+
 Each row combines three seeds. Q95 attainment is the sum of per-run EB counts. Timing ranges cover available run means among EBs that attained Q95 quorum; missing EBs remain visible in the attainment columns. Verification amplification is total completed verifications divided by total accepted arrivals. Traffic is the range of per-run decimal GB, rounded in the simulator logs.
 
 | Nodes | Committee | Transport | Fanout | Q95 reached | Q95 by 7s | Q95 by 14s | Q95 mean s range | Wire GB range | Verify / accepted | Pending arrivals |

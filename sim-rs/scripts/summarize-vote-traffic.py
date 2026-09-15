@@ -112,7 +112,7 @@ def main():
     reconcile(rows, args.log.read_text())
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / 'nodes.csv').open('w', newline='') as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     (args.output / 'summary.md').write_text(markdown(rows, args.duration))

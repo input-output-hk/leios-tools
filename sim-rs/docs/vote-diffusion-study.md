@@ -313,6 +313,9 @@ model; it does not predict the prototype's exact certification loss.
 
 ## Per-node vote traffic
 
+The [captured 1500-node unrestricted-push case](vote-traffic-20260915/README.md)
+provides BP/relay tables, all 1500 node rows, raw counters and reproduction inputs.
+
 The archived 108 runs saved network totals, not individual-node traffic. The
 report's [Wire GB range](vote-diffusion-results-20260910/README.md#fanout-and-validation-order)
 is the sum sent across the network, with each send counted once. It is not a
