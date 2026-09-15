@@ -164,8 +164,10 @@ impl LeiosBlockInfo {
             // chain from either era parses:
             //   w36+ (3 fields): [transactions, leios_certificate/nil,
             //                     peras_certificate/nil]
+            //                    -> leios_certificate is block_body[1]
             //   pre-w36 (4):     [invalid_transactions/nil, transactions,
             //                     leios_certificate/nil, peras_certificate/nil]
+            //                    -> leios_certificate is block_body[2]
             // In both the certificate is the field just after `transactions`;
             // nil means no cert. Keying off arity matters because the 4-field
             // reader applied to a 3-field body silently returns the
@@ -178,11 +180,16 @@ impl LeiosBlockInfo {
                 Some(n) => n,
                 None => return Err(DecodeError::message("indefinite block_body")),
             };
+            // EXACTLY 3 or 4. A hypothetical 5-field era-8 body would put
+            // the certificate somewhere we have not seen, and guessing would
+            // silently return the wrong field; fail instead.
             let tx_field_index = match bb_len {
-                3 => 0, // w36+: transactions first
-                n if n >= 4 => 1, // pre-w36: invalid_transactions leads
-                _ => {
-                    return Err(DecodeError::message("block_body missing leios_certificate slot"))
+                3 => 0, // w36+:    transactions first, cert at [1]
+                4 => 1, // pre-w36: invalid_transactions leads, cert at [2]
+                other => {
+                    return Err(DecodeError::message(format!(
+                        "unrecognised era-8 block_body arity {other}; expected 3 (w36+) or 4 (pre-w36)"
+                    )))
                 }
             };
             for _ in 0..=tx_field_index {
@@ -475,11 +482,12 @@ impl BlockBody {
             None => return Err(DecodeError::message("indefinite era-8 block_body")),
         };
         let tx_field_index = match bb_len {
-            3 => 0,           // w36+: transactions first
-            n if n >= 4 => 1, // pre-w36: invalid_transactions leads
+            3 => 0, // w36+:    transactions first, cert at [1]
+            4 => 1, // pre-w36: invalid_transactions leads, cert at [2]
             _ => {
-                // Too short to be either layout; report what we know rather
-                // than guessing at the slots.
+                // Not a layout we recognise (too short, or a future variant
+                // with extra fields). Report what we know rather than guessing
+                // at the slots and mis-reading a different field as the cert.
                 return Ok(ParsedBodyInfo {
                     field_count,
                     ..ParsedBodyInfo::default()
@@ -1032,6 +1040,26 @@ mod tests {
     }
 
     #[test]
+    fn unrecognised_era8_body_arity_is_rejected_not_guessed() {
+        // A future era-8 body with extra fields must FAIL rather than be read
+        // as the pre-w36 4-field layout: guessing would silently return some
+        // other field as the Leios certificate. (Copilot review, PR #94.)
+        for bb_len in [2u64, 5, 6] {
+            let cert = sample_leios_cert(7);
+            let raw = build_era8_block_body(bb_len, 1, Some(&cert));
+            let info = BlockBody::opaque(raw.clone()).praos_inspect();
+            assert!(
+                info.eb_certificate.is_none(),
+                "arity {bb_len}: must not invent a certificate from an unknown layout"
+            );
+            assert!(
+                !info.eb_certificate_pending,
+                "arity {bb_len}: must not report a pending cert from an unknown layout"
+            );
+        }
+    }
+
+    #[test]
     fn era8_praos_inspect_reports_no_cert_when_slot_is_nil() {
         for bb_len in [3u64, 4] {
             let raw = build_era8_block_body(bb_len, 1, None);
@@ -1137,7 +1165,8 @@ mod tests {
 
     /// Build an era-8 Leios block `#6.24([8, [header, block_body]])` with a
     /// dummy (skippable) header. `cert` is the raw leios_certificate CBOR for
-    /// `block_body[2]`, or None for a nil cert slot.
+    /// the cert slot (`block_body[2]` on this pre-w36 4-field fixture;
+    /// `block_body[1]` on a w36+ 3-field body), or None when that slot is nil.
     fn build_era8_block(cert: Option<&[u8]>) -> Vec<u8> {
         let body = crate::encode_block_body(&[], cert);
         let dummy_header_inner = [0x80u8]; // empty array — parse skips field 0
@@ -1157,7 +1186,7 @@ mod tests {
         assert_eq!(
             info.eb_certificate.expect("cert present"),
             cert,
-            "the leios_certificate at block_body[2] is extracted verbatim"
+            "the leios_certificate (block_body[2] on this 4-field body) is extracted verbatim"
         );
     }
 
@@ -1166,7 +1195,7 @@ mod tests {
         let block = build_era8_block(None);
         assert!(
             LeiosBlockInfo::parse(&block).is_none(),
-            "a nil block_body[2] means no certificate"
+            "a nil cert slot (block_body[2] here) means no certificate"
         );
     }
 
