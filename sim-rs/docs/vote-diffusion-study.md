@@ -104,8 +104,9 @@ measurements of the fixed simulator; earlier figures below are historical.
 The earlier everyone-votes comparison reported 1500-node quorum timings of
 about 3.525s for push versus 4.002s for announce/request at Q95 (quorum available
 at nodes collectively holding 95% of network stake),
-and a traffic ratio of about 7.9. Those remain historical observations for their
-configured arms. Equal certified-block counts do not prove identical certified
+and a traffic ratio of about 7.9, using flat 8-byte announcements and requests
+against 94-byte vote bodies. Those remain historical observations for their
+configured arms; changing control sizes can change congestion and timing too. Equal certified-block counts do not prove identical certified
 EB identities; that claim requires comparing identifiers in traces.
 
 The old fanout conclusion is **superseded by the corrected matrix**. Fanout 22
