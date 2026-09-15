@@ -69,7 +69,9 @@ The [Linear Leios vote study](docs/vote-diffusion-study.md) compares
 announce/request and push transport, crosses fanout with deduplication order,
 and distinguishes everyone-votes load tests from the proposed stake-weighted
 fixed-size committee. It documents the corrected measurements, reproducible
-run matrix and limitations of the earlier results.
+run matrix and limitations of the earlier results. The [focused findings](docs/vote-diffusion-followup-20260915/README.md)
+cover BP protection within the fanout cap, control-message size sensitivity
+and absolute traffic at individual BPs and relays.
 
 ## Network partitions
 

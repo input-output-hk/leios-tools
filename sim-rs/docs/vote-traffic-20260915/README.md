@@ -3,6 +3,9 @@
 One representative unrestricted-push run: **1,500 nodes, stake-weighted committee,
 seed 0, 400 simulated seconds**. The topology contains 458 separate BPs and
 1,042 relays. This is a breakdown of one case, not an additional fanout study.
+The [subsequent ten-run pilot](../vote-diffusion-followup-20260915/README.md)
+adds matched fanout and control-size comparisons, with per-node captures using
+an executable whose embedded revision matches its recorded source.
 
 The run sent **32.684092 GB** of vote bodies across the network.
 The configured 10 Mbit/s bandwidth is per link, not a node-wide uplink limit.

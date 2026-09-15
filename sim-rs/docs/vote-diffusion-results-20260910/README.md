@@ -8,6 +8,11 @@ instrumentation, so their obsolete-work breakdown is unknown. The
 [study guide](../vote-diffusion-study.md#measuring-obsolete-vote-work) explains
 what the new counters measure and why they are subsets of the existing totals.
 
+The [focused follow-up](../vote-diffusion-followup-20260915/README.md) adds a matched
+BP-protection comparison, control-message size sensitivity and per-node traffic.
+It changes how the fanout and bandwidth findings below should be interpreted;
+the original 108 measurements are retained unchanged.
+
 ## Transport terminology
 
 **Push** means sending the vote body directly to peers, without waiting for a
@@ -86,11 +91,11 @@ endorsement changes below therefore apply to the simulator.
 - **Unrestricted push trades bandwidth for about half a second.** Across all 12 paired size/committee/seed comparisons, push that marks votes seen on arrival retained the announce/request arm's Q95 attainment and L1 endorsement counts. Its conditional mean Q95 time was 0.356–0.530s earlier, with 7.81–7.88× the vote mini-protocol bytes. This comparison uses flat 8-byte announcements and requests against 94-byte vote bodies; it does not measure the bandwidth or timing trade-off at larger control-message sizes. These are equal counts, not an EB-identity comparison.
 - **At 1500 nodes, marking votes seen after verification reduces endorsement counts only in the everyone-votes arm.** With unrestricted push, the stake-weighted reference reached Q95 for 58/72 generated EBs and produced 25 L1 endorsements across the three seeds with either push setting. Marking seen after verification still incurred 9.69 completed verifications per accepted arrival and increased conditional mean Q95 times from 3.334–3.339s to 3.796–3.814s. The reference has 458 eligible pools, so it also generates fewer vote bodies than the 1500-voter stress arm.
 - **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; Q50 attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but Q50 attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
-- **None of the tested bounded fanouts preserves quorum availability at nodes holding 95% of stake.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained Q50, while 16 and 8 never reached Q50 in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
+- **None of the tested unprotected bounded fanouts preserves quorum availability at nodes holding 95% of stake.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained Q50, while 16 and 8 never reached Q50 in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
 
-**Caveat added after the run, fanout rows only.** The cap used for these runs sampled a relay's block producer like any other consumer. Every stake pool in both topologies is a producer with exactly two relays, so each relay skipped it with probability about 1 − k/d for its d consumers. From the topology alone, the stake at producers expected to fall below the quorum line exceeds 5% at every tested cap. That is a plausible mechanism for the Q95 losses, not a measured cause: these summaries carry no per-node data, and the bundle-delivery statistic counts nodes, not stake. The simulator keeps `vote-push-fanout-protects-producers: false` as the default, reproducing the rule used here. The optional protected rule uses explicit topology markers and counts protected BP connections within the same total cap (see the [study guide](../vote-diffusion-study.md#forwarding-and-accounting)). The original fanout rows describe the unprotected rule only; the matched protected comparison is reported separately in the follow-up. The announce/request and unlimited push rows are unaffected.
+**The fanout rows use the original unprotected rule.** The cap sampled BP recipients like any other consumer, although every BP has only two upstream relays. The [matched follow-up](../vote-diffusion-followup-20260915/README.md) protects those connections within the same total cap. At 1500 nodes with stake-weighted voting and seed 0, all three protected caps restore unrestricted push's Q95 and endorsement counts. This supports the BP-connection explanation for that case; the original matrix does not establish a general need to send to every peer. Protection defaults to false so archived inputs retain their behavior. The announce/request and unlimited push rows are unaffected.
 
-These results support unlimited simple vote streaming as feasible under the modeled load, with a bandwidth/latency trade-off. They do not establish a safe bounded-fanout setting or predict the Haskell node's exact performance. Lower fanout reduces verification work but, in this matrix, does not preserve the broad availability of unrestricted diffusion.
+Under the stated load, unrestricted push retains availability and saves about half a second with either committee when votes are marked seen on arrival. Its traffic cost depends on the assumed control-message sizes, and the bounded-fanout outcome depends on which connections are protected. The follow-up tests both assumptions in one reference scenario. Neither study predicts the Haskell node's exact performance.
 
 ## Reading the measurements
 
@@ -155,9 +160,10 @@ quorum counts and verification costs.
 
 ## Fanout and validation order
 
-For individual-node traffic, see the [one-run BP/relay breakdown](../vote-traffic-20260915/README.md).
-It reproduces the 1500-node, stake-weighted, unrestricted-push seed-0 case and
-adds sent/received bytes and fixed one-second rates for all 1500 nodes.
+For individual-node traffic, see the [focused BP/relay comparisons](../vote-diffusion-followup-20260915/README.md).
+All ten cases include sent/received bytes and fixed one-second rates for all
+1500 nodes. The [historical one-run breakdown](../vote-traffic-20260915/README.md)
+is also retained with its original provenance.
 
 Each row combines three seeds. Q95 attainment is the sum of per-run EB counts. Timing ranges cover available run means among EBs that attained Q95 quorum; missing EBs remain visible in the attainment columns. Verification amplification is total completed verifications divided by total accepted arrivals. Traffic is the range of per-run decimal GB, rounded in the simulator logs.
 

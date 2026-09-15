@@ -5,6 +5,11 @@ committee, and whether selective fetching or reduced fanout improves timing,
 bandwidth or verification cost. The comparison covers Linear Leios. Full Haskell
 node parity is not a prerequisite for this experiment.
 
+Start with the [focused findings](vote-diffusion-followup-20260915/README.md)
+for the BP-protection comparison, control-size sensitivity and per-node traffic.
+The [original 108-run report](vote-diffusion-results-20260910/README.md) also
+covers both committees and duplicate-handling orders.
+
 ## Transport terminology
 
 The [transport definitions in the report](vote-diffusion-results-20260910/README.md#transport-terminology)
@@ -25,7 +30,7 @@ how much verification work they cause. Neither arm is a Haskell runtime benchmar
 
 [CIP PR #1196](https://github.com/cardano-foundation/CIPs/pull/1196) replaced
 weighted Fait Accompli with a stake-based committee. The subsequent
-[open PR #1250](https://github.com/cardano-foundation/CIPs/pull/1250), checked at
+[PR #1250](https://github.com/cardano-foundation/CIPs/pull/1250), checked at
 [`e173ea52`](https://github.com/cardano-scaling/CIPs/blob/e173ea5250e99e93db3436205f32f755169f1866/CIP-0164/README.md#committee-structure),
 proposes a fixed committee size. These are distinct selection rules:
 
@@ -84,7 +89,9 @@ push already forwards to all consumers.
 
 The original fanout results measured a rule that could omit BP recipients.
 Those measurements describe that rule, rather than a general requirement to
-send to every peer. The matched follow-up tests protection at the same caps.
+send to every peer. The [matched follow-up](vote-diffusion-followup-20260915/README.md)
+tests protection at the same caps and restores Q95 in its single-seed reference
+scenario. That does not establish a universally safe cap.
 
 Accepted arrivals count completed first acceptance, excluding locally generated
 votes, redundant copies and votes for pruned EBs. Pending arrivals are separate;
@@ -280,8 +287,10 @@ model; it does not predict the prototype's exact certification loss.
 
 ## Per-node vote traffic
 
-The [captured 1500-node unrestricted-push case](vote-traffic-20260915/README.md)
-provides BP/relay tables, all 1500 node rows, raw counters and reproduction inputs.
+The [focused report](vote-diffusion-followup-20260915/README.md) provides BP/relay
+comparisons and captures all 1500 nodes in each of its ten cases. The earlier
+[single unrestricted-push capture](vote-traffic-20260915/README.md) remains
+available with its original provenance.
 
 The archived 108 runs saved network totals, not individual-node traffic. The
 report's [Wire GB range](vote-diffusion-results-20260910/README.md#fanout-and-validation-order)
@@ -354,6 +363,10 @@ python3 scripts/test-summarize-vote-traffic.py
 ```
 
 ## Focused fanout and control-size follow-up
+
+The [published pilot](vote-diffusion-followup-20260915/README.md) completes the
+ten cases below for seed 0, with reconciled per-node traffic and a comparison
+against the five corresponding archived default cases.
 
 `vote-announcement-size-bytes` and `vote-request-size-bytes` independently set
 Linear Leios vote-bundle control-message sizes. Both default to 8. Sizes include
