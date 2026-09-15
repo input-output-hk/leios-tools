@@ -428,7 +428,8 @@ and stake-weighted voting; it does not repeat the everyone-votes stress test.
 # First extract study-config.yaml from the original input archive.
 VOTE_STUDY_CONFIG_REVISION=f307ed5fa7077a32eb470ca3832a34092882bfe3 \
   python3 scripts/vote-diffusion-followup.py /tmp/study-config.yaml /tmp/vote-followup 0
-python3 docs/vote-diffusion-results-20260910/extract-results.py /tmp/vote-followup
+python3 scripts/summarize-vote-diffusion-followup.py /tmp/vote-followup \
+  --output /tmp/vote-followup/breakdown
 ```
 
 The default duration is 400 slots; `VOTE_STUDY_SLOTS` changes it. A dry run uses
@@ -436,3 +437,10 @@ The default duration is 400 slots; `VOTE_STUDY_SLOTS` changes it. A dry run uses
 can be disabled with `VOTE_STUDY_NODE_TRAFFIC=0`. All inputs, scripts, row names,
 logs, capture files and the executable checksum are retained. One seed is a
 pilot comparison; repeat promising cases across seeds before broad claims.
+
+The focused summarizer verifies capture checksums, completed logs, topology
+membership and control-message sizes, then reconciles every per-node report
+against the final network totals. Its tables compare BP protection under a
+fixed total cap and executed control-size variants against the same unrestricted
+push baseline. Separate per-node CSVs retain the traffic distribution for every
+case. It also compares unprotected 8/8 outcomes with matching archived runs.
