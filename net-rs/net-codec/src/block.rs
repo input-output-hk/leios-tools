@@ -367,22 +367,28 @@ impl BlockBody {
 
         // Field 0: header — skip.
         inner.skip()?;
-        // Field 1: transactions.
-        //   Pre-Leios (era < 8): field 1 is `tx_bodies` (`[* transaction_body]`)
-        //     directly — count its length.
-        //   Leios (era ≥ 8): field 1 is a body wrapper `[?, tx_list, ?, ?]`
-        //     (the other slots are null placeholders) whose `tx_list` holds the
-        //     `[tx_body, witness_set, aux]` triples. Descend one level so we
-        //     count the actual transactions — counting the wrapper's own length
-        //     reports a constant 4 tx/block regardless of the real payload.
-        // Both accept definite and indefinite arrays: dev-relay blocks around
-        // the Leios era encode arrays as `9f … ff`, and returning Err would
-        // silently default the whole body info (`field_count = 0`).
-        let tx_count = if era >= LEIOS_ERA {
-            count_leios_tx_list(&mut inner)?
-        } else {
-            count_and_skip_array(&mut inner)?
-        };
+
+        // Era-8 Leios: field 1 is the `block_body` array, and BOTH the
+        // transaction list and the certificate slots live inside it. Parse it
+        // here rather than falling through to the trailing-optional probes
+        // below, which describe the pre-Leios (era-7 flat Conway) shape where
+        // the cert really was a trailing field of the *block* array.
+        //
+        // Getting this wrong was silent: for era-8 `block_len == 2`, so
+        // `base_remaining` and `trailing` both came out 0, the cert probe never
+        // ran, and `eb_certificate` was None for EVERY era-8 block whether or
+        // not it carried one. That fed `certified_eb` and the EB-application
+        // path in shared-consensus praos, and made the `body_cert_eb_slot`
+        // telemetry structurally unable to report a cert.
+        if era >= LEIOS_ERA {
+            return Self::inspect_leios_body(&mut inner, field_count);
+        }
+
+        // Field 1 (era < 8): `tx_bodies` (`[* transaction_body]`) directly —
+        // count its length. Accepts definite and indefinite arrays: dev-relay
+        // blocks around the Leios era encode arrays as `9f … ff`, and returning
+        // Err would silently default the whole body info (`field_count = 0`).
+        let tx_count = count_and_skip_array(&mut inner)?;
         // Skip the rest of the Conway base: tx_witness_sets,
         // auxiliary_data_set, invalid_transactions.  We treat the count
         // permissively to keep working if the era/CDDL adds another
@@ -414,7 +420,7 @@ impl BlockBody {
         if trailing >= 1 {
             match classify_cert_slot(&mut inner)? {
                 CertSlotState::Absent => {}
-                CertSlotState::Pending => {
+                CertSlotState::Pending | CertSlotState::PresentWithoutIdentity => {
                     eb_certificate_pending = true;
                 }
                 CertSlotState::Other => {
@@ -431,8 +437,92 @@ impl BlockBody {
         if trailing >= 2 {
             match classify_cert_slot(&mut inner)? {
                 CertSlotState::Absent => {}
-                CertSlotState::Pending => {
+                CertSlotState::Pending | CertSlotState::PresentWithoutIdentity => {
                     peras_cert_pending = true;
+                }
+                CertSlotState::Other => {
+                    return Err(DecodeError::message(
+                        "peras_cert slot has unknown shape; layout not yet known",
+                    ));
+                }
+            }
+        }
+
+        Ok(ParsedBodyInfo {
+            tx_count,
+            field_count,
+            eb_certificate,
+            eb_certificate_pending,
+            peras_cert_pending,
+        })
+    }
+
+    /// Inspect an era-8 `block_body`, positioned at the body array.
+    ///
+    /// Two layouts, told apart by arity so a chain from either era parses:
+    ///   w36+ (3 fields): `[transactions, leios_cert/nil, peras_cert/nil]`
+    ///   pre-w36 (4):     `[invalid_transactions/nil, transactions,
+    ///                      leios_cert/nil, peras_cert/nil]`
+    ///
+    /// In both, the certificate is the field immediately after `transactions`
+    /// and the peras slot the one after that.
+    fn inspect_leios_body(
+        inner: &mut Decoder,
+        field_count: u32,
+    ) -> Result<ParsedBodyInfo, DecodeError> {
+        let bb_len = match inner.array()? {
+            Some(n) => n,
+            None => return Err(DecodeError::message("indefinite era-8 block_body")),
+        };
+        let tx_field_index = match bb_len {
+            3 => 0,           // w36+: transactions first
+            n if n >= 4 => 1, // pre-w36: invalid_transactions leads
+            _ => {
+                // Too short to be either layout; report what we know rather
+                // than guessing at the slots.
+                return Ok(ParsedBodyInfo {
+                    field_count,
+                    ..ParsedBodyInfo::default()
+                });
+            }
+        };
+        for _ in 0..tx_field_index {
+            inner.skip()?;
+        }
+        let tx_count = count_and_skip_array(inner)?;
+
+        let mut eb_certificate = None;
+        let mut eb_certificate_pending = false;
+        let mut peras_cert_pending = false;
+
+        // `leios_certificate`. Shapes, as for the era-7 slot: `null` = Absent,
+        // `array(0)` = the prototype's "pending" placeholder, `array(4)`
+        // `[slot, hash, signers, sig]` = a real cert, anything else = parse
+        // failure surfaced via the caller's hex dump.
+        if bb_len >= tx_field_index + 2 {
+            match classify_cert_slot(inner)? {
+                CertSlotState::Absent => {}
+                // Both mean "a cert is here but it names no EB". The consumer
+                // treats `pending` as certified and resolves the EB from the
+                // parent RB's announcement, which is exactly right for the
+                // w36 2-tuple.
+                CertSlotState::Pending | CertSlotState::PresentWithoutIdentity => {
+                    eb_certificate_pending = true
+                }
+                CertSlotState::Other => {
+                    eb_certificate = Some(try_decode_leios_cert(inner)?);
+                }
+            }
+        }
+
+        // `peras_certificate`. CDDL shape still unknown, so accept only the
+        // Absent / Pending sentinels and fail the parse otherwise, rather than
+        // silently misinterpreting a layout we have not seen.
+        if bb_len >= tx_field_index + 3 {
+            match classify_cert_slot(inner)? {
+                CertSlotState::Absent => {}
+                CertSlotState::Pending | CertSlotState::PresentWithoutIdentity => {
+                    peras_cert_pending = true
                 }
                 CertSlotState::Other => {
                     return Err(DecodeError::message(
@@ -579,6 +669,14 @@ enum CertSlotState {
     /// Counted separately from `Absent` so we can see how often
     /// this signal fires on the chain.
     Pending,
+    /// CBOR `array(2)` — the real w36 on-chain shape,
+    /// `[signers_bitfield, aggregated_signature]`. A certificate IS
+    /// present, but it carries no EB slot/hash, so the EB it certifies
+    /// can only be resolved from the parent RB's announcement
+    /// (`parent_announced_eb_for_cert`). Verified against a cert-bearing
+    /// block pulled from a w36 node's VolatileDB: `[bytes[1], bytes[48]]`,
+    /// with the header's `leios_certified` bit set.
+    PresentWithoutIdentity,
     /// Anything else: a real cert (or an unknown shape that the
     /// caller will decode / fail on).
     Other,
@@ -597,11 +695,19 @@ fn classify_cert_slot(d: &mut Decoder<'_>) -> Result<CertSlotState, DecodeError>
         }
         Type::Array | Type::ArrayIndef => {
             let mut probe = d.probe();
-            if let Ok(Some(0)) = probe.array() {
-                d.array()?; // consume the `array(0)` from the real decoder
-                Ok(CertSlotState::Pending)
-            } else {
-                Ok(CertSlotState::Other)
+            match probe.array() {
+                Ok(Some(0)) => {
+                    d.array()?; // consume the `array(0)` from the real decoder
+                    Ok(CertSlotState::Pending)
+                }
+                // The w36 wire cert: `[signers_bitfield, aggregated_signature]`.
+                // No eb_slot/eb_hash to lift, so skip it whole and let the
+                // caller resolve the EB from the parent's announcement.
+                Ok(Some(2)) => {
+                    d.skip()?;
+                    Ok(CertSlotState::PresentWithoutIdentity)
+                }
+                _ => Ok(CertSlotState::Other),
             }
         }
         _ => Ok(CertSlotState::Other),
@@ -789,6 +895,153 @@ mod tests {
         oe.tag(minicbor::data::Tag::new(24)).unwrap();
         oe.bytes(&inner_buf).unwrap();
         outer_buf
+    }
+
+    /// Build an era-8 block whose `block_body` has `bb_len` fields, carrying
+    /// `tx_count` txs and optionally a real `leios_certificate`.
+    ///
+    /// bb_len 3 => [transactions, cert/nil, nil]            (w36+)
+    /// bb_len 4 => [nil, transactions, cert/nil, nil]       (pre-w36)
+    fn build_era8_block_body(bb_len: u64, tx_count: u64, cert: Option<&[u8]>) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut block_buf = Vec::new();
+        let mut be = Encoder::new(&mut block_buf);
+        be.array(2).unwrap();
+        be.bytes(&[0x80]).unwrap(); // dummy header
+        be.array(bb_len).unwrap();
+        if bb_len >= 4 {
+            be.null().unwrap(); // [0] invalid_transactions (pre-w36 only)
+        }
+        be.array(tx_count).unwrap(); // transactions
+        for _ in 0..tx_count {
+            be.array(3).unwrap();
+            be.map(0).unwrap();
+            be.map(0).unwrap();
+            be.null().unwrap();
+        }
+        match cert {
+            Some(c) => {
+                be.writer_mut().write_all(c).unwrap();
+            }
+            None => {
+                be.null().unwrap();
+            }
+        }
+        be.null().unwrap(); // peras_certificate
+
+        let mut inner_buf = Vec::new();
+        let mut ie = Encoder::new(&mut inner_buf);
+        ie.array(2).unwrap();
+        ie.u32(8).unwrap();
+        ie.writer_mut().write_all(&block_buf).unwrap();
+
+        let mut outer_buf = Vec::new();
+        let mut oe = Encoder::new(&mut outer_buf);
+        oe.tag(minicbor::data::Tag::new(24)).unwrap();
+        oe.bytes(&inner_buf).unwrap();
+        outer_buf
+    }
+
+    /// A real `leios_certificate`: `[slot, hash32, signers, sig]`.
+    fn sample_leios_cert(eb_slot: u64) -> Vec<u8> {
+        let mut c = Vec::new();
+        let mut e = Encoder::new(&mut c);
+        e.array(4).unwrap();
+        e.u64(eb_slot).unwrap();
+        e.bytes(&[0xABu8; 32]).unwrap();
+        e.bytes(&[0x63, 0xff, 0xff]).unwrap();
+        e.bytes(&[0x11u8; 48]).unwrap();
+        c
+    }
+
+    #[test]
+    fn era8_praos_inspect_extracts_cert_from_inside_block_body() {
+        // Regression: for era-8 the block array is [header, block_body], so
+        // block_len == 2 and the old trailing-optional probe computed
+        // trailing == 0 and NEVER looked at the cert slot. eb_certificate came
+        // back None for every era-8 block, certified or not -- which fed
+        // `certified_eb` and the EB-application path in shared-consensus and
+        // made body_cert_eb_slot telemetry unable to ever report a cert.
+        for bb_len in [3u64, 4] {
+            let cert = sample_leios_cert(4242);
+            let raw = build_era8_block_body(bb_len, 2, Some(&cert));
+            let info = BlockBody::opaque(raw).praos_inspect();
+            assert_eq!(info.tx_count, 2, "bb_len {bb_len}: tx count");
+            let got = info
+                .eb_certificate
+                .unwrap_or_else(|| panic!("bb_len {bb_len}: cert must be extracted"));
+            assert_eq!(got.eb_slot, 4242, "bb_len {bb_len}: cert eb_slot");
+            assert!(
+                !info.eb_certificate_pending,
+                "bb_len {bb_len}: a real cert is not 'pending'"
+            );
+        }
+    }
+
+    /// A REAL cert-bearing w36 block, lifted verbatim from a proto-devnet
+    /// node's VolatileDB (blockNo 48, slot 1008) and re-wrapped in `#6.24` as
+    /// BlockFetch delivers it.
+    ///
+    /// `block_body` is `[transactions, cert, nil]` (arity 3) and the cert is
+    /// the w36 2-tuple `[signers_bitfield bytes[1], aggregated_signature
+    /// bytes[48]]` -- NOT the `array(4)` `[slot, hash, signers, sig]` the
+    /// decoder used to assume. There is no EB identity in it, so
+    /// `eb_certificate_pending` is the correct report and the consumer
+    /// resolves the EB from the parent RB's announcement.
+    const REAL_W36_CERT_BLOCK_HEX: &[&str] = &[
+        "d818590390820882828c18301903f05820e8dd4281b5a356784f966e9fe3d95187a954955f0d718f8cfbdd80ea999ca0",
+        "3c582060d8abbb95bf48767dae3a6d3f8473206b72542f40e9d8945040000c3fa681c858207d58e5c6c021e33b057a6c",
+        "6bb28b0b7a42444a76b67a770f53017ca2c68de8f58258404cc96f5bf599fb11c17491a7f115c8fe705412122ddfc98c",
+        "ce4bfff2e23460c082603e39a7ce97214c0203d508d06f214a98bd5d63c98cc1fd77b8f85c3e7f655850e147b7e51f91",
+        "e479bd72d679deb8179158a98f662eebaa5364af00079b25e62bff744cabd199f2aa1d8eaf72c8c36f23af7ddecc89a2",
+        "2dadf14a82082f1db42b6f2ea94dede9fd502210da8288e1310b183858200d6df56fc0c49e6baade44d779510360e963",
+        "e3168992aff9c448ad8b392675b7845820f1292ffddd67c4d99bf2a3d6590392b78fa8b52104fab81d94e7865a25f237",
+        "72000058403fc90e7862c6d469b866d95db82baa85725b9f9de78365d68d0b19d78f291e3d163a3e5cb39c9ed858f308",
+        "ac2bbd65cbb606593b0d2257405cc3dda7b3c4bd01820c00f5f65901c0283a68b42aafae1f8a790b4b2498a7d03492fa",
+        "36cb166953343bbca74860b67584473c19ec66d0218c3510e61ef210745b60c49cd24127cccb5094493c7db40a487366",
+        "0f9fc6b2ea810d9ceae28140ed2f6f3c697314f70b2479f04f6f9f76088dc7f2ee12a0edb7401e80d08e733dfab43be4",
+        "1c8596e1bee1e9b26f11a7c9e6d3c96a82805e79c89c99702f20b733b7305e851eea4c31221bd10a17098178deb03dab",
+        "10ccf6bf390a2d1aace82dbeca2152047d29e904f5b47a117a3b23e74eb3b04429129e7539939fddbf4543fec7126952",
+        "b313b7520bf02a5dab7d0581e41594e926377f8f0a1fa7b7504354ef0d17cf243f2cec6dc533a180a334503e1725c803",
+        "69fb8f0aa749b80821ec4628fa5dffadcd0d47285321eae4c252262b4dbae9ac959bc2c19492a77d05da7c804c18c0a3",
+        "07f45d46e8a229390e3565b5849b3f96213f0c22fa061257599faa79051461e9bfa567d49b943afa7faadf2264d53b4e",
+        "f155c714f1a637331add5c1a227124e69765f5c04f39dc78d1571fb39bc08d20030839289546235a8b2ab844f381088d",
+        "488cfb8828ad62f5d422039f87a58d08f5bb8a9e021472bf8f32eaaff1dd128003cdfffab53655527e0c4a8eb8838082",
+        "41e05830b5e115beaac498cd011531fa05e3615572143a557ab9118c99dce693d33bd6747de51ff7bb660f617b380a32",
+        "c2edcc7df6",
+    ];
+
+    #[test]
+    fn real_w36_cert_bearing_block_is_reported_as_certified() {
+        let hex_str: String = REAL_W36_CERT_BLOCK_HEX.concat();
+        let raw = hex::decode(hex_str).expect("valid hex");
+        let info = BlockBody::opaque(raw).praos_inspect();
+
+        // Before the era-8 fix this asserted nothing useful: the cert slot was
+        // never probed, so a genuinely certified block reported no cert at all.
+        assert!(
+            info.eb_certificate_pending,
+            "a real w36 cert-bearing block must be reported as carrying a cert"
+        );
+        assert!(
+            info.eb_certificate.is_none(),
+            "the w36 2-tuple carries no eb_slot/eb_hash, so none must be invented"
+        );
+        assert_eq!(info.field_count, 2, "era-8 block is [header, block_body]");
+    }
+
+    #[test]
+    fn era8_praos_inspect_reports_no_cert_when_slot_is_nil() {
+        for bb_len in [3u64, 4] {
+            let raw = build_era8_block_body(bb_len, 1, None);
+            let info = BlockBody::opaque(raw).praos_inspect();
+            assert_eq!(info.tx_count, 1, "bb_len {bb_len}: tx count");
+            assert!(
+                info.eb_certificate.is_none() && !info.eb_certificate_pending,
+                "bb_len {bb_len}: nil cert slot means absent, not pending"
+            );
+        }
     }
 
     #[test]
