@@ -179,10 +179,17 @@ async fn main() -> Result<()> {
     };
     let (completed_slots, report) = monitored??;
     result?;
-    anyhow::ensure!(
-        !token.is_cancelled(),
-        "simulation interrupted; traffic capture discarded"
-    );
+    if token.is_cancelled() {
+        // Ctrl-C is the documented way to finish an ordinary interactive run.
+        // Its event stream and final stats have already been flushed. A traffic
+        // capture needs the full interval, so keep that failure distinct.
+        anyhow::ensure!(
+            report.is_none(),
+            "simulation interrupted; traffic capture discarded"
+        );
+        info!("Simulation interrupted after {completed_slots} observed slots.");
+        return Ok(());
+    }
     anyhow::ensure!(
         slots.is_none_or(|slots| slots == completed_slots),
         "simulation ended before all requested slots were observed"

@@ -10,7 +10,7 @@ use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use rand_distr::Distribution;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     clock::Timestamp,
@@ -370,7 +370,8 @@ pub struct RawParameters {
     /// Prioritize topology links marked `always-forward-votes` within the
     /// total fanout budget. These identify a relay's own BP consumers without
     /// inferring ownership from stake. Remaining places are sampled by hash.
-    /// Defaults to false, preserving the 2026-09-10 forwarding rule.
+    /// Defaults to false, preserving the 2026-09-10 forwarding rule. Without
+    /// a cap this is accepted with a warning for archived-input compatibility.
     #[serde(default)]
     pub vote_push_fanout_protects_producers: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
@@ -853,7 +854,7 @@ pub enum RawNodeLocation {
 pub struct RawLinkInfo {
     /// On this consumer's upstream connection, always forward votes from the
     /// upstream node to this consumer when producer protection is enabled.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always_forward_votes: bool,
     pub latency_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1855,6 +1856,13 @@ impl SimConfiguration {
                     params.vote_transport
                 );
             }
+        }
+        if params.vote_push_fanout.is_none() && params.vote_push_fanout_protects_producers {
+            // The archived unrestricted-push traffic overlay enables this
+            // flag. All consumers already receive votes without a cap.
+            warn!(
+                "producer protection has no effect without a vote-push-fanout cap; preserving the configured transport"
+            );
         }
         if let Some(fanout) = params.vote_push_fanout
             && params.vote_push_fanout_protects_producers

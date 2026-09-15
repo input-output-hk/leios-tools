@@ -267,7 +267,9 @@ The runner marks each BP's two upstream entries with `always-forward-votes: true
 in both saved study topologies. Routing uses those explicit markers, not stake.
 For other topologies, mark the consumer's own relay entries under `producers`.
 Enabling protection with a bounded cap requires marked links and at least one
-unprotected consumer. Node/peer roles are prepared once per node.
+unprotected consumer. Without a cap, protection is accepted with a warning for
+compatibility with the archived unrestricted-push overlay; unlimited push already
+forwards to every consumer. Node/peer roles are prepared once per node.
 
 Run once with each protection value into separate output directories. Run names
 include `bptrue` or `bpfalse`, `runs.csv` includes `protects_producers`, and the
@@ -344,7 +346,10 @@ on arrivals, so the recorder needs no bundle-size cache.
 The destination must not already exist or alias the event output. A temporary
 file is opened before the simulation starts and published only after successful
 completion. Monitor failures cancel the simulation, and failed/interrupted
-captures leave the destination available for retry.
+captures leave the destination available for retry. Ctrl-C on an ordinary run
+without capture still saves events and exits successfully. The study runner
+requires the full-duration completion marker before marking any run passed,
+including runs without traffic capture.
 
 Send timestamps mean **queued for transmission**; receive timestamps mean
 **delivered**. A peak is the busiest fixed one-second bucket, not instantaneous

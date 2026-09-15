@@ -42,7 +42,7 @@ tx-size-bytes-distribution: {distribution: constant, value: 1500}
 
     def command(self, *extra, slots=64, output=None):
         return [str(BINARY), 'topology.json'] + ([output] if output else []) + [
-            '-p', 'config.yaml', '-s', str(slots), *extra]
+            '-p', 'config.yaml', *([] if slots is None else ['-s', str(slots)]), *extra]
 
     def run_cli(self, *extra, slots=64, output=None, timeout=15):
         return subprocess.run(self.command(*extra, slots=slots, output=output), cwd=self.root,
@@ -107,22 +107,58 @@ tx-size-bytes-distribution: {distribution: constant, value: 1500}
         retry = self.run_cli('--vote-traffic', 'traffic.json')
         self.assertEqual(retry.returncode, 0, retry.stderr)
 
-    def test_interrupted_capture_is_not_published(self):
-        with (self.root / 'interrupted.log').open('w') as log:
-            process = subprocess.Popen(self.command('--vote-traffic', 'traffic.json', slots=1000000),
-                                       cwd=self.root, stdout=log, stderr=log)
+    def interrupt_run(self, engine, slots, capture):
+        (self.root / 'engine.yaml').write_text(f'engine: {engine}\n')
+        extra = ['-p', 'engine.yaml'] + (['--vote-traffic', 'traffic.json'] if capture else [])
+        log_path = self.root / 'interrupted.log'
+        events_path = self.root / 'events.jsonl'
+        with log_path.open('w') as log:
+            process = subprocess.Popen(self.command(*extra, slots=slots, output=events_path.name),
+                                       cwd=self.root, stdout=log, stderr=log,
+                                       env=dict(os.environ, RUST_LOG='info'))
             try:
                 deadline = time.monotonic() + 5
-                while not list(self.root.glob('.vote-traffic-*.tmp')) and time.monotonic() < deadline:
+                while 'Slot 1 has begun.' not in log_path.read_text() and time.monotonic() < deadline:
+                    self.assertIsNone(process.poll(), log_path.read_text())
                     time.sleep(.01)
+                self.assertIn('Slot 1 has begun.', log_path.read_text())
                 process.send_signal(signal.SIGINT)
-                self.assertNotEqual(process.wait(timeout=5), 0)
+                code = process.wait(timeout=5)
             finally:
                 if process.poll() is None:
                     process.kill()
                     process.wait()
-        self.assertFalse((self.root / 'traffic.json').exists())
-        self.assertEqual(list(self.root.glob('.vote-traffic-*.tmp')), [])
+        log_text = log_path.read_text()
+        self.assertIn('Final protocol stats:', log_text)
+        self.assertIn('Final network stats:', log_text)
+        self.assertNotIn('Simulation completed:', log_text)
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        self.assertGreater(len(events), 0)
+        return code, log_text
+
+    def test_ctrl_c_without_capture_saves_events_and_succeeds(self):
+        for engine in ['sequential', 'actor']:
+            for slots in [None, 1000000]:
+                with self.subTest(engine=engine, slots=slots):
+                    code, log = self.interrupt_run(engine, slots, capture=False)
+                    self.assertEqual(code, 0, log[-1000:])
+                    self.assertNotIn('traffic capture discarded', log)
+
+    def test_interrupted_capture_is_not_published(self):
+        for engine in ['sequential', 'actor']:
+            for slots in [None, 1000000]:
+                with self.subTest(engine=engine, slots=slots):
+                    code, log = self.interrupt_run(engine, slots, capture=True)
+                    self.assertNotEqual(code, 0)
+                    self.assertIn('traffic capture discarded', log)
+                    self.assertFalse((self.root / 'traffic.json').exists())
+                    self.assertEqual(list(self.root.glob('.vote-traffic-*.tmp')), [])
+
+    def test_unlimited_protection_warns_without_rejecting_archived_inputs(self):
+        (self.root / 'protection.yaml').write_text('vote-push-fanout-protects-producers: true\n')
+        result = self.run_cli('-p', 'protection.yaml', slots=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('producer protection has no effect without a vote-push-fanout cap', result.stdout)
 
 
 if __name__ == '__main__':

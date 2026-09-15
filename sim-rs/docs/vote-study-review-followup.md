@@ -27,8 +27,8 @@ described in its README. A new runner check cannot repair old provenance. Its
 raw artifacts remain unchanged, and the current summarizer reproduces both
 published tables byte for byte using the original successful run record.
 
-Validation: 166 Rust tests passed, one ignored; 13 runner/extractor tests and
-four summarizer tests passed. The real CLI suite covers both engines, push and
+Validation: 166 Rust tests passed, one ignored; 14 runner/extractor tests and
+four summarizer tests passed. Eight real CLI tests cover both engines, push and
 pull capture, path aliases, cancellation, monitor failure and retry. The original
 108-run extraction still reproduces all published numeric results.
 
@@ -36,3 +36,18 @@ No full study rerun is needed to validate these implementation fixes. The
 protected/unprotected fanout comparison remains outstanding. Announcement and
 request sizes remain 8-byte model assumptions and need their own parameterized
 experiments before quoting a general bandwidth ratio.
+
+## Follow-up review of 919947d
+
+- The Ctrl-C regression was valid. Ordinary runs again save their events and
+  final statistics and exit successfully, with or without a slot limit. An
+  interrupted traffic capture still fails and publishes no report. The study
+  runner separately requires a completion marker before accepting a result.
+- Protection without a cap is redundant, but rejecting it would break the
+  archived unrestricted-push overlay. It remains accepted with an explicit
+  warning. Unlimited push already sends to every consumer.
+- The serialization nit was valid. Unprotected links now omit the false marker
+  when generating a topology; explicitly protected links retain it.
+
+These changes affect shutdown, validation messages and topology serialization.
+They do not change simulated vote routing or the published experiment numbers.

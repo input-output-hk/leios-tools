@@ -150,7 +150,7 @@ class StudyInterfaceTests(unittest.TestCase):
     def test_runner_executes_capture_and_records_its_checksum(self):
         output = self.root / 'one-run'
         fake_binary = self.root / 'sim-cli'
-        fake_binary.write_text("#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\np = Path(sys.argv[sys.argv.index('--vote-traffic') + 1])\np.write_text('{\"captured\":true}\\n')\n")
+        fake_binary.write_text("#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\np = Path(sys.argv[sys.argv.index('--vote-traffic') + 1])\np.write_text('{\"captured\":true}\\n')\nprint('Simulation completed: ' + sys.argv[sys.argv.index('-s') + 1] + ' slots.')\n")
         fake_binary.chmod(0o755)
         env = dict(os.environ, VOTE_STUDY_DRY_RUN='0', VOTE_STUDY_SIZES='1500',
                    VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_FANOUTS='all',
@@ -167,6 +167,22 @@ class StudyInterfaceTests(unittest.TestCase):
         self.assertEqual(json.loads((output / name).read_text()), {'captured': True})
         checksums = json.loads((output / 'vote-traffic-sha256.json').read_text())
         self.assertEqual(checksums[name], runner.digest(output / name))
+
+    def test_runner_rejects_a_successful_exit_without_completion(self):
+        output = self.root / 'interrupted-run'
+        fake_binary = self.root / 'sim-cli'
+        fake_binary.write_text("#!/usr/bin/env python3\nprint('Final protocol stats:')\nprint('Final network stats:')\n")
+        fake_binary.chmod(0o755)
+        env = dict(os.environ, VOTE_STUDY_DRY_RUN='0', VOTE_STUDY_SIZES='750',
+                   VOTE_STUDY_COMMITTEES='top-stake-seats', VOTE_STUDY_FANOUTS='all',
+                   VOTE_STUDY_TRANSPORTS='push', VOTE_STUDY_NODE_TRAFFIC='0')
+        with patch.dict(os.environ, env, clear=True), patch.object(runner, 'build_binary', return_value=fake_binary), \
+                patch.object(sys, 'argv', [str(RUNNER), str(self.archive / 'study-config.yaml'), str(output), '0']):
+            self.assertEqual(runner.main(), 1)
+        with (output / 'runs.csv').open() as stream:
+            row, = csv.DictReader(stream)
+        self.assertEqual(row['exit_code'], '0')
+        self.assertEqual(row['status'], 'failed')
 
     def test_stale_binary_rebuilt_and_rejected_if_still_stale(self):
         revision = 'abcdef0123456789'

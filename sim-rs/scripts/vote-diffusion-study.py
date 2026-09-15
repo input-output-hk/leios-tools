@@ -212,9 +212,16 @@ def main():
                                         '-p', str(root / 'study-config.yaml'),
                                         '-p', str(root / 'workload.yaml'), '-p', str(root / 'engine.yaml'),
                                         '-p', str(root / (row['run'] + '.yaml'))] + traffic_args, stdout=log, stderr=subprocess.STDOUT)
-        row.update(status='passed' if completed.returncode == 0 else 'failed',
+        # Ctrl-C deliberately returns success for ordinary interactive runs.
+        # A study result still needs the entire configured simulation interval.
+        completion = f"Simulation completed: {row['slots']} slots."
+        log_text = re.sub(r'\x1b\[[0-9;]*m', '', (root / (row['run'] + '.txt')).read_text())
+        passed = completed.returncode == 0 and any(line.endswith(completion) for line in log_text.splitlines())
+        if completed.returncode == 0 and not passed:
+            print(f"{row['run']}: missing completion marker; recording a failed study run", flush=True)
+        row.update(status='passed' if passed else 'failed',
                    finished_utc=utc(), elapsed_s=f'{time.monotonic() - started:.3f}', exit_code=completed.returncode)
-        if capture and completed.returncode == 0:
+        if capture and passed:
             traffic_reports[traffic_name] = digest(root / traffic_name)
             write_json(root / 'vote-traffic-sha256.json', traffic_reports)
         logs[row['run'] + '.txt'] = digest(root / (row['run'] + '.txt'))
