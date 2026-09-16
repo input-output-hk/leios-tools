@@ -303,7 +303,7 @@ pub enum Event {
         msg_size_bytes: u64,
     },
     /// A vote bundle's id was offered to a peer, without the body.  Costs
-    /// the 8 bytes the Vote mini-protocol charges for it.
+    /// `vote-announcement-size-bytes`, 8 by default.
     ///
     /// `announce-then-request` sends one of these per link and one
     /// `VTBundleRequested` back for every body it goes on to send, so in
@@ -316,7 +316,7 @@ pub enum Event {
         msg_size_bytes: u64,
     },
     /// A vote bundle's body was asked for after its id was announced.  Costs
-    /// 8 bytes, like the announcement it answers.
+    /// `vote-request-size-bytes`, 8 by default.
     VTBundleRequested {
         id: VoteBundleId<Node>,
         sender: Node,

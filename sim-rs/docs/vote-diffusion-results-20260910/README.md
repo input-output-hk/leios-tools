@@ -9,7 +9,8 @@ instrumentation, so their obsolete-work breakdown is unknown. The
 what the new counters measure and why they are subsets of the existing totals.
 
 The [focused follow-up](../vote-diffusion-followup-20260915/README.md) adds a matched
-BP-protection comparison, control-message size sensitivity and per-node traffic.
+BP-protection comparison, control-message size sensitivity and per-node traffic
+for the mark-seen-on-arrival push setting.
 It changes how the fanout and bandwidth findings below should be interpreted;
 the original 108 measurements are retained unchanged.
 
@@ -93,7 +94,7 @@ endorsement changes below therefore apply to the simulator.
 - **Fanout 22 relieves some verification load, at a cost in availability.** In the 1500-node everyone-votes arm that marks seen after verification, it reduced total completed verifications by 30.0% and wire bytes by 29.4%; Q50 attainment increased from 37/72 to 50/72 EBs and L1 endorsements from 13 to 18. Q95 attainment fell from 37/72 to zero. In the stake-weighted arm with the same handling of copies, fanout 22 cut wire bytes by 40.3% and verifications by 43.2%, but Q50 attainment fell from 58/72 to 57/72 and endorsements from 25 to 19; Q95 again fell to zero.
 - **None of the tested unprotected bounded fanouts preserves quorum availability at nodes holding 95% of stake.** All 72 runs with fanout 22/16/8 had zero EBs reaching Q95. Fanout 22 often retained Q50, while 16 and 8 never reached Q50 in these runs. Fanout 8 produced zero L1 endorsements in every arm. A first-node quorum can still exist; zero Q95 does not mean nobody obtained a quorum.
 
-**The fanout rows use the original unprotected rule.** The cap sampled BP recipients like any other consumer, although every BP has only two upstream relays. The [matched follow-up](../vote-diffusion-followup-20260915/README.md) protects those connections within the same total cap. At 1500 nodes with stake-weighted voting and seed 0, all three protected caps restore unrestricted push's Q95 and endorsement counts. This supports the BP-connection explanation for that case; the original matrix does not establish a general need to send to every peer. Protection defaults to false so archived inputs retain their behavior. The announce/request and unlimited push rows are unaffected.
+**The fanout rows use the original unprotected rule.** The cap sampled BP recipients like any other consumer, although every BP has only two upstream relays. The [matched follow-up](../vote-diffusion-followup-20260915/README.md) protects those connections within the same total cap. At 1500 nodes with stake-weighted voting, seed 0 and votes marked seen on arrival, all three protected caps restore unrestricted push's Q95 and endorsement counts. Protection is untested with the mark-seen-after-verification order. This supports the BP-connection explanation for that case; the original matrix does not establish a general need to send to every peer. Protection defaults to false so archived inputs retain their behavior. The announce/request and unlimited push rows are unaffected.
 
 Under the stated load, unrestricted push retains availability and saves about half a second with either committee when votes are marked seen on arrival. Its traffic cost depends on the assumed control-message sizes, and the bounded-fanout outcome depends on which connections are protected. The follow-up tests both assumptions in one reference scenario. Neither study predicts the Haskell node's exact performance.
 

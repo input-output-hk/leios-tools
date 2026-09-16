@@ -810,13 +810,13 @@
       "description": "Only supported by Haskell simulation."
     },
     "vote-announcement-size-bytes": {
-      "description": "Linear vote-bundle announcement size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies.",
+      "description": "Linear vote-bundle announcement size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies. Only announce-then-request sends these messages; a nondefault size on a push transport warns and has no effect.",
       "type": "integer",
       "minimum": 1,
       "default": 8
     },
     "vote-request-size-bytes": {
-      "description": "Linear vote-bundle request size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies.",
+      "description": "Linear vote-bundle request size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies. Only announce-then-request sends these messages; a nondefault size on a push transport warns and has no effect.",
       "type": "integer",
       "minimum": 1,
       "default": 8

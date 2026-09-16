@@ -1392,7 +1392,9 @@ impl ObsoleteVoteStats {
 ///
 /// The bodies are the `Vote` counts in `MessageStats`; these are the bytes
 /// behind them, plus the announcement and request messages that the Vote
-/// mini-protocol charges 8 bytes each for and that no counter used to see.
+/// mini-protocol charges `vote-announcement-size-bytes` and
+/// `vote-request-size-bytes` for, 8 bytes each by default, and that no counter
+/// used to see.
 /// Leaving them out flattered `announce-then-request`, which sends an
 /// announcement per link and a request per body on top of the bodies
 /// themselves, and so sends the most messages of any arm while appearing to

@@ -2,7 +2,7 @@
 
 This pilot revisits two assumptions in the [108-run study](../vote-diffusion-results-20260910/README.md): whether bounded fanout should protect BP connections, and how pull changes when announcements and requests exceed the original 8-byte assumption. It adds per-node traffic for every case.
 
-The matrix has ten completed 400-slot runs at 1500 nodes, using top-stake-seats and seed 0. The 458 BPs carry the voting stake; 1042 relays carry no stake. The topology and load match the original seed-0 reference cases. This is one seed and one committee, so it does not repeat the everyone-votes CPU stress test or establish a generally safe fanout.
+The matrix has ten completed 400-slot runs at 1500 nodes, using top-stake-seats and seed 0. Every push case uses `push`, which marks a vote seen on arrival. `push-late-dedupe`, which marks it seen only after verification and is the order the inspected Haskell prototype uses, is not in this matrix. The 458 BPs carry the voting stake; 1042 relays carry no stake. The topology and load match the original seed-0 reference cases. This is one seed and one committee, so it does not repeat the everyone-votes CPU stress test or establish a generally safe fanout.
 
 ## Findings
 
@@ -14,7 +14,7 @@ The matrix has ten completed 400-slot runs at 1500 nodes, using top-stake-seats 
 | 16 | 0/26 → 20/26 | 1 → 8 | 14.194 | 14.375 | 3.338 |
 | 8 | 0/26 → 20/26 | 0 → 8 | 7.097 | 7.380 | 3.345 |
 
-Unrestricted push sends **32.684 GB** with a **3.334s** Q95 mean. Protected cap 8 sends **7.380 GB**, a **77.4% reduction**, with a **3.345s** mean (0.011s later). All protected cases deliver every generated bundle to at least 95% of nodes. That does not mean every node received every vote. These findings apply to this seed, topology and duplicate-handling order.
+Unrestricted push sends **32.684 GB** with a **3.334s** Q95 mean. Protected cap 8 sends **7.380 GB**, a **77.4% reduction**, with a **3.345s** mean (0.011s later). All protected cases deliver every generated bundle to at least 95% of nodes. That does not mean every node received every vote. These findings apply to this seed, topology and to `push`. BP protection is untested with `push-late-dedupe`, which the 108-run study found changes endorsement counts under load.
 
 **The bandwidth ratio depends strongly on control-message size.** The following rows are actual simulations. The push references send no control messages and are reused across the three pull sizes.
 
@@ -49,7 +49,7 @@ Announcement and request sizes are independently configurable. The tested pairs 
 
 The same unrestricted-push run is the reference for all three pull cases. Push sends no vote announcements or requests, so those settings do not change its traffic. Pull uses request-from-first. The reported aggregate totals count sends once; adding receives would count delivered bytes a second time.
 
-The runs keep existing transport behavior for obsolete votes. Obsolete work remains included in the total and is also reported separately. This pilot cannot quantify obsolete work in the heavier everyone-votes or verification-before-deduplication cases.
+The runs keep existing transport behavior for obsolete votes. Obsolete work remains included in the total and is also reported separately. This pilot cannot quantify obsolete work in the heavier everyone-votes case, or under `push-late-dedupe`, which verifies a copy before recording the vote as seen.
 
 ## Reading the tables
 

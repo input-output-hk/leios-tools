@@ -171,6 +171,12 @@ tx-size-bytes-distribution: {distribution: constant, value: 1500}
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('producer protection has no effect without a vote-push-fanout cap', result.stdout)
 
+    def test_push_control_sizes_warn_without_rejecting(self):
+        (self.root / 'push-sizes.yaml').write_text('vote-transport: push\nvote-announcement-size-bytes: 40\nvote-request-size-bytes: 64\n')
+        result = self.run_cli('-p', 'push-sizes.yaml', slots=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('vote announcement/request sizes have no effect with', result.stdout)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

@@ -311,6 +311,8 @@ vote-transport: "announce-then-request"
 # Linear vote control messages: identifier plus application framing, without
 # TCP/IP. These sizes affect link transmission time and reported bytes. The
 # 8-byte defaults preserve historical studies, not a concrete wire encoding.
+# Only announce-then-request sends these messages; a nondefault size on a push
+# transport is accepted with a warning and changes nothing.
 vote-announcement-size-bytes: 8
 vote-request-size-bytes: 8
 

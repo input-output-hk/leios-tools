@@ -344,6 +344,8 @@ pub struct RawParameters {
     pub vote_transport: VoteTransport,
     /// Linear vote-bundle announcements and requests, including identifier and
     /// application framing, excluding TCP/IP. Legacy studies use 8 bytes each.
+    /// Only `announce-then-request` sends these messages, so a nondefault size
+    /// on a push transport is accepted with a warning and changes nothing.
     #[serde(default = "default_vote_control_size_bytes")]
     pub vote_announcement_size_bytes: u64,
     #[serde(default = "default_vote_control_size_bytes")]
@@ -1843,6 +1845,17 @@ impl SimConfiguration {
         {
             bail!(
                 "configurable vote announcement/request sizes support the linear Leios variants only"
+            );
+        }
+        if (params.vote_announcement_size_bytes != 8 || params.vote_request_size_bytes != 8)
+            && params.vote_transport.is_push()
+        {
+            // Push sends bodies without announcing them, so these sizes reach
+            // no message. Rejecting them would refuse a size sweep that keeps
+            // one overlay per size across both transports, so say so instead.
+            warn!(
+                "vote announcement/request sizes have no effect with {:?}, which sends bodies without announcing or requesting them",
+                params.vote_transport
             );
         }
         // A knob that is silently ignored is worse than one that is

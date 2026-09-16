@@ -139,7 +139,7 @@ justifies it, especially before making a behavior change or new effect-size clai
 ## Validation
 
 The implementation passes 168 Rust tests (one ignored), 17 runner/extractor
-tests, four traffic-summary tests and nine real CLI tests. The checks cover
+tests, four traffic-summary tests and ten real CLI tests. The checks cover
 stake quorum, timing gates, duplicate and obsolete processing, exact archived
 result extraction, message-size transmission/accounting, output aliases,
 cancellation, capture completion and retry. The original 108 numeric results
@@ -374,7 +374,9 @@ the identifier and application framing and exclude TCP/IP. They are carried by
 the messages through the network scheduler and arrival accounting, so changing
 them changes transmission time as well as the reported bytes. Other protocol
 messages keep their existing sizes. Nondefault sizes on unsupported Leios
-variants and zero sizes are rejected.
+variants and zero sizes are rejected. Only `announce-then-request` sends
+these messages, so a nondefault size on a push transport is accepted with a
+warning and changes nothing.
 
 The generic runner exposes these as `VOTE_STUDY_ANNOUNCEMENT_BYTES` and
 `VOTE_STUDY_REQUEST_BYTES`. Every run name, overlay, runs.csv row and extraction
@@ -382,10 +384,11 @@ key records both sizes; paired comparisons use a matching control-size baseline.
 Old CSVs are interpreted with the historical 8/8 defaults.
 
 The focused runner freezes ten cases per seed into one matrix and runs them with
-one checked executable: push at fanout 22/16/8 with and without BP protection,
-unlimited push, and announce/request at 8/8, 40/40 and 64/64 bytes. Sizes above 8
-are sensitivity assumptions, not verified encodings. Its scope is 1500 nodes
-and stake-weighted voting; it does not repeat the everyone-votes stress test.
+one checked executable: `push` at fanout 22/16/8 with and without BP protection,
+unlimited `push`, and announce/request at 8/8, 40/40 and 64/64 bytes. Sizes above 8
+are sensitivity assumptions, not verified encodings. Its scope is 1500 nodes,
+stake-weighted voting and votes marked seen on arrival; it repeats neither the
+everyone-votes stress test nor `push-late-dedupe`.
 
 ```sh
 # First extract study-config.yaml from the original input archive.

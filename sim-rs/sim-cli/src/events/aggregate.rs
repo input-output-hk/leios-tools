@@ -396,9 +396,9 @@ enum MessageKind {
     IB,
     EB,
     Votes,
-    /// Announcements and requests on the vote mini-protocol: 8 bytes each,
-    /// no body.  Separate from `Votes` so the body counts keep meaning what
-    /// they always meant.
+    /// Announcements and requests on the vote mini-protocol: their configured
+    /// sizes, 8 bytes each by default, and no body.  Separate from `Votes` so
+    /// the body counts keep meaning what they always meant.
     VoteControl,
     PB,
 }
