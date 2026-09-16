@@ -6,8 +6,8 @@
 //! Wire shapes (confirmed against real musashi blocks/headers):
 //!   - ChainSync header:  `[era_header, #6.24([header_body, body_signature])]`
 //!   - BlockFetch block:  `#6.24([era_block, [header, block_body]])`
-//!   - `block_body = [invalid_transactions/nil, transactions,
-//!                    leios_certificate/nil, peras_certificate/nil]`
+//!   - `block_body = [transactions, leios_certificate/nil,
+//!                    peras_certificate/nil]`  (3 fields, w36+)
 //!   - `header_body` is the fixed 12-field Dijkstra array (10 base fields +
 //!     `leios_certified: bool` + `leios_announcement: [hash32,uint]/nil`).
 //!
@@ -105,28 +105,39 @@ impl HeaderBody {
     }
 }
 
-/// Encode the era-8 `block_body = [invalid_transactions/nil, transactions,
-/// leios_certificate/nil, peras_certificate/nil]`.
+/// Encode the era-8 `block_body = [transactions, leios_certificate/nil,
+/// peras_certificate/nil]`.
 ///
-/// `transactions` are already-encoded `transaction` items (each
-/// `[transaction_body, witness_set, auxiliary_data/nil]`), appended verbatim;
+/// `transactions` are already-encoded `transaction` items, appended verbatim;
 /// pass an empty slice for an honest empty body. `leios_cert` is the 2-tuple
 /// `[signers, aggregated_signature]` CBOR when certifying, else `None`.
-/// `invalid_transactions` and `peras_certificate` are always nil here.
+/// `peras_certificate` is always nil here.
+///
+/// THREE fields, not four. Verified against 161 real w36 blocks pulled from the
+/// proto-devnet nodes' VolatileDB: every one decodes as `[list, nil, nil]`.
+/// There is no leading `invalid_transactions` slot — the era-8 restructure moved
+/// per-transaction validity into the `transaction` item itself, which is now the
+/// 4-tuple `[transaction_body, witness_set, auxiliary_data/nil, is_valid]`.
+///
+/// Emitting the old 4-field body (a leading `nil` where the node expects the
+/// transaction list) is not a soft mismatch: cardano-node's BlockFetch decoder
+/// aborts the whole connection with
+/// `DeserialiseFailure <offset> "expected list len or indef"`, so our blocks
+/// never diffuse and any EB they announce is never certified.
 pub fn encode_block_body(transactions: &[&[u8]], leios_cert: Option<&[u8]>) -> Vec<u8> {
     let mut buf = Vec::new();
-    let _ = Encoder::new(&mut buf).array(4).and_then(|e| e.null()); // [0] invalid_transactions = nil
-    let _ = Encoder::new(&mut buf).array(transactions.len() as u64); // [1] transactions
+    let _ = Encoder::new(&mut buf).array(3); // 3-field block_body
+    let _ = Encoder::new(&mut buf).array(transactions.len() as u64); // [0] transactions
     for tx in transactions {
         buf.extend_from_slice(tx);
     }
     match leios_cert {
-        Some(c) => buf.extend_from_slice(c), // [2] leios_certificate (verbatim)
+        Some(c) => buf.extend_from_slice(c), // [1] leios_certificate (verbatim)
         None => {
             let _ = Encoder::new(&mut buf).null();
         }
     }
-    let _ = Encoder::new(&mut buf).null(); // [3] peras_certificate = nil
+    let _ = Encoder::new(&mut buf).null(); // [2] peras_certificate = nil
     buf
 }
 
@@ -196,19 +207,29 @@ mod tests {
     }
 
     #[test]
-    fn empty_block_body_matches_musashi_shape_and_hash() {
-        // Honest empty body: [nil, [], nil, nil] = 84 f6 80 f6 f6 — byte-identical
-        // to a real empty musashi body; hash = the chain's known value.
+    fn empty_block_body_matches_w36_shape_and_hash() {
+        // Honest empty body: [[], nil, nil] = 83 80 f6 f6.
+        //
+        // Both vectors are lifted from real w36 blocks, not assumed: every one
+        // of the 61 blocks in a proto-devnet node's VolatileDB satisfies
+        // `blake2b256(block_body_bytes) == header_body[7]` and
+        // `len(block_body_bytes) == header_body[6]`, and the empty ones are
+        // byte-identical to this.
+        //
+        // The previous vector here (`84 f6 80 f6 f6`, hash 22e62b67…) was the
+        // pre-w36 4-field body. It was captured from musashi before the
+        // 2026-09-07 respin put that chain on w36 too, so it no longer
+        // describes any live chain.
         let body = encode_block_body(&[], None);
-        assert_eq!(body, [0x84, 0xf6, 0x80, 0xf6, 0xf6]);
+        assert_eq!(body, [0x83, 0x80, 0xf6, 0xf6]);
         assert_eq!(
             hex::encode(blake2b_256(&body)),
-            "22e62b6763c4774ba8367e1d792ebafd4b4f06e2c2893db35154e6f5f2ee12fe"
+            "c93a1b1497883589d7ec8abb158c9b66c311ac8d45be74610bf889443daec967"
         );
     }
 
     #[test]
-    fn block_body_places_cert_at_index_2() {
+    fn block_body_places_cert_at_index_1() {
         let cert = {
             let mut c = Vec::new();
             let _ = Encoder::new(&mut c)
@@ -218,13 +239,12 @@ mod tests {
             c
         };
         let body = encode_block_body(&[], Some(&cert));
-        // Decode: [nil, [], cert, nil]
+        // Decode: [[], cert, nil]
         let mut d = minicbor::Decoder::new(&body);
-        assert_eq!(d.array().unwrap(), Some(4));
-        d.skip().unwrap(); // [0] nil
-        d.skip().unwrap(); // [1] []
+        assert_eq!(d.array().unwrap(), Some(3));
+        d.skip().unwrap(); // [0] transactions
         let cert_start = d.position();
-        d.skip().unwrap(); // [2] cert
+        d.skip().unwrap(); // [1] leios_certificate
         assert_eq!(&body[cert_start..d.position()], cert.as_slice());
     }
 
