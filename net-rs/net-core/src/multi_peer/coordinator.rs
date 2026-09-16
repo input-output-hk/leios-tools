@@ -93,6 +93,7 @@ use crate::bearer::tcp::TcpBearer;
 use crate::mux::MuxConfig;
 use crate::protocols::peersharing::PeerAddress;
 use crate::types::{Point, Tip, Vote};
+use net_codec::blake2b_256;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -813,11 +814,40 @@ impl Coordinator {
             }
 
             PeerEvent::LeiosBlockFetched { point, block } => {
-                // Pending-fetch dedup lives in shared-consensus's CandidateTracker now;
-                // the consensus layer clears the entry on `on_eb_received`.
-                // Populate leios store for responder peers.
-                if let Some(ref store) = self.leios_store {
-                    store.inject_block(point.clone(), block.clone(), Some(peer_id));
+                // Content-address gate on the relay path. An EB is identified by
+                // `blake2b_256` of its manifest bytes (net_codec::encode_overflow_eb),
+                // and that hash is what the fetch point commits to. A fetched body
+                // that does NOT hash to `point.hash` is not this EB — it is an
+                // incomplete/stale response (observed on musashi: an upstream serving
+                // an empty `a0` manifest before it had assembled the real one). We
+                // must not re-serve it: `inject_block` caches the body AND enqueues a
+                // `BlockOffer`, so a downstream Haskell peer would fetch the stub
+                // back, recompute the committed EB size, and tear down the whole mux
+                // on the `MsgLeiosBlock size mismatch` — the churn that kept
+                // `consumers` at 0 and blocked diffusion. So skip caching/offering
+                // the mismatched body; we still emit `LeiosBlockReceived` so the
+                // consensus fetch layer clears its in-flight entry and re-fetches,
+                // and the real body arrives on a later, matching call. Self-produced
+                // EBs never take this path (they enter via `InjectLeiosBlock`,
+                // source=None), so adversarial declared-size lies are unaffected.
+                let body_ok = match &point {
+                    Point::Specific { hash, .. } => &blake2b_256(&block) == hash,
+                    Point::Origin => false,
+                };
+                if body_ok {
+                    // Populate leios store for responder peers.
+                    if let Some(ref store) = self.leios_store {
+                        store.inject_block(point.clone(), block.clone(), Some(peer_id));
+                    }
+                } else {
+                    tracing::warn!(
+                        peer = peer_id.0,
+                        %point,
+                        body_bytes = block.len(),
+                        cbor_prefix = %block.iter().take(4).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
+                        "leios_fetch: fetched EB body hash != committed point hash \
+                         (incomplete/stale); not caching or re-offering — will re-fetch"
+                    );
                 }
                 self.emit_event(NetworkEvent::LeiosBlockReceived {
                     source: Some(peer_id),
@@ -3880,6 +3910,87 @@ mod tests {
             }
             other => panic!("expected LeiosBlockTxsReceived, got {other:?}"),
         }
+    }
+
+    /// Content-address gate on the relay path (regression for the musashi EB
+    /// churn): a fetched EB body that hashes to its committed point is cached
+    /// and offerable; one that does NOT — an incomplete/stale `a0` stub served
+    /// by an upstream before it had the real manifest — is dropped, so we never
+    /// re-offer/serve it to a downstream Haskell peer (which recomputes the EB
+    /// size and tears the whole mux down on the mismatch). Either way the app
+    /// still receives `LeiosBlockReceived`, so the fetch layer clears in-flight
+    /// and re-fetches until the real body arrives.
+    #[tokio::test]
+    async fn fetched_eb_body_gated_on_content_hash() {
+        let (peer_event_sender, peer_event_receiver) = mpsc::channel(256);
+        let (net_event_sender, mut net_event_receiver) = mpsc::channel(NETWORK_EVENTS_CAPACITY);
+        let (_net_cmd_sender, net_cmd_receiver) = mpsc::channel(64);
+        let (chain_store, _chain_rx) = ChainStore::new(100);
+        let (leios_store, _leios_rx) = LeiosStore::new(100);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_event_sender,
+            peer_event_receiver,
+            net_event_sender,
+            net_cmd_receiver,
+            chain_store,
+            Some(leios_store.clone()),
+        );
+
+        // (1) Content-valid body: the point commits to blake2b_256(body), so it
+        //     must be cached and servable.
+        let good_body = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let good_hash = blake2b_256(&good_body);
+        coordinator
+            .handle_peer_event(
+                PeerId(1),
+                PeerEvent::LeiosBlockFetched {
+                    point: Point::Specific {
+                        slot: 10,
+                        hash: good_hash,
+                    },
+                    block: good_body.clone(),
+                },
+            )
+            .await;
+        assert_eq!(
+            leios_store.get_block(10, &good_hash).as_deref(),
+            Some(good_body.as_slice()),
+            "a content-valid fetched EB body must be cached"
+        );
+
+        // (2) Incomplete `a0` stub under a non-matching hash: must be dropped,
+        //     never cached (so it is never re-offered or served downstream).
+        let stub = vec![0xA0u8]; // empty-map CBOR — the observed incomplete response
+        let claimed_hash = [0x99u8; 32]; // != blake2b_256(stub)
+        coordinator
+            .handle_peer_event(
+                PeerId(1),
+                PeerEvent::LeiosBlockFetched {
+                    point: Point::Specific {
+                        slot: 11,
+                        hash: claimed_hash,
+                    },
+                    block: stub,
+                },
+            )
+            .await;
+        assert!(
+            leios_store.get_block(11, &claimed_hash).is_none(),
+            "a hash-mismatched (incomplete) fetched EB body must be dropped, not cached"
+        );
+
+        // Both fetches still surface to the app so the fetch layer can retry.
+        let mut received = 0;
+        while let Ok(ev) = net_event_receiver.try_recv() {
+            if matches!(ev, NetworkEvent::LeiosBlockReceived { .. }) {
+                received += 1;
+            }
+        }
+        assert_eq!(
+            received, 2,
+            "both fetches must emit LeiosBlockReceived so the retry path stays intact"
+        );
     }
 
     /// When the manifest hasn't been recorded yet (race-free in
