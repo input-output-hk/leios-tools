@@ -164,6 +164,14 @@ pub struct LeiosControl {
     /// the real-EB actuator, which buffers each EB's own real tx closure.
     /// Default `0`.
     pub eb_burst_n_txs: u32,
+    /// fetch-flood (T22): re-request every announced EB over LeiosFetch this
+    /// many times per second (per in-window EB), fanned to all upstreams.
+    /// `0` keeps `ControlSignal::default()` honest (no flood).
+    pub fetch_flood_rate: u32,
+    /// fetch-flood (T22): keep re-requesting an EB for this many slots after its
+    /// announcement, even once its body is held. Only meaningful with
+    /// `fetch_flood_rate > 0`. Default `0`.
+    pub fetch_flood_window_slots: u64,
 }
 
 /// Mempool-domain actuator inputs.
