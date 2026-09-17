@@ -56,6 +56,18 @@ use crate::store::leios_store::LeiosStore;
 /// substitute a different header for this `peer` (peer-split equivocation via
 /// `EquivocateRouting` + the shared variant store) or suppress the send
 /// (`DropTo` partition / eclipse mute).
+/// How long a downstream `MsgFindIntersect` may be parked while our store is
+/// still empty at boot (see the park in [`serve_chainsync`]).
+///
+/// MUST stay comfortably under the counterparty's ChainSync intersect time
+/// limit, which cardano-node enforces at ~10s — measured on the w36
+/// proto-devnet, where an unbounded park produced
+/// `ExceededTimeLimit (ChainSync … ServerHasAgency (SingIntersect))` with
+/// `PeerHotDuration` of 10.005s / 10.007s / 10.021s, then `MuxErrored` and a
+/// demotion to cold. Parking past that deadline cannot help: it loses the
+/// connection instead of merely giving an unhelpful answer.
+const PARK_UNSEEDED_INTERSECT_MAX: std::time::Duration = std::time::Duration::from_secs(7);
+
 pub async fn serve_chainsync(
     cs_send: CodecSend,
     cs_recv: CodecRecv,
@@ -114,14 +126,41 @@ pub async fn serve_chainsync(
                 if !store.is_seeded() {
                     tracing::info!(
                         peer = peer.0,
+                        park_max_ms = PARK_UNSEEDED_INTERSECT_MAX.as_millis(),
                         "chainsync: store not seeded yet (syncing to tip); parking downstream intersect until we hold a chain"
                     );
-                    while !store.is_seeded() {
-                        if subscription.changed().await.is_err() {
-                            return;
+                    let wait_for_seed = async {
+                        while !store.is_seeded() {
+                            if subscription.changed().await.is_err() {
+                                return false; // store dropped
+                            }
+                        }
+                        true
+                    };
+                    match tokio::time::timeout(PARK_UNSEEDED_INTERSECT_MAX, wait_for_seed).await {
+                        Ok(true) => {
+                            tracing::info!(
+                                peer = peer.0,
+                                "chainsync: store seeded; answering parked intersect"
+                            );
+                        }
+                        Ok(false) => return,
+                        Err(_) => {
+                            // Deadline hit. Answering from an unseeded store
+                            // means IntersectNotFound with tip=Genesis, which a
+                            // downstream at a real tip rejects — but parking on
+                            // past the counterparty's own intersect timeout is
+                            // strictly worse: it tears the whole connection down
+                            // and demotes us to cold anyway, and costs a
+                            // reconnect cycle on top. Answer and let the peer
+                            // decide.
+                            tracing::warn!(
+                                peer = peer.0,
+                                park_max_ms = PARK_UNSEEDED_INTERSECT_MAX.as_millis(),
+                                "chainsync: still unseeded at the park deadline; answering anyway rather than letting the peer's intersect timeout kill the connection"
+                            );
                         }
                     }
-                    tracing::info!(peer = peer.0, "chainsync: store seeded; answering parked intersect");
                 }
                 match store.find_intersection(&points) {
                     Some((point, tip)) => {
@@ -1471,6 +1510,75 @@ mod tests {
             .expect("client task join");
         let (point, _tip) = result.unwrap().unwrap();
         assert_eq!(point, make_point(5), "must intersect at the shared point, not Origin");
+
+        server_handle.abort();
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    // `start_paused` so the deadline is exercised without spending it: tokio
+    // auto-advances the clock whenever every task is idle, which is exactly the
+    // state a parked intersect is in.
+    #[tokio::test(start_paused = true)]
+    async fn chainsync_server_stops_parking_intersect_at_the_deadline() {
+        // Companion to the test above. Parking is right, parking FOREVER is not:
+        // cardano-node enforces its own ChainSync intersect time limit at ~10s,
+        // so an unbounded park guarantees
+        // `ExceededTimeLimit (… SingIntersect)` -> MuxErrored -> demotion to
+        // cold, plus a reconnect cycle. Observed on the w36 proto-devnet: a
+        // net-rs restart into a hot cluster churned 12+ inbound peers and never
+        // recovered, because each new peer parked and was killed in turn.
+        //
+        // So the park must have a deadline of its own, and on expiry answer
+        // (IntersectNotFound with our empty tip) rather than lose the peer.
+        let cs_proto = ProtocolConfig {
+            id: chainsync::PROTOCOL_ID,
+            traffic_class: TrafficClass::Priority,
+            ingress_limit: chainsync::INGRESS_LIMIT,
+            egress_queue_size: 16,
+        };
+        let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&cs_proto);
+
+        // Empty store, anchored above genesis, and NEVER seeded.
+        let (store, _rx) = ChainStore::new(100);
+        store.set_anchored_above_genesis(true);
+        assert!(!store.is_seeded(), "empty anchored store is not seeded");
+
+        let server_handle = tokio::spawn(serve_chainsync(
+            server_send,
+            server_recv,
+            store.clone(),
+            PeerId(0),
+            None,
+            crate::peer::new_downstream_flag(),
+        ));
+
+        let client_task = tokio::spawn(async move {
+            let mut client = Runner::<ChainSync>::new(Role::Client, client_send, client_recv);
+            chainsync::find_intersection(&mut client, vec![make_point(5), Point::Origin]).await
+        });
+
+        // Still parked well before the deadline.
+        tokio::time::sleep(PARK_UNSEEDED_INTERSECT_MAX / 2).await;
+        assert!(
+            !client_task.is_finished(),
+            "must still be parked before the deadline"
+        );
+
+        // Past the deadline the server answers from the unseeded store instead
+        // of holding the connection open until the peer kills it.
+        let answered = tokio::time::timeout(
+            PARK_UNSEEDED_INTERSECT_MAX * 2,
+            client_task,
+        )
+        .await
+        .expect("park must expire and answer, not hang until the peer times out")
+        .expect("client task join");
+        assert!(
+            answered.is_ok(),
+            "the expired park must still produce a well-formed ChainSync reply"
+        );
 
         server_handle.abort();
         mux_a.abort();

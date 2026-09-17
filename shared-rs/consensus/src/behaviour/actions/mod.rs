@@ -28,7 +28,9 @@ pub mod rb_equivocator;
 pub mod t22;
 pub mod withhold_txs;
 pub mod tx_flood;
+pub mod vote_flood;
 pub mod withhold_eb_announce;
+pub mod eb_burst;
 
 pub use announce_dangling::AnnounceDangling;
 pub use announce_equivocate::AnnounceEquivocate;
@@ -47,4 +49,6 @@ pub use rb_equivocator::{equivocation_bucket, RbHeaderEquivocator};
 pub use t22::T22;
 pub use withhold_txs::WithholdTxs;
 pub use tx_flood::TxFlood;
+pub use vote_flood::VoteFlood;
 pub use withhold_eb_announce::WithholdEbAnnounce;
+pub use eb_burst::EbBurst;

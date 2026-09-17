@@ -121,6 +121,25 @@ pub enum ActionSpec {
         #[serde(default)]
         slot_offset: i64,
     },
+    /// vote-flood — emit `count` votes over fabricated distinct RB hashes per
+    /// tick, bypassing the election gate (unbounded seenVotes/pointStates probe).
+    #[serde(rename = "vote-flood")]
+    VoteFlood {
+        #[serde(default = "default_flood_count")]
+        count: u32,
+    },
+    /// eb-burst (T23) — withhold `count` REAL, self-produced EBs, then release
+    /// the whole batch in one tick. (`withhold_slots`/`n_txs` are legacy spec
+    /// fields, unused by the real-EB actuator.)
+    #[serde(rename = "eb-burst")]
+    EbBurst {
+        #[serde(default = "default_withhold_slots")]
+        withhold_slots: u32,
+        #[serde(default = "default_flood_count")]
+        count: u32,
+        #[serde(default = "default_fake_eb_txs")]
+        n_txs: u32,
+    },
     #[serde(rename = "withhold-eb-block-announce")]
     WithholdEbAnnounce,
     /// Flood the local tx generator at `rate` txs/sec (garbage or magazine).
@@ -128,6 +147,11 @@ pub enum ActionSpec {
     TxFlood {
         #[serde(default = "default_tx_flood_rate")]
         rate: u32,
+        /// Optional coordinated fire slot: hold replay until this slot, then
+        /// burst. `None` (default) fires immediately at `rate`. Set live via
+        /// `set_param fire_at_slot` for a shoal volley (#1068).
+        #[serde(default)]
+        fire_at_slot: Option<u64>,
     },
 }
 
@@ -149,6 +173,10 @@ fn default_tx_flood_rate() -> u32 {
 
 fn default_flood_count() -> u32 {
     100
+}
+
+fn default_withhold_slots() -> u32 {
+    20
 }
 
 fn default_lazy_reason() -> NoVoteReason {

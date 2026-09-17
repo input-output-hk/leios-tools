@@ -152,6 +152,24 @@ pub struct LeiosControl {
     /// the absent junk-detection + ≤ 2-per-election server discipline. Default
     /// `0` keeps `ControlSignal::default()` honest.
     pub announce_flood_count: u32,
+    /// vote-flood: emit this many votes over fabricated, distinct announcing-RB
+    /// hashes per tick, bypassing the honest election gate (voting needs no
+    /// stake — only a committee seat + BLS key). Probes unbounded
+    /// `seenVotes`/`pointStates` growth on receivers. `0` keeps
+    /// `ControlSignal::default()` honest.
+    pub vote_flood_count: u32,
+    /// eb-burst (T23): legacy spec field (accumulation window in slots); unused
+    /// by the real-EB actuator, which releases once `eb_burst_count` EBs are
+    /// buffered. Default `0`.
+    pub eb_burst_withhold_slots: u32,
+    /// eb-burst (T23): number of REAL, self-produced EBs to withhold + buffer
+    /// during the accumulation phase and release together in one tick. `0` keeps
+    /// `ControlSignal::default()` honest (no burst).
+    pub eb_burst_count: u32,
+    /// eb-burst (T23): legacy spec field (fabricated tx-closure size); unused by
+    /// the real-EB actuator, which buffers each EB's own real tx closure.
+    /// Default `0`.
+    pub eb_burst_n_txs: u32,
 }
 
 /// Mempool-domain actuator inputs.
@@ -161,12 +179,17 @@ pub struct MempoolControl {
     pub tx_filter: TxFilterPolicy,
     pub tx_withholding_filter: TxWithholdingPolicy,
     /// `tx-flood` action: drive the local tx generator at this rate (txs/sec;
-    /// `0` = honest, no override). The net-node actuator applies it to the tx
+    /// `0` = honest, no override). The I/O wrapper applies it to the tx
     /// generator so the node injects far faster than the network drains,
     /// overflowing the mempool (evict-oldest) to displace honest txs. Integer
     /// to keep the control signal `Eq`; fractional precision is irrelevant for
     /// a flood.
     pub tx_flood_rate: u32,
+    /// `tx-flood` action, optional: slot at which the tx generator may begin
+    /// firing (a coordinated "fire at slot X" gate). `None` = fire immediately
+    /// at `tx_flood_rate`. The I/O wrapper forwards it to the generator's
+    /// `fire_at_slot`, which holds replay until `current_slot() >= X`.
+    pub fire_at_slot: Option<u64>,
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.
@@ -281,6 +304,8 @@ mod tests {
         assert_eq!(d.mempool.tx_filter, TxFilterPolicy::None);
         // tx-flood must default off, or the honest node would flood.
         assert_eq!(d.mempool.tx_flood_rate, 0);
+        // no coordinated fire-slot gate by default.
+        assert_eq!(d.mempool.fire_at_slot, None);
     }
 
     #[test]
