@@ -830,24 +830,35 @@ impl Coordinator {
                 // and the real body arrives on a later, matching call. Self-produced
                 // EBs never take this path (they enter via `InjectLeiosBlock`,
                 // source=None), so adversarial declared-size lies are unaffected.
-                let body_ok = match &point {
-                    Point::Specific { hash, .. } => &blake2b_256(&block) == hash,
-                    Point::Origin => false,
-                };
-                if body_ok {
-                    // Populate leios store for responder peers.
-                    if let Some(ref store) = self.leios_store {
-                        store.inject_block(point.clone(), block.clone(), Some(peer_id));
+                match &point {
+                    // Committed hash matches: this is the real EB body. Populate
+                    // the leios store for responder peers.
+                    Point::Specific { hash, .. } if blake2b_256(&block) == *hash => {
+                        if let Some(ref store) = self.leios_store {
+                            store.inject_block(point.clone(), block.clone(), Some(peer_id));
+                        }
                     }
-                } else {
-                    tracing::warn!(
-                        peer = peer_id.0,
-                        %point,
-                        body_bytes = block.len(),
-                        cbor_prefix = %block.iter().take(4).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
-                        "leios_fetch: fetched EB body hash != committed point hash \
-                         (incomplete/stale); not caching or re-offering — will re-fetch"
-                    );
+                    // Committed hash, but the body doesn't match it: an
+                    // incomplete/stale response. Do not cache or re-offer.
+                    Point::Specific { .. } => {
+                        tracing::warn!(
+                            peer = peer_id.0,
+                            %point,
+                            body_bytes = block.len(),
+                            cbor_prefix = %block.iter().take(4).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
+                            "leios_fetch: fetched EB body hash != committed point hash \
+                             (incomplete/stale); not caching or re-offering — will re-fetch"
+                        );
+                    }
+                    // Origin carries no committed hash to gate on, and an EB
+                    // fetch should never point at it. Not a hash mismatch, so
+                    // don't claim one; just don't cache.
+                    Point::Origin => {
+                        tracing::debug!(
+                            peer = peer_id.0,
+                            "leios_fetch: fetched EB body at Origin (no committed hash); not caching"
+                        );
+                    }
                 }
                 self.emit_event(NetworkEvent::LeiosBlockReceived {
                     source: Some(peer_id),
