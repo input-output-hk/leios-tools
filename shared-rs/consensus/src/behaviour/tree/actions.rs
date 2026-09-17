@@ -132,6 +132,10 @@ pub fn build_action(
             fire_at_slot: *fire_at_slot,
         }),
         ActionSpec::VoteFlood { count } => Box::new(catalogue::VoteFlood { count: *count }),
+        ActionSpec::FetchFlood { rate, window_slots } => Box::new(catalogue::FetchFlood {
+            rate: *rate,
+            window_slots: *window_slots,
+        }),
         ActionSpec::EbBurst {
             withhold_slots,
             count,

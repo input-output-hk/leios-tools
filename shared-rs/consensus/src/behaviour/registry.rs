@@ -128,6 +128,22 @@ pub enum ActionSpec {
         #[serde(default = "default_flood_count")]
         count: u32,
     },
+    /// fetch-flood (T22) — re-request every announced EB over LeiosFetch
+    /// (`MsgLeiosBlockRequest`) `rate` times per second for `window_slots`
+    /// slots after its announcement, EVEN AFTER the body is held. Each in-window
+    /// EB is flooded independently, so N EBs in the window = N x `rate` requests
+    /// per second, fanned to every connected upstream. The preliminary T22
+    /// method: overwhelm a node with repeated/known-info fetch requests so honest
+    /// requests go unanswered, delaying EB propagation (see threats/t22).
+    #[serde(rename = "fetch-flood")]
+    FetchFlood {
+        /// LeiosFetch requests per second, PER in-window announced EB.
+        #[serde(default = "default_fetch_flood_rate")]
+        rate: u32,
+        /// Slots after an EB's announcement to keep re-requesting it.
+        #[serde(default = "default_fetch_flood_window_slots")]
+        window_slots: u64,
+    },
     /// eb-burst (T23) — withhold `count` REAL, self-produced EBs, then release
     /// the whole batch in one tick. (`withhold_slots`/`n_txs` are legacy spec
     /// fields, unused by the real-EB actuator.)
@@ -169,6 +185,14 @@ fn default_hollow_bytes() -> u64 {
 
 fn default_tx_flood_rate() -> u32 {
     1000
+}
+
+fn default_fetch_flood_rate() -> u32 {
+    2
+}
+
+fn default_fetch_flood_window_slots() -> u64 {
+    80
 }
 
 fn default_flood_count() -> u32 {
@@ -218,6 +242,22 @@ pub fn seed_from_node_id(node_id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_flood_parses_from_generated_spec() {
+        // Locks the .bt-generated spec (kind = "fetch-flood", rate, window_slots)
+        // to ActionSpec::FetchFlood so serde drift is caught in CI, not at runtime.
+        let spec: ActionSpec =
+            toml::from_str(r#"kind = "fetch-flood"
+rate = 2
+window_slots = 80"#)
+            .unwrap();
+        assert_eq!(spec, ActionSpec::FetchFlood { rate: 2, window_slots: 80 });
+
+        // Defaults apply when the params are omitted (rate 2, window 80).
+        let bare: ActionSpec = toml::from_str(r#"kind = "fetch-flood""#).unwrap();
+        assert_eq!(bare, ActionSpec::FetchFlood { rate: 2, window_slots: 80 });
+    }
 
     #[test]
     fn action_spec_round_trips() {
