@@ -51,6 +51,17 @@ impl TraceAggregator {
     }
 
     pub fn process(&mut self, event: OutputEvent) -> Option<AggregatedData> {
+        if let Some(message) = super::vote_accounting::message(&event.message) {
+            let kind = match message.kind {
+                super::vote_accounting::VoteMessageKind::Body => MessageKind::Votes,
+                _ => MessageKind::VoteControl,
+            };
+            if message.receiving {
+                self.track_wire_received(kind, message.node.clone(), message.bytes);
+            } else {
+                self.track_wire_sent(kind, message.node.clone(), message.bytes);
+            }
+        }
         match event.message {
             Event::TXGenerated {
                 id,
@@ -174,11 +185,28 @@ impl TraceAggregator {
             } => {
                 self.track_data_generated(MessageId::Votes(id), producer, size_bytes);
             }
-            Event::VTBundleSent { id, sender, .. } => {
-                self.track_data_sent(MessageId::Votes(id), sender);
+            Event::VTBundleDuplicate {
+                recipient,
+                msg_size_bytes,
+                ..
+            } => {
+                // Every arrival, redundant or not, already went through
+                // `VTBundleReceived`, so this is recorded as its own figure
+                // rather than added to the received totals: `redundant` is
+                // the share of `received` the recipient did not need, and
+                // the two must not be summed.  Without it the aggregate
+                // stream cannot tell the push arms from the announce arm,
+                // since what separates them is precisely the copies.
+                self.track_redundant(MessageKind::Votes, recipient, msg_size_bytes);
             }
-            Event::VTBundleReceived { id, recipient, .. } => {
-                self.track_data_received(MessageId::Votes(id), recipient);
+            Event::EBQuorumReached { node, .. } => {
+                // Not a message, so it has no place in the byte counts: it is
+                // a per-node protocol milestone and is counted as one.  It is
+                // the other half of what tells the vote transports apart, so
+                // letting it fall through the catch-all left `-a` with no way
+                // to show any difference between them.
+                self.nodes_updated.insert(node.clone());
+                self.nodes.entry(node).or_default().quorums_reached += 1;
             }
             Event::RBGenerated {
                 id,
@@ -226,6 +254,12 @@ impl TraceAggregator {
             Event::RBReceived { id, recipient, .. } => {
                 self.track_data_received(MessageId::PB(id), recipient);
             }
+            // Everything else is either not per-node traffic (slots, CPU
+            // tasks, partitions) or is already covered by the generated /
+            // sent / received event it comes with.  Anything added to
+            // `Event` that a node spends bytes or work on belongs above,
+            // not here: an event that only falls through leaves `-a` unable
+            // to show whatever that event was added to measure.
             _ => {}
         };
         let current_chunk = (self.current_time - Timestamp::zero()).as_millis() / 250;
@@ -307,6 +341,41 @@ impl TraceAggregator {
         stats.bytes += bytes;
         node_data.bytes_received += bytes;
     }
+
+    /// An arrival the recipient did not need.  Already counted in
+    /// `received`; this is a breakdown of it, not an addition to it, so it
+    /// deliberately leaves `bytes_received` alone.
+    fn track_redundant(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
+        self.nodes_updated.insert(recipient.clone());
+        let stats = self
+            .nodes
+            .entry(recipient)
+            .or_default()
+            .redundant
+            .entry(kind)
+            .or_default();
+        stats.count += 1;
+        stats.bytes += bytes;
+    }
+
+    /// A wire message whose size is carried directly by its event.
+    fn track_wire_sent(&mut self, kind: MessageKind, sender: Node, bytes: u64) {
+        self.nodes_updated.insert(sender.clone());
+        let sender_data = self.nodes.entry(sender).or_default();
+        let sent = sender_data.sent.entry(kind).or_default();
+        sent.count += 1;
+        sent.bytes += bytes;
+        sender_data.bytes_sent += bytes;
+    }
+
+    fn track_wire_received(&mut self, kind: MessageKind, recipient: Node, bytes: u64) {
+        self.nodes_updated.insert(recipient.clone());
+        let recipient_data = self.nodes.entry(recipient).or_default();
+        let received = recipient_data.received.entry(kind).or_default();
+        received.count += 1;
+        received.bytes += bytes;
+        recipient_data.bytes_received += bytes;
+    }
 }
 
 #[derive(Serialize)]
@@ -327,6 +396,10 @@ enum MessageKind {
     IB,
     EB,
     Votes,
+    /// Announcements and requests on the vote mini-protocol: their configured
+    /// sizes, 8 bytes each by default, and no body.  Separate from `Votes` so
+    /// the body counts keep meaning what they always meant.
+    VoteControl,
     PB,
 }
 
@@ -346,6 +419,9 @@ impl MessageId {
             Self::IB(_) => MessageKind::IB,
             Self::EB(_) => MessageKind::EB,
             Self::Votes(_) => MessageKind::Votes,
+            // `MessageKind::VoteControl` has no `MessageId`: announcements
+            // and requests carry their own size, so they never go through
+            // the id-keyed `bytes` map.
             Self::PB(_) => MessageKind::PB,
         }
     }
@@ -366,6 +442,13 @@ struct NodeAggregatedData {
     generated: BTreeMap<MessageKind, u64>,
     sent: BTreeMap<MessageKind, MessageStats>,
     received: BTreeMap<MessageKind, MessageStats>,
+    /// The part of `received` that the node did not need -- a copy of
+    /// something it already held, or one it only found redundant after
+    /// verifying it.  A subset of `received`, never an addition to it.
+    redundant: BTreeMap<MessageKind, MessageStats>,
+    /// Endorser blocks whose vote tally crossed the quorum threshold at this
+    /// node.  Counted once per EB.
+    quorums_reached: u64,
 }
 
 #[derive(Serialize)]
@@ -418,4 +501,80 @@ struct InputBlock {
     pipeline: u64,
     header_bytes: u64,
     txs: Vec<Transaction>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sim_core::config::NodeId;
+    use std::sync::Arc;
+
+    #[test]
+    fn control_bytes_are_received_only_on_delivery() {
+        let sender = Node {
+            id: NodeId::new(0),
+            name: Arc::new("sender".into()),
+        };
+        let recipient = Node {
+            id: NodeId::new(1),
+            name: Arc::new("recipient".into()),
+        };
+        let id = VoteBundleId {
+            slot: 1,
+            pipeline: 0,
+            producer: sender.clone(),
+        };
+        for request in [false, true] {
+            let mut agg = TraceAggregator::new();
+            let sent = if request {
+                Event::VTBundleRequested {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            } else {
+                Event::VTBundleAnnounced {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            };
+            agg.process(OutputEvent {
+                time_s: Timestamp::zero(),
+                message: sent,
+            });
+            assert_eq!(agg.nodes[&sender].bytes_sent, 8);
+            assert!(
+                !agg.nodes.contains_key(&recipient),
+                "an undelivered or dropped message has no recipient bytes"
+            );
+            let received = if request {
+                Event::VTBundleRequestReceived {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            } else {
+                Event::VTBundleAnnouncementReceived {
+                    id: id.clone(),
+                    sender: sender.clone(),
+                    recipient: recipient.clone(),
+                    msg_size_bytes: 8,
+                }
+            };
+            agg.process(OutputEvent {
+                time_s: Timestamp::from_secs(1),
+                message: received,
+            });
+            assert_eq!(agg.nodes[&sender].bytes_sent, 8);
+            assert_eq!(agg.nodes[&recipient].bytes_received, 8);
+            assert_eq!(
+                agg.nodes[&recipient].received[&MessageKind::VoteControl].count,
+                1
+            );
+        }
+    }
 }

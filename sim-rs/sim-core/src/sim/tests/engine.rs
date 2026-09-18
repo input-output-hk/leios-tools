@@ -249,6 +249,7 @@ fn new_node_with_bandwidth(
                 (
                     n.to_string(),
                     RawLinkInfo {
+                        always_forward_votes: false,
                         latency_ms: 5.0,
                         bandwidth_bytes_per_second,
                         tcp_envelope: None,
