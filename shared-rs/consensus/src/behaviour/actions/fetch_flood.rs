@@ -1,16 +1,19 @@
-//! `fetch-flood` (T22) — re-request announced EBs over LeiosFetch, forever.
+//! `fetch-flood` (T22) — re-request recently-announced EBs over LeiosFetch.
 //!
-//! Sets `leios.fetch_flood_rate` and `leios.fetch_flood_window_slots`, so the
-//! node re-issues `MsgLeiosBlockRequest` for every EB announced in the last
-//! `window_slots` slots, `rate` times per second, to every connected upstream —
-//! **even after it already holds the body**. Each in-window EB is flooded
-//! independently, so N EBs in the window produce N × `rate` requests per second.
+//! Sets `leios.fetch_flood_rate` and `leios.fetch_flood_window_slots` on the
+//! control signal, so the consumer re-issues `MsgLeiosBlockRequest` for every EB
+//! announced within the last `window_slots` slots, `rate` times per second, to
+//! every connected upstream — **even after it already holds the body**. Each
+//! in-window EB is flooded independently, so N EBs in the window produce
+//! N × `rate` requests per second; an EB stops being re-requested once it falls
+//! out of the `window_slots` window.
 //!
 //! This is the preliminary T22 method (`threats/t22/attack-plan.md`): overwhelm
 //! a node with repeated / known-info fetch requests so honest requests are left
-//! unanswered, delaying EB propagation. The actuator lives in net-node's tick
-//! loop, which enumerates the in-window announced EBs and fans the requests out.
-//! Returns `Running` while installed.
+//! unanswered, delaying EB propagation. This action only publishes the rate and
+//! window on the control signal; the consumer's tick loop enumerates the
+//! in-window announced EBs and fans the requests out. Returns `Running` while
+//! installed.
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
