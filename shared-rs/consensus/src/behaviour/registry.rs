@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::behaviour::tree::control::Corruption;
 use crate::leios::NoVoteReason;
 
 /// Serialisable description of a behaviour-tree **leaf action** — the
@@ -91,6 +92,18 @@ pub enum ActionSpec {
     LoadedTxEb {
         #[serde(default = "default_fake_eb_txs")]
         take: u32,
+    },
+    /// Malformed EB — fabricated EB with a CBOR body corrupted at the encoding
+    /// level. `corruption` = truncate | garbage | zero-body | bad-tag;
+    /// `hash_matches` = true announces the hash of the corrupted bytes (decode-
+    /// stage reject), false announces the clean hash (content-address-gate
+    /// reject). Probes at which stage an invalid EB is discarded (T11).
+    #[serde(rename = "malformed-eb")]
+    MalformedEb {
+        #[serde(default = "default_corruption")]
+        corruption: Corruption,
+        #[serde(default = "default_true")]
+        hash_matches: bool,
     },
     #[serde(rename = "announce-size-lie")]
     AnnounceSizeLie {
@@ -181,6 +194,10 @@ fn default_true() -> bool {
 
 fn default_hollow_bytes() -> u64 {
     100_000
+}
+
+fn default_corruption() -> Corruption {
+    Corruption::Garbage
 }
 
 fn default_tx_flood_rate() -> u32 {

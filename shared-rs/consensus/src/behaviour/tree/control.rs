@@ -76,6 +76,11 @@ pub struct PraosControl {
 ///   Dummy. The payload (double-spend, theft, …) lives in the magazine bytes,
 ///   not the node code.
 ///
+/// - [`Malformed`](FakeEbKind::Malformed) — "Malformed EB": the CBOR body is
+///   corrupted at the encoding level (truncated / garbage / empty / wrong CBOR
+///   type). A `hash_matches` flag steers the reject to the content-address gate
+///   or the decoder. Probes at which stage an invalid EB is discarded (T11).
+///
 /// A further variant, "Mega Tx EB" (oversized manifest / declared size, for
 /// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
 /// in the leios-adversarial-tools repo, which houses the net-node actuation).
@@ -95,6 +100,37 @@ pub enum FakeEbKind {
     /// Dummy. Actuation reads the magazine, so the payload (double-spend,
     /// theft, …) lives in the magazine bytes, not the node code.
     Loaded { take: u32 },
+    /// Malformed EB — announce an EB whose CBOR body is corrupted at the
+    /// **encoding** level (not its tx content). `corruption` picks the defect;
+    /// `hash_matches` picks which receiver stage rejects it: `true` announces
+    /// `blake2b_256` of the corrupted bytes so the content-address gate passes
+    /// and the receiver fails at CBOR **decode** (T11 cheap-reject); `false`
+    /// announces the hash of the *clean* bytes so the receiver drops the body at
+    /// the **content-address/hash** gate before decoding. Actuation lives in
+    /// net-node. Probes at which stage an invalid EB is discarded, and the
+    /// fetch-then-reject work spent first (T11).
+    Malformed {
+        corruption: Corruption,
+        hash_matches: bool,
+    },
+}
+
+/// How a [`FakeEbKind::Malformed`] EB corrupts its CBOR body. All variants keep
+/// the tx content irrelevant — the defect is in the wire encoding itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Corruption {
+    /// Cut a valid manifest short mid-body: the map header claims N entries but
+    /// the stream ends early. Fails the CBOR decoder.
+    Truncate,
+    /// Replace the body with random bytes: not well-formed CBOR at all.
+    Garbage,
+    /// Serve a genuinely empty body (`[]`) where a manifest is expected.
+    ZeroBody,
+    /// Keep the declared length nibble but flip the CBOR major type (map → array
+    /// of the same length): structurally valid CBOR of the wrong type, so the
+    /// manifest decoder rejects it cleanly.
+    BadTag,
 }
 
 /// Leios-domain actuator inputs.

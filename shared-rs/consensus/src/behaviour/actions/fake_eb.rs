@@ -18,7 +18,7 @@
 //! many RBs it produces). Both return `Running` while installed.
 
 use crate::behaviour::tree::actions::LeafAction;
-use crate::behaviour::tree::control::{ControlSignal, FakeEbKind};
+use crate::behaviour::tree::control::{ControlSignal, Corruption, FakeEbKind};
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
@@ -100,6 +100,34 @@ impl LeafAction<ConsensusCtx, ControlSignal> for LoadedTxEb {
     }
 }
 
+/// Malformed EB — announces an EB whose CBOR body is corrupted at the encoding
+/// level. `corruption` picks the defect; `hash_matches` steers the receiver's
+/// reject stage (see [`FakeEbKind::Malformed`]).
+#[derive(Debug, Clone, Copy)]
+pub struct MalformedEb {
+    corruption: Corruption,
+    hash_matches: bool,
+}
+
+impl MalformedEb {
+    pub fn new(corruption: Corruption, hash_matches: bool) -> Self {
+        Self {
+            corruption,
+            hash_matches,
+        }
+    }
+}
+
+impl LeafAction<ConsensusCtx, ControlSignal> for MalformedEb {
+    fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+        out.praos.fake_eb = Some(FakeEbKind::Malformed {
+            corruption: self.corruption,
+            hash_matches: self.hash_matches,
+        });
+        Status::Running
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +185,22 @@ mod tests {
         let s = LoadedTxEb::new(7).contribute(&ctx(&env, &state), &mut out);
         assert_eq!(s, Status::Running);
         assert_eq!(out.praos.fake_eb, Some(FakeEbKind::Loaded { take: 7 }));
+    }
+
+    #[test]
+    fn malformed_sets_malformed_kind() {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let mut out = ControlSignal::default();
+        let s =
+            MalformedEb::new(Corruption::Truncate, false).contribute(&ctx(&env, &state), &mut out);
+        assert_eq!(s, Status::Running);
+        assert_eq!(
+            out.praos.fake_eb,
+            Some(FakeEbKind::Malformed {
+                corruption: Corruption::Truncate,
+                hash_matches: false,
+            })
+        );
     }
 }
