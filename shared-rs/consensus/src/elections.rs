@@ -149,19 +149,28 @@ pub struct Elections {
 impl Elections {
     pub fn new(cfg: ElectionsConfig) -> Self {
         // The compact voter index IS the CIP-0164 PersistentId: pools ranked by
-        // stake DESCENDING (node-id descending tie-break), NOT the BTreeMap
-        // (lexicographic node-id) order. The network puts this rank in a vote's
-        // `voter_id` and indexes the certificate signers bitfield by it; keying
-        // by BTreeMap order instead makes inbound votes verify under the wrong
-        // committee seat and mis-weights quorum. This comparator is byte-
-        // identical to net-node's cert-bitfield ranking
-        // (`LeiosConsensus::voter_to_persistent`), so that map stays an identity
-        // and the (block-77995-verified) bitfield layout is unchanged.
+        // stake DESCENDING, with an **ASCENDING node-id tie-break**. The network
+        // puts this rank in a vote's `voter_id` and indexes the certificate
+        // signers bitfield by it, so a tie-break in the wrong direction makes
+        // inbound votes verify under the wrong committee seat and mis-weights
+        // quorum. This comparator must stay byte-identical to net-node's
+        // cert-bitfield ranking (`LeiosConsensus::voter_to_persistent`) so that
+        // map remains an identity.
+        //
+        // The tie-break was DESCENDING until 2026-09-23. Measured on the w38
+        // proto-devnet (3 pools at 24T + net-rs at 18T): net-rs ranked the
+        // equal-stake pools eb8865c7=0, 90105953=1, 169ff24f=2, but the network
+        // labelled the same votes 169ff24f=0, 90105953=1, eb8865c7=2 — seats 1
+        // and 3 coincided while 0 and 2 swapped, so ~50% of inbound votes
+        // failed BLS verification ("verifies under a DIFFERENT committee seat",
+        // tally verified_ok=87 / verified_bad=88). Quorum was never reached, so
+        // the node could not certify its own EB and missed the cert-embed
+        // window. Ascending reproduces the network's order.
         let mut voter_ids: Vec<String> = cfg.stake_registry.keys().cloned().collect();
         voter_ids.sort_by(|a, b| {
             let sa = cfg.stake_registry.get(a).copied().unwrap_or(0);
             let sb = cfg.stake_registry.get(b).copied().unwrap_or(0);
-            sb.cmp(&sa).then_with(|| b.cmp(a))
+            sb.cmp(&sa).then_with(|| a.cmp(b))
         });
         let voter_index_map: BTreeMap<String, u16> = voter_ids
             .iter()
