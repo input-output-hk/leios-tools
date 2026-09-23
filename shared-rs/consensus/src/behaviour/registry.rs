@@ -94,7 +94,7 @@ pub enum ActionSpec {
         take: u32,
     },
     /// Malformed EB — fabricated EB with a CBOR body corrupted at the encoding
-    /// level. `corruption` = truncate | garbage | zero-body | bad-tag;
+    /// level. `corruption` = truncate | garbage | zero-body | bad-type;
     /// `hash_matches` = true announces the hash of the corrupted bytes (decode-
     /// stage reject), false announces the clean hash (content-address-gate
     /// reject). Probes at which stage an invalid EB is discarded (T11).

@@ -83,7 +83,7 @@ pub struct PraosControl {
 ///
 /// A further variant, "Mega Tx EB" (oversized manifest / declared size, for
 /// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
-/// in the leios-adversarial-tools repo, which houses the net-node actuation).
+/// in the leios-adversarial-tools repo, which houses the actuation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FakeEbKind {
     /// Phantom Tx EB — `n_txs` unfetchable phantom txs; no bodies pinned.
@@ -107,7 +107,7 @@ pub enum FakeEbKind {
     /// and the receiver fails at CBOR **decode** (T11 cheap-reject); `false`
     /// announces the hash of the *clean* bytes so the receiver drops the body at
     /// the **content-address/hash** gate before decoding. Actuation lives in
-    /// net-node. Probes at which stage an invalid EB is discarded, and the
+    /// the I/O wrapper. Probes at which stage an invalid EB is discarded, and the
     /// fetch-then-reject work spent first (T11).
     Malformed {
         corruption: Corruption,
@@ -125,12 +125,14 @@ pub enum Corruption {
     Truncate,
     /// Replace the body with random bytes: not well-formed CBOR at all.
     Garbage,
-    /// Serve a genuinely empty body (`[]`) where a manifest is expected.
+    /// Serve an empty CBOR array (`[]`, the single byte `0x80`) where a manifest
+    /// map is expected: well-formed CBOR of the wrong type, not an empty byte
+    /// stream. The decoder rejects it on the type mismatch.
     ZeroBody,
     /// Keep the declared length nibble but flip the CBOR major type (map → array
     /// of the same length): structurally valid CBOR of the wrong type, so the
     /// manifest decoder rejects it cleanly.
-    BadTag,
+    BadType,
 }
 
 /// Leios-domain actuator inputs.
