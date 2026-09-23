@@ -127,10 +127,7 @@ pub fn build_action(
             slot_offset: *slot_offset,
         }),
         ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
-        ActionSpec::TxFlood { rate, fire_at_slot } => Box::new(catalogue::TxFlood {
-            rate: *rate,
-            fire_at_slot: *fire_at_slot,
-        }),
+        ActionSpec::TxFlood { rate } => Box::new(catalogue::TxFlood { rate: *rate }),
         ActionSpec::VoteFlood { count } => Box::new(catalogue::VoteFlood { count: *count }),
         ActionSpec::FetchFlood { rate, window_slots } => Box::new(catalogue::FetchFlood {
             rate: *rate,

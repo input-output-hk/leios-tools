@@ -163,11 +163,6 @@ pub enum ActionSpec {
     TxFlood {
         #[serde(default = "default_tx_flood_rate")]
         rate: u32,
-        /// Optional coordinated fire slot: hold replay until this slot, then
-        /// burst. `None` (default) fires immediately at `rate`. Set live via
-        /// `set_param fire_at_slot` for a shoal volley (#1068).
-        #[serde(default)]
-        fire_at_slot: Option<u64>,
     },
 }
 
