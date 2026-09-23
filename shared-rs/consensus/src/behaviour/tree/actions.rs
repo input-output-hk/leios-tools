@@ -109,6 +109,10 @@ pub fn build_action(
             Box::new(catalogue::HollowEb::new(*declared_bytes))
         }
         ActionSpec::LoadedTxEb { take } => Box::new(catalogue::LoadedTxEb::new(*take)),
+        ActionSpec::MalformedEb {
+            corruption,
+            hash_matches,
+        } => Box::new(catalogue::MalformedEb::new(*corruption, *hash_matches)),
         ActionSpec::AnnounceSizeLie {
             scale_num,
             scale_den,
