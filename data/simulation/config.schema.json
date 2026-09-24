@@ -127,11 +127,20 @@
       "type": "object"
     },
     "CommitteeSelectionAlgorithm": {
-      "enum": ["wfa-ls", "everyone", "top-stake-fraction"],
+      "enum": ["wfa-ls", "everyone", "top-stake-fraction", "top-stake-seats"],
       "type": "string"
     },
     "DiffusionStrategy": {
       "enum": ["peer-order", "freshest-first", "oldest-first"],
+      "type": "string"
+    },
+    "VoteTransport": {
+      "description": "How a vote bundle reaches a peer in the Rust simulator.",
+      "enum": [
+        "announce-then-request",
+        "push",
+        "push-late-dedupe"
+      ],
       "type": "string"
     },
     "Distribution": {
@@ -800,6 +809,35 @@
       "$ref": "#/definitions/DiffusionStrategy",
       "description": "Only supported by Haskell simulation."
     },
+    "vote-announcement-size-bytes": {
+      "description": "Linear vote-bundle announcement size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies. Only announce-then-request sends these messages; a nondefault size on a push transport warns and has no effect.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 8
+    },
+    "vote-request-size-bytes": {
+      "description": "Linear vote-bundle request size including identifier and application framing, excluding TCP/IP. Affects transmission time and accounting. Default 8 preserves historical studies. Only announce-then-request sends these messages; a nondefault size on a push transport warns and has no effect.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 8
+    },
+    "vote-transport": {
+      "$ref": "#/definitions/VoteTransport",
+      "description": "How a vote bundle reaches a peer in the Rust simulator: announce-then-request, push, or push-late-dedupe."
+    },
+    "vote-transport-echo-to-source": {
+      "description": "Forward a vote back to the peer it arrived from. Off by default; the Haskell node does this because its notify server has no per-peer provenance.",
+      "type": "boolean"
+    },
+    "vote-push-fanout": {
+      "description": "Push a vote body to at most this many peers instead of every consumer. Unset means every consumer, which is what both node implementations do. A proposal, not a CIP-0164 rule: the specification caps distinct votes relayed per committee member per slot, not copies of one vote. Push transports only. See vote-push-fanout-protects-producers for which consumers the limit is drawn from.",
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "vote-push-fanout-protects-producers": {
+      "description": "Prioritize connections marked always-forward-votes in the topology within the total fanout cap. Protected consumers count toward k; remaining places are sampled by hash. false (default) preserves the forwarding rule of the 2026-09-10 study.",
+      "type": "boolean"
+    },
     "vote-generation-cpu-time-ms-constant": {
       "description": "Grandfathered for Haskell sim.",
       "type": "number"
@@ -842,11 +880,16 @@
     },
     "committee-selection-algorithm": {
       "$ref": "#/definitions/CommitteeSelectionAlgorithm",
-      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake."
+      "description": "Committee selection algorithm. 'wfa-ls' (default) uses VRF lottery. 'everyone' means every node votes. 'top-stake-fraction' selects highest-stake nodes covering committee-stake-fraction-threshold of total stake. 'top-stake-seats' seats the top committee-seat-count stake-holding pools, each voting with its active stake as weight (CIP-0164 PR #1250)."
     },
     "committee-stake-fraction-threshold": {
       "description": "Fraction of total stake eligible to vote when committee-selection-algorithm is 'top-stake-fraction'. Default 0.95.",
       "type": "number"
+    },
+    "committee-seat-count": {
+      "description": "Committee size in seats when committee-selection-algorithm is 'top-stake-seats'. The top N stake-holding pools by stake are seated, ties broken by pool identifier ascending, and each casts one vote weighted by its active stake. If fewer pools exist, all are seated. The quorum denominator remains total active stake, including stake outside the committee. CIP-0164 PR #1250 proposes 900.",
+      "type": "integer",
+      "minimum": 1
     }
   },
   "type": "object"

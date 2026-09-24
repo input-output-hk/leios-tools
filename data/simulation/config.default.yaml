@@ -227,6 +227,7 @@ non-persistent-vote-generation-probability: 100.0
 #   wfa-ls             → quorum-weight-fraction × (PV + NPV)
 #   everyone           → quorum-weight-fraction × N nodes
 #   top-stake-fraction → quorum-weight-fraction × total active stake
+#   top-stake-seats    → quorum-weight-fraction × total active stake
 # Replaces the old `vote-threshold` knob; see CIP-164 PR #1196.
 quorum-weight-fraction: 0.6
 # vote-spec#"Generate vote"
@@ -260,17 +261,91 @@ vote-bundle-size-bytes-per-eb: 105
 # = 0.6 × 500 = 300. Keep in sync with quorum-weight-fraction above.
 vote-threshold: 300
 
-# Committee selection algorithm: "wfa-ls" (default), "everyone", or "top-stake-fraction"
+# Committee selection algorithm: "wfa-ls" (default), "everyone",
+# "top-stake-fraction" or "top-stake-seats".
 # The same `quorum-weight-fraction` knob applies to all modes; the
 # absolute threshold is derived from it via the mode-specific
 # denominator (see above).
 committee-selection-algorithm: "wfa-ls"
 # Fraction of total stake eligible to vote when using "top-stake-fraction".
 committee-stake-fraction-threshold: 0.95
+# Committee size for "top-stake-seats", following the open CIP-0164 PR #1250
+# (proposed value: 900). The top N stake-holding pools are seated, ties broken
+# by node identifier ascending (topology name order, standing in for pool IDs).
+# Each vote carries its pool's active stake.
+# If fewer pools exist, all are seated. The quorum denominator is total
+# active stake, including stake outside the selected committee.
+committee-seat-count: 900
 
+# Request ordering for vote relay.  Read by the Haskell simulator only; this
+# simulator never looks at it.  Accepted values are "peer-order",
+# "freshest-first" and "oldest-first".  Nothing to do with `vote-transport`
+# below, which is the knob this simulator does read -- the two share this file
+# and nothing else.
 vote-diffusion-strategy: "peer-order"
 
-# Haskell prototype relay mini-protocol parameters.
+# How a vote bundle reaches a peer in this simulator.
+#
+#   announce-then-request  announce the bundle id, wait for the peer to ask,
+#                          then send the body.  Each body crosses the network
+#                          exactly once per node, so there are no duplicates.
+#                          Retains the historic transport as the default.
+#                          Voting gate and deadline fixes still change behavior;
+#                          reproduce older studies with their source revision.
+#   push                   send the body straight to peers, forwarding a bundle
+#                          only the first time it is seen.  What both Leios node
+#                          implementations do.  Traffic is bounded by links
+#                          rather than by nodes.  A copy arriving while another
+#                          is still being validated is dropped before it costs
+#                          anything.
+#   push-late-dedupe       as push, but suppression applies only once a bundle
+#                          is fully held, so copies arriving during the
+#                          validation window are each validated.  This is the
+#                          Haskell node's ordering, which verifies before
+#                          inserting into its seen-set.
+#
+# These three are the only accepted values.  "peer-order", "freshest-first" and
+# "oldest-first" belong to vote-diffusion-strategy above; they are not aliases
+# of anything here, and setting one of them here fails to load the config.
+vote-transport: "announce-then-request"
+# Linear vote control messages: identifier plus application framing, without
+# TCP/IP. These sizes affect link transmission time and reported bytes. The
+# 8-byte defaults preserve historical studies, not a concrete wire encoding.
+# Only announce-then-request sends these messages; a nondefault size on a push
+# transport is accepted with a warning and changes nothing.
+vote-announcement-size-bytes: 8
+vote-request-size-bytes: 8
+
+# Push a vote body back to the peer it arrived from.  Pure waste, and off here,
+# but the Haskell node's notify server has no per-peer provenance and so does
+# exactly this.  The option exists to measure that gap.  It applies to the push
+# transports only: announce-then-request has no notify server to model, and it
+# is the published baseline, so the flag leaves it alone.
+vote-transport-echo-to-source: false
+
+# Push a vote body to at most this many peers instead of every consumer.
+# Unset (the default) means every consumer, which is what both node
+# implementations do.
+#
+# This is a proposal, not a CIP-0164 rule.  The specification caps how many
+# *distinct* votes a node relays per committee member per slot, which the
+# bundle key already enforces here; nothing in it bounds how many *copies* of
+# one vote cross the network, and the copies are what cost verification time.
+# Applies to the push transports only: announce-then-request sends a body only
+# when a peer asks for it and so produces no copies to cut.
+# See vote-push-fanout-protects-producers for which consumers the limit is
+# drawn from.
+vote-push-fanout: null
+
+# Prioritize topology connections marked always-forward-votes within the total
+# fanout budget. A BP marks its own relay entries under producers with this flag.
+# Protected connections count toward k; remaining places are sampled by hash.
+# Rejects missing markers, an entirely protected topology, and protected counts
+# exceeding k. false preserves the rule used by the 2026-09-10 archived overlays.
+vote-push-fanout-protects-producers: false
+
+# Haskell prototype relay mini-protocol parameters.  Not read by this simulator;
+# kept for parity with the Haskell simulator's configuration.
 vote-diffusion-max-bodies-to-request: 1
 vote-diffusion-max-headers-to-request: 100
 vote-diffusion-max-window-size: 100
