@@ -45,6 +45,20 @@ pub struct PraosControl {
     /// parent RB's announced EB, killing that EB's certification (strict
     /// parent-only cert rule) without touching quorum.
     pub suppress_cert: bool,
+    /// AUDIT (`single-bls-cert` action): forge the `leios_certificate` on any
+    /// CertRB this node produces so its `signers` bitfield names the WHOLE
+    /// committee while its aggregate is only this node's OWN BLS vote signature
+    /// over the announcing RB hash. The all-committee bitfield clears the
+    /// ledger's weight gate (`InsufficientWeight`), leaving exactly one thing
+    /// between the block and adoption: whether `verifyLeiosCert` binds the
+    /// aggregate to the named signer set. Honest reject (`InvalidSignature`) =
+    /// aggregate verification holds; honest ADOPT = the verifier trusts the
+    /// bitfield's weight without checking the aggregate — a certificate-forgery
+    /// soundness break (a single committee key forges full-quorum certs). The
+    /// actuator ships the deliberately-invalid cert on purpose, so it also
+    /// bypasses the producer's own pre-publish self-verify drop. Default
+    /// `false` keeps `ControlSignal::default()` honest.
+    pub forge_single_bls_cert: bool,
     /// Announce a fabricated EB on any RB this node produces this slot (the
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
@@ -332,6 +346,9 @@ mod tests {
         assert!(!d.praos.drop_inbound);
         assert_eq!(d.praos.body_path, None);
         assert!(!d.praos.suppress_cert);
+        // The cert-forgery audit must default off, or the honest node would
+        // ship a deliberately-invalid certificate.
+        assert!(!d.praos.forge_single_bls_cert);
         assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
