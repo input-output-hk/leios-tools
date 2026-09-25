@@ -2,10 +2,10 @@
 //! produces so its `signers` bitfield names the WHOLE committee while its
 //! aggregate is only this node's OWN BLS vote signature.
 //!
-//! Sets `praos.forge_single_bls_cert = true`. The actuation (in the net-node
-//! producer) then builds a certificate `[all-committee bitfield, own-key
-//! aggregate]` instead of aggregating the votes it actually collected, and
-//! ships it WITHOUT the usual pre-publish self-verify drop.
+//! Sets `praos.forge_single_bls_cert = true`. The consuming I/O wrapper then
+//! builds a certificate `[all-committee bitfield, own-key aggregate]` instead of
+//! aggregating the votes it actually collected, and ships it WITHOUT the usual
+//! pre-publish self-verify drop.
 //!
 //! This is a soundness audit of the ledger's `verifyLeiosCert`. The
 //! all-committee bitfield clears the weight gate (`InsufficientWeight`), so the
