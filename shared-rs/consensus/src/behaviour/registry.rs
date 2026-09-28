@@ -64,6 +64,12 @@ pub enum ActionSpec {
     EchoToSource,
     #[serde(rename = "cert-suppressor")]
     CertSuppressor,
+    /// AUDIT — forge a `leios_certificate` whose signers bitfield names the
+    /// whole committee but whose aggregate is only this node's own BLS vote
+    /// signature. Probes whether `verifyLeiosCert` binds the aggregate to the
+    /// named signer set. No parameters (a single, well-defined forgery).
+    #[serde(rename = "single-bls-cert")]
+    SingleBlsCert,
     /// Phantom Tx EB — fabricated EB of `n_txs` unfetchable phantom txs.
     #[serde(rename = "phantom-tx-eb")]
     PhantomTxEb {
