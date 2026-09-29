@@ -59,6 +59,19 @@ pub struct PraosControl {
     /// bypasses the producer's own pre-publish self-verify drop. Default
     /// `false` keeps `ControlSignal::default()` honest.
     pub forge_single_bls_cert: bool,
+    /// AUDIT (`wrong-len-cert` action, T14 variant #2): forge the
+    /// `leios_certificate` on any CertRB this node produces so its `signers`
+    /// bitfield is a DELIBERATELY WRONG length (`⌈committee_size/8⌉ + 1` bytes)
+    /// while otherwise well-formed (an all-committee bitfield over a valid G1
+    /// aggregate). `verifyLeiosCert` compares the bitfield length against the
+    /// committee size FIRST — before any BLS math — and rejects a mismatch as
+    /// `MalformedSigners`, which makes the carrying RB an `InvalidBlock`. This is
+    /// the cheapest-to-reject invalid-cert variant (a length compare), the
+    /// low end of T14's cost-asymmetry axis. Like `forge_single_bls_cert` the
+    /// cert is invalid by construction, so the actuator ships it past the
+    /// producer's own pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_len_cert: bool,
     /// Announce a fabricated EB on any RB this node produces this slot (the
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
@@ -349,6 +362,7 @@ mod tests {
         // The cert-forgery audit must default off, or the honest node would
         // ship a deliberately-invalid certificate.
         assert!(!d.praos.forge_single_bls_cert);
+        assert!(!d.praos.forge_wrong_len_cert);
         assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
