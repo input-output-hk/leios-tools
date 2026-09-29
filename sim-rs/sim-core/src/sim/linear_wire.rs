@@ -214,7 +214,7 @@ impl SimCpuTask for CpuTask {
         match self {
             Self::TransactionValidated(_, _) => "".to_string(),
             Self::RBBlockGenerated(_, _) => "".to_string(),
-            Self::RBHeaderValidated(_, _, _, _) => "".to_string(),
+            Self::RBHeaderValidated(_, header, _, _) => header.id.to_string(),
             Self::RBBlockValidated(_) => "".to_string(),
             Self::EBHeaderValidated(_, _) => "".to_string(),
             Self::EBBlockValidated(_, _) => "".to_string(),
