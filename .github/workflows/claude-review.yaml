@@ -204,8 +204,10 @@ jobs:
             pr-head/ prefix) and take line numbers from the file under pr-head/.
             Start the body with "🔴 Important:" or "🟡 Nit:", then the problem,
             why it matters, and the fix. Use a suggestion block only for a
-            small, certain fix, and set startLine and line to exactly the lines
-            it replaces. Post one comment per finding and no other comments.
+            small, certain fix. A suggestion replaces the commented lines: for
+            one line set only line; for several, set startLine and line to
+            exactly that range. Post one comment per finding and no other
+            comments.
 
             Finish with structured output: `findings` is the number of inline
             comments you posted; `summary` is short markdown for the PR that
