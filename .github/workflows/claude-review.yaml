@@ -10,6 +10,9 @@ name: "claude-review"
 #     whole-PR review on demand. This is the only way to review a PR from a
 #     fork, whose pull_request runs get no secrets; read the fork's changes
 #     before asking, since Claude reads them with this repo's API key in scope.
+#     GitHub attaches these runs to the default branch, not the PR, so the run
+#     reacts 👀 to the comment and sets a "claude-review (requested)" status
+#     on the PR head while it works.
 # Draft PRs and bot pushes are skipped. What to flag: REVIEW.md.
 #
 # Needs secret ANTHROPIC_API_KEY: an IOHK-owned Claude Console key (not a
@@ -50,11 +53,13 @@ jobs:
       group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     # Claude reads code and posts PR comments; it gets no shell and no write
-    # access to contents. Comments come from github-actions[bot].
+    # access to contents. Comments come from github-actions[bot]. statuses:
+    # the progress status on comment-triggered runs.
     permissions:
       contents: read
       pull-requests: write
       issues: write
+      statuses: write
     env:
       GH_TOKEN: ${{ github.token }}
       PR: ${{ github.event.pull_request.number || github.event.issue.number }}
@@ -63,6 +68,8 @@ jobs:
         id: pr
         env:
           HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          EVENT: ${{ github.event_name }}
+          COMMENTER: ${{ github.event.comment.user.login }}
         run: |
           set -euo pipefail
           if [ "$HAS_KEY" != true ]; then
@@ -73,11 +80,42 @@ jobs:
           # Retry GitHub API 5xx. Keep only a successful attempt's output: gh api
           # prints the error body to stdout, even with --jq.
           retry() { local i out; for i in 1 2 3; do if out=$("$@"); then printf '%s\n' "$out"; return 0; fi; [ "$i" -lt 3 ] && sleep $((i * 10)); done; return 1; }
+          if [ "$EVENT" = issue_comment ]; then
+            # The action makes the same check before running Claude; doing it
+            # first means an outsider's comment gets no reaction or status.
+            perm=$(retry gh api "repos/$GITHUB_REPOSITORY/collaborators/$COMMENTER/permission" --jq .permission)
+            case "$perm" in
+              admin|write) ;;
+              *)
+                echo "::notice::@$COMMENTER has $perm access; @claude review needs write access"
+                echo "state=not-allowed" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
+            esac
+          fi
           pr=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
           state=$(jq -er .state <<<"$pr")
           base_ref=$(jq -er .base.ref <<<"$pr")
+          head_sha=$(jq -er .head.sha <<<"$pr")
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+      # Progress feedback for "@claude review" runs, best effort: a failure
+      # here only warns. pull_request runs already show as a PR check.
+      - name: Acknowledge request
+        if: github.event_name == 'issue_comment' && steps.pr.outputs.state == 'open'
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes > /dev/null \
+            || echo "::warning::could not react to the review request"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending -f context="claude-review (requested)" \
+            -f target_url="$RUN_URL" -f description="Review in progress" > /dev/null \
+            || echo "::warning::could not set the pending status"
 
       # Trusted base branch at the workspace root, so Claude's config
       # (.claude/, CLAUDE.md, REVIEW.md) never comes from the PR. The PR's code
@@ -257,3 +295,25 @@ jobs:
             grep -qF -- "<!-- claude-review run=$run -->" <<<"$bodies" && exit 0
           done
           exit 1
+
+      - name: Report status
+        if: always() && github.event_name == 'issue_comment' && steps.pr.outputs.state == 'open'
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          JOB_STATUS: ${{ job.status }}
+          MODE: ${{ steps.range.outputs.mode }}
+          POSTED: ${{ steps.review.outputs.structured_output != '' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          case "$JOB_STATUS" in
+            success)
+              if [ "$MODE" = skip ]; then state=success; desc="Nothing to review"
+              elif [ "$POSTED" = true ]; then state=success; desc="Review posted"
+              else state=failure; desc="Review ended without a summary; see the run"; fi ;;
+            cancelled) state=error; desc="Review cancelled" ;;
+            *) state=failure; desc="Review failed; see the run" ;;
+          esac
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" -f context="claude-review (requested)" \
+            -f target_url="$RUN_URL" -f description="$desc" > /dev/null \
+            || echo "::warning::could not set the final status"
