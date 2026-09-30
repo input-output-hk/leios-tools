@@ -72,6 +72,23 @@ pub struct PraosControl {
     /// producer's own pre-publish self-verify drop. Default `false` keeps
     /// `ControlSignal::default()` honest.
     pub forge_wrong_len_cert: bool,
+    /// AUDIT (`wrong-context-cert` action, T14 variant #3): forge the
+    /// `leios_certificate` on any CertRB this node produces so it is well-formed
+    /// in every structural way (correct `⌈committee_size/8⌉` bitfield length, an
+    /// all-committee bitfield, a genuine 48-byte G1 aggregate) but its aggregate
+    /// signs the WRONG message — a deterministically-derived hash (the
+    /// announcing RB hash bitwise-complemented) rather than the announcing RB the
+    /// cert rides on. `verifyLeiosCert` reconstructs the aggregate public key and
+    /// verifies it against the announcing RB's hash (the message each vote
+    /// actually signed), so a valid aggregate over the wrong hash fails with
+    /// `InvalidSignature`. This is the dearest-to-reject variant on T14's
+    /// cost-asymmetry axis — rejection needs full aggregate-pubkey
+    /// reconstruction and a pairing check, unlike `forge_wrong_len_cert`'s cheap
+    /// length compare. Like the other cert-forgery audits the cert is invalid by
+    /// construction, so the actuator ships it past the producer's own
+    /// pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_context_cert: bool,
     /// Announce a fabricated EB on any RB this node produces this slot (the
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
@@ -363,6 +380,7 @@ mod tests {
         // ship a deliberately-invalid certificate.
         assert!(!d.praos.forge_single_bls_cert);
         assert!(!d.praos.forge_wrong_len_cert);
+        assert!(!d.praos.forge_wrong_context_cert);
         assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);

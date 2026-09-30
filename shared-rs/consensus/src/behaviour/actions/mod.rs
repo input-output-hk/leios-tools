@@ -18,6 +18,7 @@ pub mod announce_size_lie;
 pub mod announce_slot_skew;
 pub mod cert_suppressor;
 pub mod single_bls_cert;
+pub mod wrong_context_cert;
 pub mod wrong_len_cert;
 pub mod deep_reorg;
 pub mod drop_inbound;

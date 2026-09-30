@@ -77,6 +77,17 @@ pub enum ActionSpec {
     /// No parameters (a single, well-defined length lie).
     #[serde(rename = "wrong-len-cert")]
     WrongLenCert,
+    /// AUDIT (T14 variant #3) — forge a `leios_certificate` that is well-formed
+    /// in every structural way (correct `⌈n/8⌉` bitfield length, all-committee
+    /// bitfield, a genuine 48-byte G1 aggregate) but whose aggregate signs the
+    /// WRONG message: a deterministically-derived hash (the announcing RB hash,
+    /// bitwise-complemented) rather than the announcing RB the cert rides on.
+    /// `verifyLeiosCert` binds the aggregate to the announcing RB's hash, so a
+    /// valid aggregate over the wrong hash fails with `InvalidSignature` — the
+    /// dearest-to-reject variant (full aggregate-pubkey reconstruction + a
+    /// pairing check). No parameters (a single, well-defined context lie).
+    #[serde(rename = "wrong-context-cert")]
+    WrongContextCert,
     /// Phantom Tx EB — fabricated EB of `n_txs` unfetchable phantom txs.
     #[serde(rename = "phantom-tx-eb")]
     PhantomTxEb {
