@@ -232,6 +232,7 @@ jobs:
           LAST: ${{ steps.range.outputs.last }}
         run: |
           set -euo pipefail
+          run="$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           if [ "$MODE" = delta ]; then
             scope="new commits ${LAST:0:7}..${HEAD:0:7}"
           else
@@ -242,14 +243,17 @@ jobs:
             echo
             echo "<sub>Claude review of $scope</sub>"
             echo "<!-- claude-review head=$HEAD -->"
+            echo "<!-- claude-review run=$run -->"
           } > "$RUNNER_TEMP/summary.md"
           # Retry, but a 5xx can hide a comment that was created: check for
-          # this head's marker before posting again.
+          # this run's marker before posting again. Not the head marker: an
+          # "@claude review" of an already-reviewed head finds an earlier
+          # run's summary with the same head.
           for i in 1 2 3; do
             gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md" && exit 0
             sleep $((i * 10))
             bodies=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
                        --jq '.[] | select(.user.login == "github-actions[bot]") | .body') || bodies=""
-            grep -qF -- "<!-- claude-review head=$HEAD -->" <<<"$bodies" && exit 0
+            grep -qF -- "<!-- claude-review run=$run -->" <<<"$bodies" && exit 0
           done
           exit 1
