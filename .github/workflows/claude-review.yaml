@@ -20,13 +20,6 @@ on:
   issue_comment:
     types: [created]
 
-# One review per PR at a time; a running review is never cancelled. If GitHub
-# drops a queued run, nothing is lost: the next run starts from the last head
-# a summary comment recorded.
-concurrency:
-  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: false
-
 env:
   MODEL: claude-opus-5-5 # claude-sonnet-5 costs less per review
   # Pathspecs kept out of the diffs Claude reviews (generated / machine files).
@@ -46,6 +39,14 @@ jobs:
          startsWith(github.event.comment.body, '@claude review')))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # One review per PR at a time; a running review is never cancelled. Set on
+    # the job, not the workflow, so skipped runs (ordinary comments, bot
+    # pushes) never take the one waiting slot. If GitHub drops a waiting review
+    # for a newer one, nothing is lost: the newer one reviews from the last
+    # head a summary comment recorded.
+    concurrency:
+      group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
     # Claude reads code and posts PR comments; it gets no shell and no write
     # access to contents. Comments come from github-actions[bot].
     permissions:
