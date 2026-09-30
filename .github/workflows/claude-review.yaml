@@ -70,10 +70,14 @@ jobs:
             echo "state=no-key" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
+          # Retry GitHub API 5xx. Keep only a successful attempt's output: gh api
+          # prints the error body to stdout, even with --jq.
+          retry() { local i out; for i in 1 2 3; do if out=$("$@"); then printf '%s\n' "$out"; return 0; fi; [ "$i" -lt 3 ] && sleep $((i * 10)); done; return 1; }
           pr=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
-          echo "state=$(jq -r .state <<<"$pr")" >> "$GITHUB_OUTPUT"
-          echo "base_ref=$(jq -r .base.ref <<<"$pr")" >> "$GITHUB_OUTPUT"
+          state=$(jq -er .state <<<"$pr")
+          base_ref=$(jq -er .base.ref <<<"$pr")
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
 
       # Trusted base branch at the workspace root, so Claude's config
       # (.claude/, CLAUDE.md, REVIEW.md) never comes from the PR. The PR's code
@@ -103,7 +107,9 @@ jobs:
         run: |
           set -euo pipefail
           set -f # EXCLUDE holds git pathspecs, not shell globs
-          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
+          # Retry GitHub API 5xx. Keep only a successful attempt's output: gh api
+          # prints the error body to stdout, even with --jq.
+          retry() { local i out; for i in 1 2 3; do if out=$("$@"); then printf '%s\n' "$out"; return 0; fi; [ "$i" -lt 3 ] && sleep $((i * 10)); done; return 1; }
           out="$GITHUB_WORKSPACE/.claude-review"
           mkdir -p "$out"
           cd pr-head
@@ -226,7 +232,6 @@ jobs:
           LAST: ${{ steps.range.outputs.last }}
         run: |
           set -euo pipefail
-          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
           if [ "$MODE" = delta ]; then
             scope="new commits ${LAST:0:7}..${HEAD:0:7}"
           else
@@ -238,4 +243,13 @@ jobs:
             echo "<sub>Claude review of $scope</sub>"
             echo "<!-- claude-review head=$HEAD -->"
           } > "$RUNNER_TEMP/summary.md"
-          retry gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md"
+          # Retry, but a 5xx can hide a comment that was created: check for
+          # this head's marker before posting again.
+          for i in 1 2 3; do
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md" && exit 0
+            sleep $((i * 10))
+            bodies=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                       --jq '.[] | select(.user.login == "github-actions[bot]") | .body') || bodies=""
+            grep -qF -- "<!-- claude-review head=$HEAD -->" <<<"$bodies" && exit 0
+          done
+          exit 1
