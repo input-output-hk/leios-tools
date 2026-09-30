@@ -70,7 +70,8 @@ jobs:
             echo "state=no-key" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
+          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
+          pr=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")
           echo "state=$(jq -r .state <<<"$pr")" >> "$GITHUB_OUTPUT"
           echo "base_ref=$(jq -r .base.ref <<<"$pr")" >> "$GITHUB_OUTPUT"
 
@@ -102,14 +103,15 @@ jobs:
         run: |
           set -euo pipefail
           set -f # EXCLUDE holds git pathspecs, not shell globs
+          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
           out="$GITHUB_WORKSPACE/.claude-review"
           mkdir -p "$out"
           cd pr-head
           head=$(git rev-parse HEAD)
           base="origin/$BASE_REF"
-          last=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-                   --jq '.[] | select(.user.login == "github-actions[bot]") | .body' \
-                 | grep -oE '<!-- claude-review head=[0-9a-f]{40} -->' | tail -n1 \
+          bodies=$(retry gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+                     --jq '.[] | select(.user.login == "github-actions[bot]") | .body')
+          last=$(grep -oE '<!-- claude-review head=[0-9a-f]{40} -->' <<<"$bodies" | tail -n1 \
                  | grep -oE '[0-9a-f]{40}' || true)
 
           if [ "$EVENT" = issue_comment ]; then
@@ -133,13 +135,14 @@ jobs:
               > "$out/new-commits.patch"
             [ -s "$out/new-commits.patch" ] || mode=skip
           fi
-          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate \
-            --jq '.[] | select(.user.login == "github-actions[bot]") | {path, line, body}' \
-            > "$out/previous-comments.jsonl"
+          prev=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate \
+                   --jq '.[] | select(.user.login == "github-actions[bot]") | {path, line, body}')
+          printf '%s\n' "$prev" > "$out/previous-comments.jsonl"
           # The PR's own claims, for REVIEW.md's claims check.
           if [ "$mode" = delta ]; then commits="$last..$head"; else commits="$base..$head"; fi
+          text=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '"# \(.title)\n\n\(.body // "")"')
           {
-            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '"# \(.title)\n\n\(.body // "")"'
+            printf '%s\n' "$text"
             printf '\n## Commit messages\n\n'
             git log --first-parent --format='### %h %s%n%n%b' "$commits"
           } > "$out/pr-claims.md"
@@ -223,6 +226,7 @@ jobs:
           LAST: ${{ steps.range.outputs.last }}
         run: |
           set -euo pipefail
+          retry() { local i; for i in 1 2 3; do "$@" && return 0; sleep $((i * 10)); done; return 1; } # GitHub API 5xx
           if [ "$MODE" = delta ]; then
             scope="new commits ${LAST:0:7}..${HEAD:0:7}"
           else
@@ -234,4 +238,4 @@ jobs:
             echo "<sub>Claude review of $scope</sub>"
             echo "<!-- claude-review head=$HEAD -->"
           } > "$RUNNER_TEMP/summary.md"
-          gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md"
+          retry gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/summary.md"
