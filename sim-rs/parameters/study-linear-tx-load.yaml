@@ -1,0 +1,20 @@
+# Scenario overlay for the vote-transport study at 750 and 1500 nodes.
+#
+# Layered over the ouroboros-leios study configuration
+# (analysis/sims/2026w18/experiments/config.yaml) it selects the Linear Leios
+# variant with transaction references, the CIP-0164 stage lengths, 12 MB
+# endorser blocks and a 6 ms interarrival gap (~167 tx/s) for 1500-byte
+# transactions from 60 s to
+# 960 s, so the vote traffic is measured under realistic block and transaction
+# load rather than on an idle network.  See scripts/vote-diffusion-study.sh.
+leios-variant: linear-with-tx-references
+linear-eb-propagation-criteria: eb-received
+linear-diffuse-stage-length-slots: 7
+linear-vote-stage-length-slots: 4
+leios-stage-length-slots: 4
+eb-referenced-txs-max-size-bytes: 12000000
+eb-body-avg-size-bytes: 12000000
+tx-size-bytes-distribution: {distribution: constant, value: 1500}
+tx-generation-distribution: {distribution: constant, value: 6.0}
+tx-start-time: 60
+tx-stop-time: 960

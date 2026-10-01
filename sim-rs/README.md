@@ -17,7 +17,7 @@ The `input_path` is a YAML file which describes the network topology. Input file
 
 The default parameters for the simulation are defined in `data/simulation/config.default.yaml` in the root of this repository, which is symlinked to `parameters/config.default.yaml` here. To override parameters, pass `-p <path-to-parameters-file>` (you can pass this flag as many times as you'd like). Some predefined overrides are in the `parameters` directory.
 
-While the simulation is running, it will log what's going on to the console. You can stop it at any time with ctrl+c, and when you do it will save the stream of events to `output_path`. To only simulate e.g. 50 slots, pass `-s 50`.
+While the simulation is running, it will log what's going on to the console. You can stop it at any time with ctrl+c, and when you do it will save the stream of events to `output_path`. To only simulate e.g. 50 slots, pass `-s 50`. Ordinary runs stopped with Ctrl-C exit successfully after saving their events and final statistics. If `--vote-traffic` is requested, interruption instead discards that capture and exits unsuccessfully because the traffic report requires a completed interval.
 
 The simulation runs in virtual time and completes as fast as your machine allows.
 
@@ -62,6 +62,16 @@ This uses the sequential engine with 6 shards and `zero-latency-clusters`, typic
 
 > [!NOTE]
 > For instructions on running the simulation using Docker, please refer to the Docker Simulation section in the root README.md.
+
+## Vote diffusion experiments
+
+The [Linear Leios vote study](docs/vote-diffusion-study.md) compares
+announce/request and push transport, crosses fanout with deduplication order,
+and distinguishes everyone-votes load tests from the proposed stake-weighted
+fixed-size committee. It documents the corrected measurements, reproducible
+run matrix and limitations of the earlier results. The [focused findings](docs/vote-diffusion-followup-20260915/README.md)
+cover BP protection within the fanout cap, control-message size sensitivity
+and absolute traffic at individual BPs and relays.
 
 ## Network partitions
 
