@@ -106,6 +106,7 @@ pub fn build_action(
         ActionSpec::SingleBlsCert => Box::new(catalogue::single_bls_cert::SingleBlsCert),
         ActionSpec::WrongLenCert => Box::new(catalogue::wrong_len_cert::WrongLenCert),
         ActionSpec::WrongContextCert => Box::new(catalogue::wrong_context_cert::WrongContextCert),
+        ActionSpec::NonMemberCert => Box::new(catalogue::non_member_cert::NonMemberCert),
         ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
         ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
         ActionSpec::HollowEb { declared_bytes } => {

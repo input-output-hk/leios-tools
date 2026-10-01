@@ -88,6 +88,20 @@ pub enum ActionSpec {
     /// pairing check). No parameters (a single, well-defined context lie).
     #[serde(rename = "wrong-context-cert")]
     WrongContextCert,
+    /// AUDIT (T14 variant #4) — forge a `leios_certificate` whose `signers`
+    /// bitfield has the CORRECT length (`⌈n/8⌉` bytes, so it clears the length
+    /// check, unlike `wrong-len-cert`) but sets ONLY out-of-range bits: indices
+    /// `>= committee_size` in the padding of the final byte, and NO in-range
+    /// bit. `verifyLeiosCert` applies an `idx < n` guard when decoding the
+    /// bitfield, dropping every out-of-range bit, so the effective signer set is
+    /// EMPTY and the cert carries zero committee weight — the ledger rejects it
+    /// for `InsufficientWeight`, a third distinct verdict after
+    /// `MalformedSigners` (wrong-len) and `InvalidSignature` (wrong-context /
+    /// single-bls). The aggregate is never reached. Requires `committee_size %
+    /// 8 != 0` (a multiple-of-8 committee has no padding bits). No parameters (a
+    /// single, well-defined empty-signer-set lie).
+    #[serde(rename = "non-member-cert")]
+    NonMemberCert,
     /// Phantom Tx EB — fabricated EB of `n_txs` unfetchable phantom txs.
     #[serde(rename = "phantom-tx-eb")]
     PhantomTxEb {

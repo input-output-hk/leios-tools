@@ -17,6 +17,7 @@ pub mod announce_flood;
 pub mod announce_size_lie;
 pub mod announce_slot_skew;
 pub mod cert_suppressor;
+pub mod non_member_cert;
 pub mod single_bls_cert;
 pub mod wrong_context_cert;
 pub mod wrong_len_cert;
