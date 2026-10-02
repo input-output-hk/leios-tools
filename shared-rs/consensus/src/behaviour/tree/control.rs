@@ -59,6 +59,57 @@ pub struct PraosControl {
     /// bypasses the producer's own pre-publish self-verify drop. Default
     /// `false` keeps `ControlSignal::default()` honest.
     pub forge_single_bls_cert: bool,
+    /// AUDIT (`wrong-len-cert` action, T14 variant #2): forge the
+    /// `leios_certificate` on any CertRB this node produces so its `signers`
+    /// bitfield is a DELIBERATELY WRONG length (`⌈committee_size/8⌉ + 1` bytes)
+    /// while otherwise well-formed (an all-committee bitfield over a valid G1
+    /// aggregate). `verifyLeiosCert` compares the bitfield length against the
+    /// committee size FIRST — before any BLS math — and rejects a mismatch as
+    /// `MalformedSigners`, which makes the carrying RB an `InvalidBlock`. This is
+    /// the cheapest-to-reject invalid-cert variant (a length compare), the
+    /// low end of T14's cost-asymmetry axis. Like `forge_single_bls_cert` the
+    /// cert is invalid by construction, so the actuator ships it past the
+    /// producer's own pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_len_cert: bool,
+    /// AUDIT (`wrong-context-cert` action, T14 variant #3): forge the
+    /// `leios_certificate` on any CertRB this node produces so it is well-formed
+    /// in every structural way (correct `⌈committee_size/8⌉` bitfield length, an
+    /// all-committee bitfield, a genuine 48-byte G1 aggregate) but its aggregate
+    /// signs the WRONG message — a deterministically-derived hash (the
+    /// announcing RB hash bitwise-complemented) rather than the announcing RB the
+    /// cert rides on. `verifyLeiosCert` reconstructs the aggregate public key and
+    /// verifies it against the announcing RB's hash (the message each vote
+    /// actually signed), so a valid aggregate over the wrong hash fails with
+    /// `InvalidSignature`. This is the dearest-to-reject variant on T14's
+    /// cost-asymmetry axis — rejection needs full aggregate-pubkey
+    /// reconstruction and a pairing check, unlike `forge_wrong_len_cert`'s cheap
+    /// length compare. Like the other cert-forgery audits the cert is invalid by
+    /// construction, so the actuator ships it past the producer's own
+    /// pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_context_cert: bool,
+    /// AUDIT (`non-member-cert` action, T14 variant #4): forge the
+    /// `leios_certificate` on any CertRB this node produces so its `signers`
+    /// bitfield has the CORRECT length (`⌈committee_size/8⌉` bytes, so it clears
+    /// the ledger's length check, unlike `forge_wrong_len_cert`) but sets ONLY
+    /// out-of-range bits — bit indices `>= committee_size` living in the padding
+    /// of the final byte — and NO in-range bit. `verifyLeiosCert` applies an
+    /// `idx < committee_size` guard when it decodes the bitfield into named
+    /// signers, so every out-of-range bit is dropped and the effective signer
+    /// set is EMPTY. A certificate that names zero committee seats carries zero
+    /// committee weight, so the ledger rejects it for `InsufficientWeight` — a
+    /// third distinct invalid-cert verdict after `forge_wrong_len_cert`'s
+    /// `MalformedSigners` and `forge_wrong_context_cert` /
+    /// `forge_single_bls_cert`'s `InvalidSignature`. The aggregate is never
+    /// reached: the empty signer set fails the weight gate before any BLS math.
+    /// Requires `committee_size % 8 != 0` (a multiple-of-8 committee has no
+    /// padding bits, so no out-of-range bit is settable within the correct
+    /// length). Like the other cert-forgery audits the cert is invalid by
+    /// construction, so the actuator ships it past the producer's own
+    /// pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_non_member_cert: bool,
     /// Announce a fabricated EB on any RB this node produces this slot (the
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
@@ -349,6 +400,9 @@ mod tests {
         // The cert-forgery audit must default off, or the honest node would
         // ship a deliberately-invalid certificate.
         assert!(!d.praos.forge_single_bls_cert);
+        assert!(!d.praos.forge_wrong_len_cert);
+        assert!(!d.praos.forge_wrong_context_cert);
+        assert!(!d.praos.forge_non_member_cert);
         assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
