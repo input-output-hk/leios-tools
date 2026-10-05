@@ -1,0 +1,197 @@
+# Agent Instructions for net-rs
+
+These instructions apply to this directory and its descendants, in addition to
+`../AGENTS.md`. Commands and local paths below are relative to `net-rs/` unless
+stated otherwise. This file adapts the networking guidance in `CLAUDE.md`.
+
+## Project Overview
+
+Rust implementation of the Cardano mini-protocol network stack for Praos and Leios protocols.
+
+This public workspace contains the reusable networking crates: `net-codec` (Cardano ledger-object CBOR), `net-core` (protocol logic), and `net-cli` (testing/demo CLI). The live-network tooling (test node, cluster orchestrator, web UI) lives in a separate private repository.
+
+### Goals
+
+- Network prototyping and simulation
+- Fast Leios on-ramp for downstream tools (Acropolis, Dolos, Ogmios)
+- Reference design for node implementors
+
+## Build & Test Commands
+
+```sh
+cargo build --workspace --all-targets  # include tests, benches, and examples
+cargo test --workspace                # run all workspace tests
+cargo clippy --workspace --all-targets # lint
+cargo fmt --all --check               # format check
+```
+
+## Testing
+
+```sh
+cargo test                     # run all unit + integration tests
+cargo run -p net-cli -- handshake backbone.cardano.iog.io:3001  # live test against mainnet
+cargo run -p net-cli -- capture backbone.cardano.iog.io:3001    # capture wire bytes for test vectors
+cargo run -p net-cli -- serve --port 9999 --block-rate 0.05     # fake server (Poisson blocks)
+cargo run -p net-cli -- follow 127.0.0.1:9999                   # follow fake server
+cargo run -p net-cli -- submit 127.0.0.1:9999                   # submit tx to fake server
+cargo run -p net-cli -- peer-share cardano-main2.everstake.one:3001  # peer sharing (live, supports peer_sharing=1)
+cargo run -p net-cli -- multi-follow --host backbone.cardano.iog.io:3001 --host backbone.cardano.iog.io:3001  # multi-peer follow (live)
+cargo run -p net-cli -- multi-follow --host backbone.cardano.iog.io:3001 --listen 0.0.0.0:8888  # relay mode (live upstream, local downstream)
+cargo run -p net-cli -- serve --port 9999 --block-rate 0.5 --leios  # fake server with Leios EB/vote generation
+cargo run -p net-cli -- multi-follow --host 127.0.0.1:9999 --leios  # follow with Leios notifications
+RUST_LOG=debug cargo run -p net-cli -- multi-follow --host 127.0.0.1:9999 --host 127.0.0.1:9999 --leios  # multi-peer Leios dedup (two connections, observe dedup/routing logs)
+```
+
+### Test vector workflow
+
+When implementing a new protocol or changing CBOR encoding:
+
+1. Use `net-cli capture` (or write a similar capture command) to record the raw bytes exchanged with a real Cardano node
+2. Add the captured bytes as `const` test vectors in the relevant codec test module
+3. Write tests that: (a) decode the captured bytes, (b) verify our encoding matches the captured bytes, (c) round-trip our types through encode/decode
+4. This ensures wire compatibility with the live network, not just self-consistency
+
+Keep fixtures with the relevant codec/protocol tests. Read `net-codec/README.md`,
+`net-core/README.md`, and the per-protocol README files alongside the implementation.
+
+## Code Standards
+
+- **No panics** — every `unwrap()`, `expect()`, indexing, etc. must be handled. Use `Result`/`Option` propagation.
+- **Simplicity over concision** — code must be legible to non-Rust developers. When there's a choice, be explicit.
+- **Minimal dependencies** — do not introduce new C-binding dependencies. Discuss significant new dependencies with the user before adding them; existing dependencies do not authorize unrelated removal work.
+- **Stable Rust only** — no nightly or unstable features.
+- **High performance, high security** — avoid unnecessary allocations, copies, and unsafe code.
+
+## Architecture Notes
+
+### Multiplexing
+
+Cardano mini-protocols are carried over a single multiplexed TCP socket per node pair (per direction if duplexed). Leios introduces large messages that can head-of-line block time-critical Praos messages, so the multiplexer needs QoS facilities:
+
+- Two-class scheduling via `PriorityWfq` (default): Priority class (Praos, absolute) + Default class (Leios/PeerSharing, message-based WFQ with configurable weights)
+- Alternative schedulers: `StrictPriority` (hardwired tiers, can starve), `RoundRobin` (testing)
+- Per-protocol traffic class configurable via `--protocol-priority` CLI flag
+
+### Codecs
+
+Messages use CBOR encoding (CDDL-specified). The multiplexing protocol has no framing bits for message boundaries — we need an efficient solution rather than successive decode attempts.
+
+### Timeouts
+
+Protocol timeouts must be implemented and enforced, both detection and handling.
+
+### Alternate Transports
+
+The bearer/transport layer must be trait-based and pluggable. Current scope is TCP only (no Unix sockets / N2C), but the design must not block future transports (Unix sockets, QUIC, etc.).
+
+## Workspace Structure
+
+```
+net-rs/
+  Cargo.toml            -- workspace root
+  net-codec/            -- public library crate: Cardano ledger-object CBOR
+    src/
+      lib.rs            -- Point, Tip, Vote (re-exported from shared-consensus), encode/decode_points, size constants
+      header.rs         -- WrappedHeader, HeaderInfo (Shelley+ header parser with Leios extensions), header_hash
+      block.rs          -- BlockBody, LeiosBlockInfo (block body parser), praos_inspect
+      eb.rs             -- CIP-0164 overflow EB manifest codec (encode/decode_overflow_eb)
+  net-core/             -- library crate
+    src/
+      lib.rs
+      bearer/           -- Bearer trait (mod.rs), TcpBearer (tcp.rs), MemBearer (mem.rs)
+      mux/              -- Multiplexer: wire format, egress/ingress tasks, channels, scheduler, CBOR codec
+        scheduler/      -- Scheduling strategies: PriorityWfq (default), StrictPriority, RoundRobin
+        codec.rs        -- CBOR framing over mux channels (CodecSend/CodecRecv)
+      types/            -- Shared Cardano types
+        mod.rs          -- re-exports the ledger-object codec from the net-codec crate (Point, Tip, WrappedHeader, BlockBody, encode/decode_points)
+      protocols/
+        protocol.rs     -- Protocol trait, Runner with agency-checked send/recv
+        handshake/      -- Handshake protocol (state machine, CBOR codec, N2N version data)
+        chainsync/      -- ChainSync protocol (follow chain tip, intersection finding)
+        blockfetch/     -- BlockFetch protocol (request and stream block ranges)
+        keepalive/      -- KeepAlive protocol (ping/pong to keep connections alive)
+        txsubmission/   -- TxSubmission protocol (pull-based tx dissemination, blocking/non-blocking)
+        peersharing/    -- PeerSharing protocol (peer discovery, IPv4/IPv6 addresses)
+        leios_notify/   -- LeiosNotify protocol (Leios announcement, protocol ID 18)
+        leios_fetch/    -- LeiosFetch protocol (Leios data fetch with bitmap TX addressing, protocol ID 19)
+      peer/
+        mod.rs             -- PeerId, ConnectionMode, PeerError
+        types.rs           -- PeerEvent, PeerCommand
+        command_dispatch.rs -- routes PeerCommand messages to protocol sub-tasks
+        connect.rs         -- connection helpers (TCP + mux + handshake, moved from net-cli)
+        peer_task.rs       -- per-peer initiator task: client protocol sub-tasks
+        duplex_task.rs     -- per-peer duplex task: both client + server on one connection (also used for inbound connections from the accept loop)
+        server_handlers.rs -- server-side protocol handlers (ChainSync/BlockFetch/KeepAlive/TxSubmission/PeerSharing/LeiosNotify/LeiosFetch)
+      multi_peer/
+        mod.rs            -- CoordinatorConfig, CoordinatorHandle, spawn_coordinator
+        types.rs          -- NetworkEvent, NetworkCommand
+        coordinator.rs    -- coordinator: peer aggregation, tip dedup, fetch routing, accept loop, reconnection
+        chain_fragment.rs -- ChainFragment: per-peer ordered point set for fork-aware fetch routing
+      store/
+        mod.rs            -- module root
+        chain_store.rs    -- ChainStore: shared in-memory chain state for responder peers
+        leios_store.rs    -- LeiosStore: content-addressed store for Leios data (EBs, votes)
+  net-cli/              -- binary crate (CLI tools for testing and demos)
+    src/
+      main.rs           -- subcommand dispatch
+      connect.rs        -- re-exports net_core::peer::connect
+      handshake.rs      -- `handshake` command (connect + negotiate)
+      capture.rs        -- `capture` command (raw byte capture for test vectors)
+      chainsync.rs      -- `chain-sync` command (follow chain tip)
+      blockfetch.rs     -- `block-fetch` command (fetch blocks)
+      follow.rs         -- `follow` command (persistent single-peer chain follower)
+      multi_follow.rs   -- `multi-follow` command (multi-peer chain follower via coordinator, --listen, --duplex)
+      serve.rs          -- `serve` command (fake server via coordinator with Poisson block generation)
+      submit.rs         -- `submit` command (tx submission with Poisson generation)
+      peershare.rs      -- `peer-share` command (request peers from a node)
+```
+
+## Key Design Decisions
+
+- **Bearer**: trait-based (not enum) for transport pluggability
+- **Mux**: per-protocol egress queues with pluggable Scheduler trait; egress uses shared `tokio::sync::Notify` for event-driven wakeup (signalled by `ChannelSend` on write); demuxer uses `try_send` (never blocks); supervisor auto-aborts peer on task failure
+- **Ingress accounting**: shared `Arc<AtomicUsize>` between demuxer and ChannelRecv for accurate buffer tracking; shared `IngressLimit` atomic allows Runner to update per-state size limits at the demuxer (closest to TCP socket)
+- **Codec**: `for<'a> Decode<'a>` (HRTB) so decoded types are owned, avoiding borrow conflicts
+- **Protocol framework**: `Runner` wraps codec + state, provides agency-checked `send()`/`recv()` — protocols use it directly in async functions (not a generic driver loop). Runner updates demuxer ingress limit on every state transition. `Protocol::size_limit()` is a required trait method (must return nonzero)
+- **SDU size**: default 12,288 bytes (Cardano standard), not 65,535
+- **Parsed headers, opaque blocks**: `WrappedHeader` stores raw CBOR bytes plus parsed `HeaderInfo` (Shelley+ era, slot, block_number, prev_hash, issuer_vkey, body_size, block_body_hash, CIP-0164 Leios extensions). `BlockBody` stores raw bytes plus parsed `LeiosBlockInfo` (EB certificate if present); `BlockBody::point()` extracts the header from the block body, parses it for slot, and computes Blake2b-256 for the block hash. `BlockBody::header()` extracts the header as a `WrappedHeader` (used by the coordinator as fallback when `pending_headers` misses). Byron headers/blocks return `None` gracefully. Verify optional Leios field layouts against the current codec and captured wire vectors; historical field counts may describe an older prototype.
+- **Composable client helpers**: protocols expose simple async functions (`find_intersection`, `request_next`, `recv_block`) rather than complex callback frameworks
+- **Server uses Message directly**: server-side code uses `runner.recv()` / `runner.send()` with Message enums — no separate Request/Response types (Runner enforces agency)
+- **Multi-peer coordinator**: task-per-peer with a shared coordinator task. Each peer runs an independent tokio task tree; coordinator aggregates state via channels. Per-peer tasks fan-in `(PeerId, PeerEvent)` to coordinator; coordinator sends `PeerCommand` per-peer. Application interface is peer-agnostic (`NetworkEvent`/`NetworkCommand`). Three connection modes: InitiatorOnly (outbound, client protocols), ResponderOnly (inbound, server protocols), Duplex (both on one connection). Mux uses `(ProtocolId, u16)` composite keys to support both directions per protocol ID. ChainStore shared between coordinator and responder/duplex peers; populated via `InjectBlock`/`InjectRollback` commands or from initiator peer `BlockFetched` events (coordinator derives point via `body.point()`). Accept loop for inbound connections via `listen_address` config. Exponential backoff reconnection for initiator/duplex peers; no reconnection for responder peers. Per-peer `ChainFragment` tracks the ordered set of points announced via ChainSync (intersection + headers), truncated on rollback, pruned on successful fetch. Block fetch routing uses `fragment.contains(&point)` for fork-aware peer selection (lowest RTT among candidates). `PeerEvent::IntersectionFound` surfaces the intersection point from `find_intersection`. `PeerEvent::BlockFetchFailed` / `NetworkEvent::BlockFetchFailed` surface NoBlocks responses. `WrappedHeader::point()` derives header points via shared `header_hash()` helper (Blake2b-256). `NetworkCommand::SubmitTransaction` broadcasts a transaction to all connected peers via `PeerCommand::SubmitTransaction`; each peer's `spawn_txsubmission` feeds it to `txsubmission::run_client()`.
+- **Leios per-peer integration**: `leios_enabled: bool` config flag (default false). When true, per-peer tasks register LeiosNotify (ID 18) and LeiosFetch (ID 19) alongside Praos protocols. `spawn_leios_notify` runs continuous request_next loop; `spawn_leios_fetch` is command-driven (like BlockFetch). Server handlers `serve_leios_notify`/`serve_leios_fetch` read from `LeiosStore`. `LeiosStore` is a content-addressed blob store separate from `ChainStore` (Leios data keyed by `(slot, hash)`, not part of a linear chain).
+- **Leios coordinator intelligence**: Coordinator deduplicates EB, TX, and vote offers across peers using slot-bounded seen sets (configurable `leios_dedup_window`, default 1000 slots). Tracks which peers offered which data for RTT-based smart fetch routing (mirrors Praos `FetchBlock` pattern). Pending fetch maps prevent duplicate in-flight requests. Vote batches are deduped per-vote (partial forwarding). App-driven fetching: coordinator does not auto-fetch, app issues `FetchLeiosBlock`/`FetchLeiosBlockTxs`/`FetchLeiosVotes` commands. `LeiosBlockTxsOffered` is a separate event from `LeiosBlockOffered` (not collapsed). `FetchLeiosBlockTxs` carries bitmap for selective TX addressing.
+- **Two-class scheduling**: Mux uses `PriorityWfq` scheduler (default). `ProtocolConfig` carries `traffic_class: TrafficClass` (`Priority` or `Default(weight)`). Priority class (Praos protocols: Handshake, ChainSync, BlockFetch, TxSubmission, KeepAlive) is always serviced first, round-robin among ready. Default class (LeiosFetch, LeiosNotify, PeerSharing; weight=1) uses message-based WFQ — each protocol gets turns proportional to its weight, only when no Priority protocol has data. Prevents starvation among Leios protocols while maintaining absolute Praos priority. `StrictPriority` (hardwired tiers by protocol ID, can starve) and `RoundRobin` (ignores traffic class) available as alternatives. Schedulers live in `net-core/src/mux/scheduler/` (one file each). Scheduler selectable via `CoordinatorConfig.scheduler_type` / CLI `--scheduler <priority-wfq|strict-priority|round-robin>`. Per-protocol traffic class configurable via `CoordinatorConfig.traffic_class_overrides` / CLI `--protocol-priority <id>,<P|weight>`. Both flags shared across `serve`, `follow`, `multi-follow` via `SchedulerArgs` flatten. `AnyScheduler` enum dispatches to all three implementations. LeiosFetch range requests do not get elevated priority (CIP-0164 suggests a separate protocol for that; deferred).
+
+### Resolved: coordinator event-loop backpressure (was `.send().await` blocking)
+
+Previously the coordinator event loop used `.send().await` on the `network_events` channel (capacity 64) and per-peer `commands` channels (capacity 16); a stalled application consumer or peer task blocked the whole loop, stalling all peers. This is now non-blocking:
+
+- **`emit_event` uses `try_send`** onto `network_events` (capacity `NETWORK_EVENTS_CAPACITY` = 65536). The coordinator never awaits an application send.
+- **`send_peer_command` uses `try_send`** onto per-peer `commands` (capacity `PEER_COMMAND_CAPACITY` = 4096). A `Full`/`Closed` channel means the peer task is broken → the peer is scheduled for removal via `pending_removals` (drained after each `select!` iteration) rather than blocking.
+- **Backpressure lands on peer tasks, not the loop.** The `peer_events` `select!` branch is gated on `network_events.capacity() >= MIN_EMIT_HEADROOM` (1024). When the application is slow the branch is disabled, so the coordinator stops reading peer events; peer tasks then block on their shared `peer_event_sender.send().await`, cascading backpressure through the mux demuxer to TCP. The other branches (commands, inbound connections, timers) keep running, so the coordinator stays live. Handlers may emit several events per peer event, so `MIN_EMIT_HEADROOM` reserves enough slots for a handler to complete without an emit failure.
+
+Regression test: `coordinator_still_processes_commands_when_app_is_slow`.
+
+Related, still open (net-node, private repo): the per-node main loop can fall behind during heavy slots (production/reorg/telemetry are synchronous on the loop), which fills the mempool **admit-fanout** channel (`ADMIT_FANOUT_CAPACITY` = 1024) and drops proactive announce notifications. This is a *benign* degradation — the tx stays in the mempool and is served on the next `MsgRequestTxIds` pull — not data loss; it only adds one pull-cycle of announce latency. Fixing the root (de-serialising the main loop) is a larger change; raising the capacity only masks it.
+
+## Historical Status
+
+The implementation-phase history and old test totals remain in `CLAUDE.md`.
+Report current results from the affected crates; do not use those historical
+counts or an earlier scheduler choice as acceptance criteria.
+
+## Documentation
+
+- `docs/praos-network.md` — protocol reference: multiplexer wire format, all six N2N mini-protocols (state machines, CBOR CDDL, timeouts, size limits), concrete Cardano era-tagged types
+- `docs/implementation-haskell.md` — how ouroboros-network implements the protocols: mux architecture (Wanton + round-robin), typed-protocol framework, connection manager, per-protocol notes
+- `docs/implementation-pallas-v1.md` — how pallas-network v1 implements them: facade API, multiplexer, codec patterns, design assessment with strengths/weaknesses for our use case
+- `docs/implementation-pallas-v2.md` — how pallas-network2 redesigns them: Interface/Behavior/Manager layering, pure state machines, visitor pattern, promotion system, comparison tables
+- `docs/leios-changes.md` — CIP-0164 Leios additions: new protocols (LeiosNotify, LeiosFetch), modified Praos headers/blocks, new data types (EB, votes, certificates, BLS), QoS/priority requirements, and structural implications for net-rs
+
+## References
+
+- [Cardano network spec (Praos)](https://ouroboros-network.cardano.intersectmbo.org/pdfs/network-spec/network-spec.pdf)
+- [Cardano blueprint](https://cardano-scaling.github.io/cardano-blueprint/network/index.html)
+- [CIP-0164 Leios spec](https://cips.cardano.org/cip/CIP-0164#network)
+- [Haskell ouroboros-network](https://github.com/IntersectMBO/ouroboros-network) — live Praos deployment
+- [Pallas v1](https://github.com/txpipe/pallas/tree/main/pallas-network) / [v2](https://github.com/txpipe/pallas/tree/main/pallas-network2) — existing Rust implementations
