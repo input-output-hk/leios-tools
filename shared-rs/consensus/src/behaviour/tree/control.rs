@@ -224,6 +224,23 @@ pub struct LeiosControl {
     /// announcement, even once its body is held. Only meaningful with
     /// `fetch_flood_rate > 0`. Default `0`.
     pub fetch_flood_window_slots: u64,
+    /// net-flood (T35): `true` while the `net-flood` action is active, telling a
+    /// flood-only node's actuator to run the embedded net-flood engine. `false`
+    /// (default) keeps `ControlSignal::default()` honest / stops the engine.
+    /// Ignored by normal nodes (only a `run_mode = flood-only` node acts on it).
+    pub net_flood_active: bool,
+    /// net-flood: which engine — `"eb"` (LeiosFetch) or `"praos"` (BlockFetch).
+    /// Only meaningful with `net_flood_active`.
+    pub net_flood_attack: String,
+    /// net-flood: target pool names (resolved against the node's registry); empty
+    /// means every pool.
+    pub net_flood_pools: Vec<String>,
+    /// net-flood: downstream connections to open per relay.
+    pub net_flood_connections_per_relay: u32,
+    /// net-flood (praos engine only): block-range width per request.
+    pub net_flood_range_width: u32,
+    /// net-flood (praos engine only): blocks back from the tip to target.
+    pub net_flood_tip_offset: u32,
 }
 
 /// Mempool-domain actuator inputs.

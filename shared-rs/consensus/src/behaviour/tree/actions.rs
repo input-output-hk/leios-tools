@@ -138,6 +138,19 @@ pub fn build_action(
             rate: *rate,
             window_slots: *window_slots,
         }),
+        ActionSpec::NetFlood {
+            attack,
+            pools,
+            connections_per_relay,
+            range_width,
+            tip_offset,
+        } => Box::new(catalogue::NetFlood {
+            attack: attack.clone(),
+            pools: pools.clone(),
+            connections_per_relay: *connections_per_relay,
+            range_width: *range_width,
+            tip_offset: *tip_offset,
+        }),
         ActionSpec::EbBurst {
             withhold_slots,
             count,

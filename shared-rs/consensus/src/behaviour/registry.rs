@@ -163,6 +163,36 @@ pub enum ActionSpec {
         #[serde(default = "default_fetch_flood_window_slots")]
         window_slots: u64,
     },
+    /// net-flood (T35) — the *isolated* fetch-flood. A dedicated flood-only node
+    /// opens many of its OWN downstream connections to named target pools and
+    /// re-requests EB bodies (`attack = "eb"`) or block-body ranges
+    /// (`attack = "praos"`), draining the target's serve capacity. Unlike
+    /// `fetch-flood` (which re-uses this node's existing upstream peers), net-flood
+    /// is a clean-room attacker and only runs in a node configured
+    /// `run_mode = "flood-only"` (so the node isn't also a participating peer and
+    /// does not distort the measurement). Carries pool *names*; the
+    /// pool->address registry and network magic live in the node's own config.
+    /// While this action is active (slot-gated like any other), the embedded flood
+    /// engine runs; `go_honest` / deselecting it stops the engine.
+    #[serde(rename = "net-flood")]
+    NetFlood {
+        /// Which flood engine: `"eb"` (LeiosFetch EB bodies) or `"praos"`
+        /// (BlockFetch block-body ranges).
+        #[serde(default = "default_net_flood_attack")]
+        attack: String,
+        /// Target pool names from the node's registry; empty = every pool.
+        #[serde(default)]
+        pools: Vec<String>,
+        /// Downstream connections to open per relay.
+        #[serde(default = "default_net_flood_conns")]
+        connections_per_relay: u32,
+        /// praos only: block-range width per request (ignored for `eb`).
+        #[serde(default = "default_net_flood_range_width")]
+        range_width: u32,
+        /// praos only: blocks back from the tip to target (ignored for `eb`).
+        #[serde(default = "default_net_flood_tip_offset")]
+        tip_offset: u32,
+    },
     /// eb-burst (T23) — withhold `count` REAL, self-produced EBs, then release
     /// the whole batch in one tick. (`withhold_slots`/`n_txs` are legacy spec
     /// fields, unused by the real-EB actuator.)
@@ -211,6 +241,22 @@ fn default_fetch_flood_rate() -> u32 {
 
 fn default_fetch_flood_window_slots() -> u64 {
     80
+}
+
+fn default_net_flood_attack() -> String {
+    "eb".to_string()
+}
+
+fn default_net_flood_conns() -> u32 {
+    100
+}
+
+fn default_net_flood_range_width() -> u32 {
+    1
+}
+
+fn default_net_flood_tip_offset() -> u32 {
+    3
 }
 
 fn default_flood_count() -> u32 {
