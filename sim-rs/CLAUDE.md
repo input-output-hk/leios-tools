@@ -71,7 +71,7 @@ The sequential engine (including multi-shard turbo) produces bit-identical resul
 
 ### Node Implementation Pattern
 
-All node variants implement `NodeImpl` trait (`sim-core/src/sim/node.rs`), which defines handlers for: new slots, incoming transactions, network messages, CPU task completions, timed events, and custom events. Each handler returns `EventResult` carrying outgoing messages, CPU tasks, and future timed events.
+All node variants implement `NodeImpl` trait (`sim-core/src/sim.rs`), which defines handlers for: new slots, incoming transactions, network messages, CPU task completions, timed events, and custom events. Each handler returns `EventResult` carrying outgoing messages, CPU tasks, and future timed events.
 
 `NodeDriver<N>` (`sim-core/src/sim/driver.rs`) wraps a `NodeImpl` in a tokio task with a `BinaryHeap<FutureEvent>` event loop that selects on network messages, transactions, and timed events.
 
