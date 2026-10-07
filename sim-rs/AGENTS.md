@@ -1,6 +1,9 @@
-# CLAUDE.md
+# Agent Instructions for sim-rs
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+These instructions apply to this directory and its descendants, in addition to
+`../AGENTS.md`. Commands and paths below are relative to `sim-rs/` unless stated
+otherwise. Read `../shared-rs/consensus/AGENTS.md` before changing the shared
+engine. This file adapts the simulator guidance in `CLAUDE.md`.
 
 ## Build & Test Commands
 
@@ -10,21 +13,28 @@ cargo test                     # run all tests (this is what CI runs)
 cargo test -p sim-core         # test only the core library
 cargo test clock               # run tests matching "clock"
 cargo clippy                   # lint
-cargo run --release -- [topology.yaml] [output.jsonl] -s 100 -p parameters/linear.yaml
+cargo run --release -p sim-cli -- ../data/simulation/pseudo-mainnet/topology-v4-mini.yaml /tmp/leios-sim-events.jsonl -s 100 -p parameters/linear.yaml
 ```
 
-Rust toolchain: **1.88** (edition 2024). CI runs on Ubuntu 22.04.
+The simulator crates use Rust edition 2024 and declare **1.88** as their minimum
+Rust version. CI currently uses **1.92.0** on Ubuntu 22.04; check
+`../.github/workflows/sim-rs.yaml` and `../.github/workflows/build.yaml` when updating
+the toolchain.
 
 ## Running the Simulator
 
 The `sim-cli` binary takes a topology YAML, optional output path, and flags:
+
 - `-p <file>` — parameter overrides (layered via figment on top of `parameters/config.default.yaml`)
 - `-s <n>` — number of slots to simulate
 - `--trace-node <id>` — enable per-node tracing
 - `-c` — conformance events mode
 - `-a` — aggregate events mode
 
-Without a topology argument, it searches default paths including `../../data/simulation/topo-default-100.yaml`.
+Pass a topology explicitly, for example
+`../data/simulation/pseudo-mainnet/topology-v4-mini.yaml`. The CLI still searches
+legacy default paths when the argument is omitted, but the referenced
+`topo-default-100.yaml` is absent from this checkout.
 
 ## Architecture
 
@@ -35,11 +45,12 @@ Two-crate workspace: **sim-core** (library) and **sim-cli** (binary).
 Two engines selected by `engine` parameter (default: `actor`):
 
 - **`actor`** — tokio-based async actor system. Each node runs as a tokio task coordinated by a virtual clock (`sim-core/src/sim/actor.rs`). Non-deterministic due to async scheduling. Supports adversarial scenarios.
-- **`sequential`** — discrete event simulation (DES) processing events in strict timestamp order (`sim-core/src/sim/sequential.rs`). Deterministic (see below). Uses rayon to parallelise simultaneous events across nodes within each timestep (BSP). Does not support attacker configs.
+- **`sequential`** — discrete event simulation (DES) processing events in strict timestamp order (`sim-core/src/sim/sequential.rs`). Deterministic (see below). Uses rayon to parallelise simultaneous events across nodes within each timestep (BSP). Legacy attacker support is limited: `late_eb_attack` is explicitly ignored by this engine. Check the selected variant and its adapter for behavior-tree support instead of assuming all attack mechanisms are equivalent.
 
 ### Sharding
 
 Nodes can be partitioned into shards for parallel execution. Both engines support sharding. Configured via:
+
 - `shard-count` — number of shards (default: 1)
 - `shard-strategy` — how nodes are assigned: `round-robin`, `zero-latency-clusters` (recommended), `geographic`, `min-latency-clusters`, `min-cut`
 
@@ -47,7 +58,7 @@ Shard assignment: `sim-core/src/sharding.rs`. For fast runs, use `-p parameters/
 
 ### Determinism
 
-The sequential engine (including multi-shard turbo) produces bit-identical results across runs with the same seed/config. This required fixing several non-obvious sources of non-determinism:
+Preserve the sequential engine's same-seed/config determinism contract, including multi-shard turbo. Verify bit-identical results using the repeat-run comparison below when changing scheduling or event ordering. This required fixing several non-obvious sources of non-determinism:
 
 1. **HashMap iteration** — Node state in `linear_leios.rs` uses `BTreeMap`/`BTreeSet` (not `HashMap`/`HashSet`) for all fields that could be iterated. Remaining `HashSet` usages are pure membership tests (contains/insert) and are noted as such. The `praos` state and `Connection` bandwidth queues were already `BTreeMap`.
 
@@ -84,9 +95,13 @@ Four node implementations selected by `config.variant`:
 | `sim/leios.rs` | `Short`, `Full`, `FullWithTxReferences` |
 | `sim/stracciatella.rs` | `FullWithoutIbs` (EBs reference TXs directly) |
 | `sim/linear_leios.rs` | `Linear`, `LinearWithTxReferences` |
-| `sim/shared_consensus.rs` | `SharedConsensus` (YAML: `shared-consensus` — thin adapter over `shared-consensus` crate at `shared-rs/consensus/`) |
+| `sim/shared_consensus.rs` | `SharedConsensus` (YAML: `shared-consensus` — thin adapter over `shared-consensus` crate at `../shared-rs/consensus/`) |
 
-`Simulation::new()` in `sim-core/src/sim.rs` dispatches on variant to construct the appropriate node types.
+Legend: IB = input block; EB = endorser block; TX = transaction. Module paths in
+the table are relative to `sim-core/src/`.
+
+`Simulation::new()` in `sim-core/src/sim.rs` dispatches by engine; the engine
+constructs node types for the selected variant.
 
 ### Network Layer
 
@@ -152,7 +167,7 @@ To verify turbo determinism, run the same config twice and compare:
 # Summary stats (should match exactly except wall-clock time):
 ./scripts/cip-voting-options.sh -e turbo -T 0.350 -m everyone -S 0 -L run1
 ./scripts/cip-voting-options.sh -e turbo -T 0.350 -m everyone -S 0 -L run2
-grep 'run[12]' voting_results.csv
+rg 'run[12]' voting_results.csv
 
 # Byte-identical event streams:
 ./scripts/cip-voting-options.sh -e turbo -T 0.350 -m everyone -S 0 -L a -o /tmp/det -s 100
@@ -162,7 +177,13 @@ cmp /tmp/det/T0.350-everyone-turbo-seed0-a.jsonl /tmp/det/T0.350-everyone-turbo-
 
 **Performance notes**: Turbo at 0.350 throughput / 750 nodes / 1500 slots takes ~15 min and ~28GB RSS. The `.jsonl` event stream adds ~15GB memory (unbounded mpsc buffering) and ~60GB disk per run. Do not run two benchmarks simultaneously — they compete for CPU and memory.
 
-On 1500-node topologies the per-node `txs` cache scales linearly, pushing sim-phase RSS to ~50–58 GB at NA,0.350. The end-of-sim flush from the EventMonitor's 1-second timestamp-bucket sort window adds a transient ~5–8 GB on top (the `buffered output events` counter peaks at >10M events for one window). 1500n high-throughput runs require swap to fit on a 60 GB box; see `analysis/sims/2026w18/CLAUDE.md` for the memory budget. Reducing `flush_window` at `sim-cli/src/events.rs:181` from `from_secs(1)` to `from_millis(100)` would cut the spike ~10× without altering correctness (inter-shard skew is bounded by min_latency, typically a few ms).
+Historical 1500-node high-throughput runs used roughly 50–58 GB resident
+memory before an additional 5–8 GB event-flush spike. Treat these as sizing
+observations, not guaranteed current measurements. Inspect the current event
+buffering in `sim-cli/src/events.rs` and measure memory before a large run.
+Changes to flush windows must preserve event ordering and pass the determinism
+comparison; do not assume a smaller window is automatically equivalent. The
+old external memory-budget document is not part of this checkout.
 
 ## Test Structure
 
