@@ -1,0 +1,25 @@
+# Two chains a1 -> a2 -> a3 and b1 -> b2 -> b3 where each a<i> conflicts
+# with b<i>: both spend the shared source c<i>. Side labels let a schedule
+# release side a to one node and side b to another at the same instant.
+version: 0
+experiment: conflicting-chains
+seed: 42
+params:
+  length: 3
+wallets:
+  alice: {}
+patterns:
+  - id: chains
+    use: conflicting_chains
+    with:
+      length: "{{ length }}"
+      conflict: per_step
+schedule:
+  releases:
+    - { select: { label: side-a }, target: node1, via: n2n, at: 0ms }
+    - { select: { label: side-b }, target: node2, via: n2n, at: 0ms }
+  targets:
+    node1: { host: "127.0.0.1:3001" }
+    node2: { host: "127.0.0.1:3002" }
+expect:
+  - { id: one_per_conflict, each_conflict_set: { on_chain: exactly_one } }

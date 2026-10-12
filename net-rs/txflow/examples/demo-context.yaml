@@ -1,0 +1,20 @@
+# Offline demo context. Everything here is FAKE and PUBLIC:
+# - the signing key is a well-known dummy value that controls no funds;
+# - the funding UTxO does not exist on any network.
+# The built transactions are valid in shape only and will be rejected by a
+# node. For a real run, offer UTxOs held by your own payment key and point
+# `signing_key_file` at its `.skey`; never commit that key. Offered UTxOs
+# must hold ADA only (no native tokens).
+network: testnet
+magic: 164            # recorded in the manifest
+era: dijkstra          # target era, recorded; txs are built in Conway format
+pparams:
+  min_fee_a: 44
+  min_fee_b: 155381
+  max_tx_size: 16384
+  coins_per_utxo_byte: 4310
+funding:
+  signing_key_hex: "00000000000000000000000000000000000000000000000000000000000000a1"
+  utxos:
+    - utxo: "1111111111111111111111111111111111111111111111111111111111111111#0"
+      lovelace: 1000000000
