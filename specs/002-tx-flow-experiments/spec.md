@@ -276,9 +276,10 @@ names.
   protocol parameters, era and funding UTxOs from a chain-context file.
 - **FR-012**: Given the same IR, seed, protocol parameters and funding UTxOs, materialise
   MUST produce a byte-identical manifest. The manifest MUST NOT contain wall-clock data.
-- **FR-013**: Each transaction MUST carry metadata with fixed-size identifiers only (IR
-  hash prefix, run id, transaction index), and MAY carry the tx-firehose colour tag
-  (label 1022) so existing mempool tooling keeps working.
+- **FR-013**: Each transaction MUST carry CIP-20 message metadata (label 674) with
+  short fixed-size identifiers only (IR hash prefix, run id, transaction index), so a
+  run's transactions can be attributed on chain and in node traces. It MAY also carry
+  the tx-firehose colour tag (label 1022) so existing mempool tooling keeps working.
 - **FR-014**: The manifest MUST record, per transaction: symbolic name, index, tx id,
   CBOR, size, resolved inputs, all conflict sets it belongs to, the conflict sets it is
   orphaned by, and labels; and for the run: network magic, era, protocol-parameter hash,
@@ -384,10 +385,20 @@ names.
 - The first target network is the proto-devnet in `ouroboros-leios/demo/proto-devnet`;
   Musashi follows. Funding comes from a payment key with sufficient balance; no faucet
   integration in the MVP.
-- Plain payments only in the MVP. Script patterns use an "always succeeds" validator
-  with a configurable execution budget until real validators are chosen.
-- The MVP uses the same key for both sides of a conflict. Per-side wallets are a spec
-  option, not a requirement.
+- Plain payments only in the MVP. The first script kinds are an "always succeeds"
+  Plutus validator with a configurable execution budget and native scripts (signature
+  and time-lock), until real validators are chosen.
+- Funding is a list of UTxOs the user offers, all spendable by one payment key.
+  Materialise uses the smallest prefix of that list that covers the experiment (sources,
+  a fee reserve per funding transaction and change) and reports a shortfall before
+  building anything. All symbolic wallets bind to the one run key, so both sides of a
+  conflict are signed by the same key; per-side wallets are a spec option, not a
+  requirement.
+- The `tools/txs` scenario runner (ARC repository, Python around `cardano-cli`) is kept
+  until `txflow` can fund and replay on Musashi. Its steps map onto `txflow` patterns
+  (`independent` → `independent`; `chain` with `depth` and `chains` → `chain` with
+  `length` and `count`), so its scenarios convert mechanically, and both tools use
+  label 674.
 - Chain observation (which transactions landed, in which RB/EB) uses an existing source
   (db-sync or node logs) rather than a new chain follower in the MVP. It also confirms
   funding (FR-016).
