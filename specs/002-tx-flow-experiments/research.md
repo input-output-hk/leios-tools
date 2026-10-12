@@ -37,6 +37,14 @@ does not exist anywhere we looked.
   offline, chains of unconfirmed transactions cost nothing extra, and conflicting
   siblings are built from the same input. It is Rust, like the rest of the repo, and
   `shared-rs` already depends on parts of Pallas (`pallas_vrf`, `pallas-math`).
+- **Risk, Dijkstra era**: Pallas 1.4.0 has no Dijkstra support. `pallas-txbuilder`
+  exposes only `BuildConway`, and neither `pallas-traverse` nor `pallas-validate` mention
+  Dijkstra (checked in the published 1.4.0 crates). The Leios devnets run Dijkstra
+  (`net-core`'s `ORIGIN_ERA` is 7). A plain payment's body may decode the same in both
+  eras, but that is unverified, so the first implementation task is a spike: build a
+  Conway payment with Pallas, submit it to the proto-devnet over N2C, and see whether it
+  is accepted. If it is not, the options are adding Dijkstra to Pallas upstream or a
+  thin Dijkstra encoder in `txflow` for the subset of fields the IR uses.
 - **Alternatives considered**:
   - *Evolution SDK* (IntersectMBO, TS): `chainResult()` gives the same chaining
     primitive, but adds a TypeScript runtime.
@@ -47,7 +55,11 @@ does not exist anywhere we looked.
 
 - **Decision**: the first transport is N2N TxSubmission using `net-core`; N2C follows.
 - **Rationale**: N2N lets one process hold connections to several peers and release to
-  them at the same instant, which is what cross-node conflict experiments need. It also
+  them at the same instant, which is what cross-node conflict experiments need. Its
+  limit: TxSubmission has no reply for a mempool rejection, so over N2N we only see that
+  a tx id was offered and whether its body was requested. Whether it was admitted comes
+  from observation (db-sync, node logs). N2C gives the node's accept/reject and reason,
+  which is why it remains a requirement (FR-019). It also
   turns the existing `net-cli submit` path (`net-rs/net-cli/src/submit.rs`) into a real
   submitter by feeding it manifest CBOR instead of random bytes. net-rs has no N2C client
   yet.
@@ -66,7 +78,20 @@ does not exist anywhere we looked.
   them underneath a `txflow` experiment gives realistic background load and stays
   comparable with other teams' runs.
 
-## D5. Design ideas borrowed
+## D5. Materialise offline from a chain-context file
+
+- **Decision**: materialise reads era, protocol parameters and funding UTxOs from a file
+  and does no network I/O. Submitting funding is a separate `fund` step.
+- **Rationale**: building fees and min-UTxO needs protocol parameters, and the funding
+  UTxOs must be known; net-rs has no LocalStateQuery client (it is TCP-only). Taking them
+  as a file keeps materialise deterministic and testable in CI, and lets every error
+  (including fee shortfalls) surface before anything is spent. A one-off query is an
+  acceptable dependency on `cardano-cli`/Ogmios/db-sync; wrapping every tx in
+  `cardano-cli` is what the user wants to avoid.
+- **Alternatives considered**: query and submit funding inside materialise (rejected:
+  errors in later txs would surface after funds were already locked in sources).
+
+## D6. Design ideas borrowed
 
 | Source | What we take |
 |---|---|
@@ -80,7 +105,7 @@ does not exist anywhere we looked.
 | `trix test` | `[[expect]]` assertions after a run |
 | SundaeSwap `sundae-contracts/lucid/main.ts` | Reference order→scoop flow for `order_batch` |
 
-## D6. Import from db-sync
+## D7. Import from db-sync
 
 - **Decision**: the importer reads cardano-db-sync.
 - **Rationale**: the project already runs a Leios-aware db-sync for Musashi, and db-sync
@@ -101,5 +126,6 @@ shapes. No CIP or paper found that defines a UTxO workload graph format.
 ## Not verified
 
 tx-centrifuge's final location; whether a tx3 TRP resolver accepts references to
-unconfirmed outputs (D1 avoids depending on it); Lucid Evolution and cardano-client-lib
+unconfirmed outputs (D1 avoids depending on it); whether a Leios node accepts a
+Conway-encoded payment in the Dijkstra era (D2 spike); Lucid Evolution and cardano-client-lib
 chaining API names; whether the SundaeSwap scooper source is public.

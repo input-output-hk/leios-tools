@@ -44,6 +44,13 @@ experiment spec ──expand──▶ graph IR ──materialise──▶ manife
 The spec and the IR are network- and version-independent. The manifest is one concrete
 binding of the IR to a network. The schedule says how the manifest is released.
 
+**Inputs are the primitive.** Each transaction names the outputs it spends and the
+outputs it only reads. Conflicts (two transactions spend one output), orphans (an
+ancestor did not land) and reference contention (one transaction spends what another
+reads) are never declared; `txflow` derives them from the inputs. This lifts the sim-rs
+limitation where each transaction has a single abstract `input_id` and can only conflict
+with the transaction generated just before it (`sim-rs/sim-core/src/sim/tx.rs`).
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - Run a hand-written conflict experiment on a devnet (Priority: P1) 🎯 MVP
@@ -67,19 +74,23 @@ chain observer records at most one transaction from each conflict set on chain.
 
 **Acceptance Scenarios**:
 
-1. **Given** the example spec and a funded key, **When** the user runs materialise,
-   **Then** the funding transaction is submitted and confirmed, six transactions are
-   built and signed without further network round-trips, and a manifest lists each by
-   symbolic name with its tx id, CBOR, size and conflict set.
-2. **Given** the manifest and a two-target schedule, **When** the user runs replay,
-   **Then** a-side transactions go only to the first target and b-side only to the
-   second, within the configured offset, and every outcome (accepted, rejected with
-   reason) is written as one JSON line keyed by symbolic name.
-3. **Given** the same spec, seed and funding UTxO, **When** materialise runs twice,
-   **Then** both manifests contain byte-identical transactions.
-4. **Given** a spec whose graph has a cycle, an input naming an output that does not
+1. **Given** the example spec and a chain-context file (protocol parameters, funding key
+   and UTxO), **When** the user runs materialise, **Then** the funding transaction and the
+   six experiment transactions are built, validated and signed with no network access,
+   nothing is submitted, and a manifest lists each by symbolic name with its tx id, CBOR,
+   size and conflict sets.
+2. **Given** that manifest, **When** the user runs fund, **Then** the funding
+   transaction is submitted and `txflow` waits until it is observed on chain.
+3. **Given** the funded manifest and a two-target schedule, **When** the user runs
+   replay, **Then** a-side transactions go only to the first target and b-side only to the
+   second, within the configured offset; every event the transport can report is written
+   as one JSON line keyed by symbolic name; and after the observation window each
+   transaction has one outcome (included, lost conflict, orphaned, not seen).
+4. **Given** the same spec, seed, protocol parameters and funding UTxO, **When**
+   materialise runs twice, **Then** both manifests are byte-identical.
+5. **Given** a spec whose graph has a cycle, an input naming an output that does not
    exist, or an output that cannot cover its fee, **When** the user runs expand or
-   materialise, **Then** `txflow` stops before submitting anything and names the
+   materialise, **Then** `txflow` stops before anything is submitted and names the
    offending transaction and field.
 
 ---
@@ -95,7 +106,8 @@ factor, instead of listing each transaction.
 transactions. Patterns make "the same experiment, 10× larger" a one-number change.
 
 **Independent Test**: Expand a spec using each pattern and compare the IR against
-checked-in snapshots; change `scale` and check that counts grow and structure does not.
+checked-in snapshots; change a `count` and check that instances are added without
+changing any instance's structure.
 
 **Acceptance Scenarios**:
 
@@ -105,8 +117,9 @@ checked-in snapshots; change `scale` and check that counts grow and structure do
 2. **Given** the same pattern with `conflict: root`, **When** expanded, **Then** only the
    first pair shares an input, and the IR marks later transactions as descendants of a
    conflict rather than as conflicts themselves.
-3. **Given** two instances of the same pattern, **When** expanded, **Then** their
-   transaction names are namespaced by instance and do not collide.
+3. **Given** two instances of the same pattern, or one instance with `count: 2`,
+   **When** expanded, **Then** their transaction names are namespaced by instance
+   (`<id>/…`, or `<id>_<k>/…` for counted instances) and do not collide.
 
 ---
 
@@ -120,8 +133,8 @@ can declare expected outcomes, so a rerun yields pass/fail as well as metrics.
 them unchanged is what makes results comparable across versions.
 
 **Independent Test**: Run one stored experiment against two node builds; check that both
-results files record the node version, protocol parameters and IR hash, that the IR hash
-is identical, and that declared expectations are evaluated and reported.
+results files record the node version, protocol parameters, IR hash and schedule hash,
+that both hashes are identical, and that declared expectations are evaluated and reported.
 
 **Acceptance Scenarios**:
 
@@ -192,18 +205,29 @@ names.
   conflicts; they become invalid when their parent loses. The IR and results must
   distinguish the two.
 - **Same-node conflicts**: sending both halves of a conflict to one node makes that
-  node reject the second. This is a valid outcome to record, not an error.
-- **Partial funding**: if the funding transaction is not confirmed within a timeout,
-  nothing else is submitted.
-- **Rejected ancestor**: if a transaction is rejected, the replayer still submits its
-  descendants by default (the network's reaction is the experiment) and records the
-  dependency, unless the schedule sets `skip_descendants_of_rejected`.
+  node keep only the first. Over N2C the second is reported as rejected; over N2N the
+  node requests or ignores the body without saying why, and only observation shows the
+  result. Either is a valid outcome to record, not an error.
+- **Partial funding**: if any funding transaction is not observed on chain within a
+  timeout, nothing else is submitted.
+- **Rejected ancestor**: the replayer still submits descendants of a transaction that
+  failed (the network's reaction is the experiment). For N2C releases the schedule can set
+  `skip_descendants_of_rejected`; N2N reports no rejections, so the option has no effect
+  there.
 - **Metadata cost**: experiment tags add bytes; manifests record each tx's size including
   tags so sizes are never compared against untagged runs by mistake.
-- **Era or parameter change** between materialise and replay: replay checks the network's
-  era and protocol parameters against the manifest and refuses on mismatch.
-- **Key reuse across concurrent runs**: two runs from one key would race for the same
-  UTxOs; the materialiser takes a lock file per key and refuses to start a second run.
+- **Era or parameter change** between materialise and replay: `fund` and `replay` take a
+  fresh chain-context file and refuse if its era or protocol-parameter hash differs from
+  the manifest's.
+- **Key reuse**: sources are paid to a run key derived from the funding key, IR hash and
+  seed, not to the funding key's address, so other tools and other runs using the funding
+  key cannot spend them between `fund` and `replay`. Two runs that name the same funding
+  UTxO conflict at funding time, and only one can be funded.
+- **Large experiments**: funding outputs are split across as many chained funding
+  transactions as `maxTxSize` requires.
+- **Long names**: transaction metadata carries only fixed-size ids (IR hash prefix, run
+  id, transaction index), never names or labels, so Cardano's 64-byte metadata string
+  limit cannot be hit.
 
 ## Requirements *(mandatory)*
 
@@ -219,13 +243,16 @@ names.
   another transaction by name and index.
 - **FR-003**: The IR MUST NOT contain tx ids, addresses, network magic or era-specific
   encodings.
-- **FR-004**: `txflow` MUST derive conflict sets from shared inputs, and MUST mark
-  descendants of conflicting transactions separately from conflicts.
+- **FR-004**: `txflow` MUST derive conflict sets from outputs spent by two or more
+  transactions, reference contention from outputs spent by one transaction and read by
+  another, and orphan relations from ancestors in a conflict set. Shared reference inputs
+  MUST NOT form a conflict.
 - **FR-005**: `txflow` MUST reject an IR that has a cycle, a dangling reference or a
   transaction with no inputs, and MUST list every derived conflict set when it expands
   or validates an IR, so an unintended shared input is visible before materialising.
 - **FR-006**: The IR MUST have a canonical serialisation and a content hash that is
-  stable across platforms and runs.
+  stable across platforms and runs, and that changes when any referenced validator
+  definition or tx3 template file changes. The schedule MUST have its own hash.
 
 **Patterns**
 
@@ -233,62 +260,75 @@ names.
   `fan_in`, `conflicting_chains`, `conflict_set` and `diamond` in the MVP, and
   `order_batch` and `contended_state` once script support exists.
 - **FR-008**: Pattern parameters MUST include counts (inputs, outputs, length, width,
-  conflicts) and a `scale` multiplier applied to counts, not to structure.
+  conflicts). Scaling MUST be explicit: a spec scales by referencing a parameter in
+  `count` or in a pattern argument, and no parameter is applied implicitly.
 - **FR-009**: Each pattern MUST have a checked-in snapshot test of its expanded IR.
 
 **Materialisation**
 
-- **FR-010**: `txflow` MUST fund an experiment with a single funding transaction that
-  creates exactly the sources the IR requires, and wait for it to be confirmed.
-- **FR-011**: `txflow` MUST build and sign all remaining transactions offline, in
-  topological order, with explicit inputs and fees, so tx ids are known before any
-  is submitted.
-- **FR-012**: Given the same IR, seed, protocol parameters and funding UTxO, materialise
-  MUST produce byte-identical transactions.
-- **FR-013**: Each transaction MUST carry metadata identifying the experiment, run and
-  symbolic name, and MAY carry the tx-firehose colour tag (label 1022) so existing
-  mempool tooling keeps working.
-- **FR-014**: The manifest MUST record, per transaction: symbolic name, tx id, CBOR,
-  size, resolved inputs, conflict set and labels; and for the run: network magic, era,
-  protocol-parameter hash, IR hash and seed.
+- **FR-010**: `txflow` MUST fund an experiment with funding transactions that create
+  exactly the sources the IR requires, splitting them across as many chained funding
+  transactions as the maximum transaction size needs, and paying them to a run key
+  derived from the funding key, IR hash and seed.
+- **FR-011**: `txflow` MUST build, validate and sign the funding transactions and every
+  experiment transaction offline, in topological order, with explicit inputs and fees,
+  before anything is submitted. Materialise MUST NOT perform network I/O; it reads
+  protocol parameters, era and funding UTxOs from a chain-context file.
+- **FR-012**: Given the same IR, seed, protocol parameters and funding UTxOs, materialise
+  MUST produce a byte-identical manifest. The manifest MUST NOT contain wall-clock data.
+- **FR-013**: Each transaction MUST carry metadata with fixed-size identifiers only (IR
+  hash prefix, run id, transaction index), and MAY carry the tx-firehose colour tag
+  (label 1022) so existing mempool tooling keeps working.
+- **FR-014**: The manifest MUST record, per transaction: symbolic name, index, tx id,
+  CBOR, size, resolved inputs, all conflict sets it belongs to, the conflict sets it is
+  orphaned by, and labels; and for the run: network magic, era, protocol-parameter hash,
+  IR hash, seed and run id.
 - **FR-015**: `txflow` MUST validate every built transaction locally (balance, fee,
   size limits, phase-1 rules) before writing the manifest.
 
-**Schedule and replay**
+**Funding, schedule and replay**
 
-- **FR-016**: The schedule MUST select transactions by name or label and assign each
+- **FR-016**: A separate `fund` step MUST submit the funding transactions and wait until
+  they are observed on chain; replay MUST refuse to start until funding is confirmed.
+- **FR-017**: The schedule MUST select transactions by name or label and assign each
   selection a target node, a transport and a release offset.
-- **FR-017**: Replay MUST support N2N TxSubmission (via the repository's net-rs stack),
+- **FR-018**: Replay MUST support N2N TxSubmission (via the repository's net-rs stack),
   including holding open connections to several targets and releasing to them at the
   same instant.
-- **FR-018**: Replay SHOULD support N2C LocalTxSubmission to a node socket.
-- **FR-019**: Replay MUST write one JSON line per event (submitted, accepted, rejected
-  with reason, observed on chain) keyed by symbolic name and tx id, with a monotonic
-  timestamp.
-- **FR-020**: Replay MUST refuse to start if the network's era or protocol parameters
-  differ from those recorded in the manifest.
+- **FR-019**: Replay SHOULD support N2C LocalTxSubmission to a node socket, so the node's
+  accept or reject decision and reason are recorded.
+- **FR-020**: Replay MUST write one JSON line per event keyed by symbolic name and tx id,
+  limited to what the transport reports (N2N: offered, body requested; N2C: accepted,
+  rejected with reason), plus `on_chain` events from an observer, with a monotonic
+  timestamp anchored to wall-clock time and slot at replay start.
+- **FR-021**: At the end of the observation window, replay MUST assign every submitted
+  transaction one outcome (included, lost conflict, orphaned, lost reference, not seen),
+  with additional causes when more than one applies.
+- **FR-022**: `fund` and `replay` MUST refuse to run if the era or protocol-parameter hash
+  in a fresh chain-context file differs from the manifest's.
 
 **Results and reruns**
 
-- **FR-021**: Every results file MUST record the node version reported by the target(s)
-  where available, the network, the IR hash, the seed and the `txflow` version.
-- **FR-022**: Specs MUST be able to declare expectations over results (inclusion of
-  conflict-set members, inclusion latency bounds, absence of both halves of a conflict
-  in one block), and a run MUST report each as pass or fail.
+- **FR-023**: Every results file MUST record the node version reported by the target(s)
+  where available, the network, the IR hash, the schedule hash, the seed and the `txflow`
+  version.
+- **FR-024**: Specs MUST be able to declare expectations over results (inclusion of
+  conflict-set members, inclusion latency bounds in slots, absence of both halves of a
+  conflict in one block), and a run MUST report each as pass or fail.
 
 **Import**
 
-- **FR-023**: `txflow` MUST import the transactions touching a set of script addresses or
+- **FR-025**: `txflow` MUST import the transactions touching a set of script addresses or
   policies over a slot range from a cardano-db-sync database into an IR and schedule.
-- **FR-024**: Import MUST support `shape`, `values` and `scripts` fidelity levels.
-- **FR-025**: Import MUST replace tx ids with names and addresses with roles, and
+- **FR-026**: Import MUST support `shape`, `values` and `scripts` fidelity levels.
+- **FR-027**: Import MUST replace tx ids with names and addresses with roles, and
   represent outputs from outside the selection as sources.
-- **FR-026**: Import SHOULD fit recognised patterns (at least `order_batch`) and emit a
+- **FR-028**: Import SHOULD fit recognised patterns (at least `order_batch`) and emit a
   pattern instance alongside the literal graph.
 
 **tx3 templates**
 
-- **FR-027**: A graph transaction MAY name a tx3 template and arguments; `txflow` MUST
+- **FR-029**: A graph transaction MAY name a tx3 template and arguments; `txflow` MUST
   bind every template input to a graph reference and build the transaction itself,
   without delegating input selection to a tx3 resolver.
 
@@ -297,11 +337,14 @@ names.
 - **Experiment spec**: what a person writes or the importer produces. Parameters,
   wallets, pattern instances, explicit transactions, schedule, expectations, seed.
 - **Pattern**: a named, parameterised generator of an IR fragment.
-- **Graph IR**: sources, transactions (inputs, outputs, labels, optional script or
-  template), derived conflict sets. Version- and network-free; has a content hash.
+- **Graph IR**: sources, validators, policies, transactions (inputs, reference inputs,
+  collateral, mint, outputs, labels, optional template), and derived relations (conflict
+  sets, reference contention, orphans). Version- and network-free; has a content hash.
+- **Chain context**: era, protocol parameters and funding UTxOs for one network, read by
+  materialise so it needs no network access.
 - **Source**: an abstract funding output the materialiser must provide (owner, value).
-- **Manifest**: one concrete binding of an IR to a network: funding, signed transactions,
-  name→tx id map, run metadata.
+- **Manifest**: one concrete binding of an IR to a chain context: funding transactions,
+  signed experiment transactions, name→tx id map, run metadata. No wall-clock data.
 - **Schedule**: selections of transactions mapped to target, transport and offset.
 - **Results**: append-only event log for one replay, plus the expectation report.
 
@@ -311,22 +354,33 @@ names.
 
 - **SC-001**: The a1..a3 / b1..b3 per-step conflict experiment can be written in at
   most 20 lines and run end to end on the proto-devnet with one command per stage.
-- **SC-002**: Materialising a 1,000-transaction chain takes one network round-trip
-  (the funding transaction) and completes in under 10 seconds on a developer laptop.
+- **SC-002**: Materialising a 1,000-transaction chain needs no network access and
+  completes in under 10 seconds on a developer laptop.
 - **SC-003**: Two materialisations with identical inputs produce identical manifests
   (byte comparison) in 100% of CI runs.
 - **SC-004**: A stored experiment reruns against a new node build with no edits to
-  the spec, and its results can be compared with the previous run by IR hash.
+  the spec, and its results can be compared with the previous run by IR hash and schedule
+  hash.
 - **SC-005**: Every transaction in a results file can be traced to its symbolic name and
   its pattern instance without consulting any other file.
 
 ## Assumptions
 
 - `txflow` is a new crate and binary in the `net-rs/` workspace so replay can use
-  `net-core`'s N2N stack directly. It depends on `net-codec`/`net-core` but does not
-  change them, so Piranha's path dependencies are unaffected.
+  `net-core`'s N2N stack directly. It needs additive changes to `net-core`: a per-tx
+  event when a peer requests a body (today `txsubmission::run_client` only drains a
+  channel), and later a Unix-socket bearer for N2C (net-rs is TCP-only today). Piranha
+  consumes `net-core` by path, so each of those changes must also be built against
+  `net-node` before merging.
 - Transactions are built with Pallas (`pallas-txbuilder`, `pallas-validate`); tx3
-  crates are used only to evaluate templates (story 5). See `research.md`.
+  crates are used only to evaluate templates (story 5). **Risk:** Pallas 1.4.0 builds and
+  validates Conway transactions only, while the Leios devnets run the Dijkstra era. The
+  first implementation task is a spike to check whether a Conway-encoded payment is
+  accepted in Dijkstra; if not, Dijkstra support has to be added to Pallas (upstream) or
+  built here. See `research.md` D2.
+- Protocol parameters and funding UTxOs reach materialise as a chain-context file. The
+  MVP produces it with a one-off query (`cardano-cli query`, Ogmios or db-sync); a net-rs
+  N2C LocalStateQuery client can replace that later.
 - The first target network is the proto-devnet in `ouroboros-leios/demo/proto-devnet`;
   Musashi follows. Funding comes from a payment key with sufficient balance; no faucet
   integration in the MVP.
@@ -335,7 +389,8 @@ names.
 - The MVP uses the same key for both sides of a conflict. Per-side wallets are a spec
   option, not a requirement.
 - Chain observation (which transactions landed, in which RB/EB) uses an existing source
-  (db-sync or node logs) rather than a new chain follower in the MVP.
+  (db-sync or node logs) rather than a new chain follower in the MVP. It also confirms
+  funding (FR-016).
 - tx-firehose and tx-centrifuge remain the tools for steady background load; `txflow`
   is for structured foreground workloads and does not replace them.
 
