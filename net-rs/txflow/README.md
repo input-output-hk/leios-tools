@@ -9,25 +9,43 @@ This first cut covers `expand` and `materialise`. Submitting (`fund`, `replay` o
 N2N/N2C), schedules, results and import are not implemented yet; `schedule` and `expect`
 in a spec are parsed and carried, not interpreted.
 
-## Example: a1..a3 vs b1..b3
+## Example: from definition to signed transactions
 
-[`examples/conflicting-chains.yaml`](examples/conflicting-chains.yaml) asks for two
-chains where each aᵢ conflicts with bᵢ:
+An experiment goes through three steps, each more concrete than the last.
+
+### 1. Definition
+
+[`examples/conflicting-chains.yaml`](examples/conflicting-chains.yaml) is written by
+hand. It gives the shape only (no tx ids, keys or network), so it can be rerun anywhere:
 
 ```yaml
 patterns:
   - id: chains
     use: conflicting_chains
-    with: { length: "{{ length }}", conflict: per_step }
+    with: { length: "{{ length }}", conflict: per_step }   # length: 3
 ```
+
+This asks for two chains a1 → a2 → a3 and b1 → b2 → b3, where each aᵢ conflicts with bᵢ.
+
+### 2. Expand
 
 ```sh
 cd net-rs
 cargo run -p txflow -- expand txflow/examples/conflicting-chains.yaml
 ```
 
-prints the IR: five sources (`chains/wa`, `chains/wb` fund the chains, `chains/c1..c3`
-are the shared inputs) and six transactions, plus what was derived from their inputs:
+The pattern becomes a graph of named transactions. Names are `<pattern id>/<name>`
+(`chains/a2`), and `.N` picks an output (`chains/a1.0` is a1's output 0). Sources are
+placeholders: `chains/wa` and `chains/wb` fund the two chains, and `chains/c1..c3` are the
+shared inputs, each "an output worth 2 ADA" with no tx id yet.
+
+```yaml
+chains/a2:
+  inputs: [chains/a1.0, chains/c2]   # a1's change output, plus the shared c2
+  outputs: [{ to: alice, lovelace: change }]
+```
+
+Conflicts and orphans are then worked out from the inputs; nothing declares them:
 
 ```yaml
 derived:
@@ -43,17 +61,30 @@ derived:
 ```
 
 With `conflict: root` only `c1` is shared and the later transactions appear only under
-`orphan_on`. `count: 10` gives ten independent copies named `chains_0/…` to `chains_9/…` (any written
-`count`, even 1, names copies this way, so scaling it keeps names stable).
+`orphan_on`. `count: 10` gives ten independent copies named `chains_0/…` to `chains_9/…`
+(any written `count`, even 1, names copies this way, so scaling it keeps names stable).
+
+### 3. Materialise
 
 ```sh
 cargo run -p txflow -- materialise txflow/examples/conflicting-chains.yaml \
   --context txflow/examples/demo-context.yaml -o /tmp/manifest.json
 ```
 
-builds and signs one funding transaction and the six experiment transactions, with real
-tx ids, fees and the inputs each one resolved to. `a1` and `b1` both spend the funding
-output that stands for `chains/c1`, so the conflict is on the wire. Each transaction
+The graph is bound to one network (protocol parameters, funding key, offered UTxOs), and
+every transaction is built and signed offline. A funding transaction turns each
+placeholder into a real output, and the experiment transactions spend those:
+
+| # | tx | spends | tx id |
+|---|----|--------|-------|
+| 0 | `fund/0` | the offered UTxO; creates one output per source | `12b1aaab…` |
+| 1 | `chains/a1` | `chains/c1` = `12b1aaab…#0`, `chains/wa` = `12b1aaab…#3` | `b1787e7e…` |
+| 2 | `chains/b1` | `chains/c1` = `12b1aaab…#0`, `chains/wb` = `12b1aaab…#4` | `6075515c…` |
+| 3 | `chains/a2` | `chains/a1.0` = `b1787e7e…#0`, `chains/c2` = `12b1aaab…#1` | `ca515927…` |
+| … | | | |
+
+`a1` and `b1` both spend `12b1aaab…#0`, so the double spend is real. The manifest lists
+every transaction in release order with its CBOR, fee and resolved inputs. Each one
 carries CIP-20 metadata (label 674): `["txflow:<IR hash prefix>", "<run id>#<index>"]`.
 
 The demo context uses a publicly known dummy key and a fake funding UTxO, so its
