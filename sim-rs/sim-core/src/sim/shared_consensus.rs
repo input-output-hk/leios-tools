@@ -604,9 +604,10 @@ impl NodeImpl for SharedConsensus {
             mempool_tx_count: 0,
         };
         let bt_seed = self.bt_tree.seed();
+        let sensors = DynamicEnv::new();
         let (_status, control) =
             self.bt_tree
-                .tick(&TickCtx::new(&self.bt_env, &chain_state, bt_seed));
+                .tick(&TickCtx::new(&self.bt_env, &sensors, &chain_state, bt_seed));
         self.leios.apply_control(&control);
         self.praos.apply_control(&control);
         self.mempool.apply_control(&control);

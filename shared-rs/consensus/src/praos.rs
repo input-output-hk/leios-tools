@@ -597,9 +597,8 @@ impl PraosState {
     /// election; the number it gets still follows the rule above.
     /// Refs: cardano-db-sync PR #435; docs.cardano.org Ouroboros overview;
     /// ouroboros-consensus report (Origin/point + chain selection).
-    pub fn next_block_number(&self) -> u64 {
-        self.adopted_tip_hash
-            .and_then(|h| self.chain_tree.block_number(&h))
+    pub fn next_block_number_after(&self, tip: &Option<[u8; 32]>) -> u64 {
+        tip.and_then(|h| self.chain_tree.block_number(&h))
             .map_or(0, |bn| bn + 1)
     }
 
@@ -2492,7 +2491,7 @@ impl PraosState {
     /// Push a `FetchAnnouncedEb` for `eb_point`, picking the fetch peer(s) by
     /// RTT across connected upstreams (any of which is on this chain). No-op if
     /// no peer is connected.
-    fn push_eb_fetch(&self, eb_point: Point, fx: &mut Vec<PraosEffect>) {
+    pub fn push_eb_fetch(&self, eb_point: Point, fx: &mut Vec<PraosEffect>) {
         let candidates: Vec<PeerId> = self.peer_chains.keys().copied().collect();
         let peers = self
             .block_policy

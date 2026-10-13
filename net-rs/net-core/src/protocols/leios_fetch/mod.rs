@@ -12,6 +12,7 @@ use crate::types::Point;
 use shared_consensus::mempool::TxBody;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tracing::info;
 
 /// LeiosFetch protocol ID in the multiplexer.
 pub const PROTOCOL_ID: u16 = 19;
@@ -150,7 +151,7 @@ pub async fn fetch_block(
     point: Point,
 ) -> Result<Vec<u8>, ProtocolError> {
     runner
-        .send(&Message::MsgLeiosBlockRequest { point })
+        .send(&Message::MsgLeiosBlockRequest { point: point.clone() })
         .await?;
     let msg = runner.recv().await?;
     match msg {

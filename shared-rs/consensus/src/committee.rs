@@ -164,6 +164,10 @@ pub fn npv_eligibility_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u
     hasher.finalize().as_bytes().to_vec()
 }
 
+pub fn imitate_bls_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u64) -> Vec<u8> {
+    npv_eligibility_signature(voter_id, eb_hash, eb_slot)
+}
+
 /// Re-run the NPV lottery from an eligibility signature and the pool's
 /// stake to count wins. Both prover and verifier compute the same
 /// count without it being transmitted on the wire — mirrors how a

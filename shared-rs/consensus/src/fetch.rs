@@ -280,6 +280,8 @@ pub struct CandidateTracker {
     pending_eb_fetches: BTreeSet<Point>,
     pending_eb_txs_fetches: BTreeSet<Point>,
 
+    eb_attempts: BTreeMap<Point, BTreeSet<PeerId>>,
+
     /// Per-EB set of peers we've already asked for EB-txs.  Used to
     /// skip a peer on retry after a partial response.
     eb_txs_attempts: BTreeMap<Point, BTreeSet<PeerId>>,
@@ -380,8 +382,26 @@ impl CandidateTracker {
         self.pending_block_fetches.remove(point);
     }
 
-    pub fn start_eb_fetch(&mut self, point: Point) -> bool {
-        self.pending_eb_fetches.insert(point)
+    pub fn start_eb_fetch(&mut self, point: Point, peers: &[PeerId]) -> bool {
+        if self.eb_attempts.get(&point).is_some_and(|x| peers.iter().any(|p| x.contains(p))) {
+            // already started
+            return false;
+        }
+
+        let attempts = self.eb_attempts.entry(point).or_insert(BTreeSet::new());
+        attempts.append(&mut BTreeSet::from_iter(peers.iter().copied()));
+
+        true
+    }
+    pub fn available_eb_candidates(&self, point: &Point) -> Vec<PeerId> {
+        let eb_offers = self.eb_candidates(point);
+        let Some(peers) = self.eb_attempts.get(point) else {
+            tracing::info!("EB fetch: {point}; all available: {:?}", eb_offers);
+            return eb_offers;
+        };
+        let available = eb_offers.iter().filter(|x| !peers.contains(x)).copied().collect();
+        tracing::info!("EB fetch: {point}; peers attempted: {peers:?}, offers: {eb_offers:?}, available: {:?}", available);
+        available
     }
     pub fn finish_eb_fetch(&mut self, point: &Point) {
         self.pending_eb_fetches.remove(point);

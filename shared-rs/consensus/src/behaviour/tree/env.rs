@@ -128,6 +128,8 @@ impl NativeChainState {
 pub struct TickCtx<'a> {
     /// Read from the [`EnvHandle`] by the caller before ticking.
     pub env: &'a DynamicEnv,
+    /// Separate namespace for sensor parameters
+    pub sensors: &'a DynamicEnv,
     /// Rebuilt each tick, read-only.
     pub state: &'a NativeChainState,
     /// Root seed for deterministic leaf choices.
@@ -139,10 +141,11 @@ pub struct TickCtx<'a> {
 
 impl<'a> TickCtx<'a> {
     /// Build a context with no live action-param overrides.
-    pub fn new(env: &'a DynamicEnv, state: &'a NativeChainState, seed: u64) -> Self {
+    pub fn new(env: &'a DynamicEnv, sensors: &'a DynamicEnv, state: &'a NativeChainState, seed: u64) -> Self {
         Self {
             env,
             state,
+            sensors,
             seed,
             action_params: None,
         }
@@ -269,6 +272,7 @@ mod tests {
     #[test]
     fn action_override_reads_store_by_id_and_field() {
         let env = DynamicEnv::new();
+        let sensors = DynamicEnv::new();
         let state = NativeChainState::default();
         let store: ActionParamStore = Arc::new(RwLock::new(BTreeMap::from([(
             "equivocate.ways".to_string(),
@@ -288,7 +292,7 @@ mod tests {
         assert_eq!(ctx.action_override("other", "ways"), None);
         // No store → never an override.
         assert_eq!(
-            TickCtx::new(&env, &state, 0).action_override("equivocate", "ways"),
+            TickCtx::new(&env, &sensors, &state, 0).action_override("equivocate", "ways"),
             None
         );
     }

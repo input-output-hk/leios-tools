@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use crate::mempool::EbKey;
 use crate::types;
-use crate::types::Point;
+use crate::types::{hex_prefix, Point};
 
 /// A block entry in a chain tree snapshot, for UI display.
 #[derive(Debug, Clone, Serialize)]
@@ -271,6 +271,35 @@ impl ChainTree {
         self.nodes.get(hash).and_then(|n| n.prev_hash)
     }
 
+    /// Returns EB point if current RB has a certificate included for EB,
+    /// but the EB was not seen by us.
+    pub fn has_eb_if_certified(&self, hash: &[u8; 32]) -> Option<Point> {
+        let current = self.nodes.get(hash)?;
+        
+        if !current.certified_eb {
+            return None;
+        }
+
+        let Some(prev_hash) = current.prev_hash else {
+            tracing::error!("No previous hash found, but EB is certified: {}", hex_prefix(hash));
+            return None;
+        };
+
+        let Some(prev_node) = self.nodes.get(&prev_hash) else {
+            tracing::error!("No previous block found for hash {}, EB is certified: {}", hex_prefix(&prev_hash), hex_prefix(hash));
+            return None;
+        };
+
+        if prev_node.cached_eb_tx_count.is_none() {
+            prev_node.announced_eb_hash.as_ref().map(|hash| Point::Specific {
+                hash: hash.clone(), slot: prev_node.slot
+            })
+        }
+        else {
+            None
+        }
+    }
+    
     pub fn is_chain_origin(&self, hash: &[u8; 32]) -> bool {
         self.nodes.get(hash).is_some_and(
             |n| matches!(n.status, ChainNodeStatus::ChainStart)
@@ -293,7 +322,7 @@ impl ChainTree {
             hash: n.announced_eb_hash?
         }))
     }
-
+    
     /// Stash the tx-count of an EB once its manifest is known.  The
     /// I/O wrapper calls this from its self-produce path (count known
     /// immediately) and its receive path (count known once the
@@ -307,7 +336,7 @@ impl ChainTree {
         // announce the same (content-derived) EB hash, and both nodes
         // need their cache populated — otherwise the fork-side entry
         // loses its tx-count once the live manifest cache ages out.
-        for node in self.nodes.values_mut() {
+        for (_rb_hash, node) in self.nodes.iter_mut() {
             if node.announced_eb_hash.as_ref() == Some(eb_hash) {
                 node.cached_eb_tx_count = Some(count);
             }
