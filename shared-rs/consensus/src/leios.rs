@@ -2539,30 +2539,58 @@ mod tests {
 
     #[test]
     fn on_slot_prunes_candidate_tracker_below_chain_tip() {
-        // Chain-progress prune: anything at slot < tip_rb_slot is dead
-        // under the strict parent-only cert rule.  With tip_rb_slot=8,
-        // slot-5 entries drop and slot-8 entries stay.
+        // Chain-progress prune *with retention*: even though a strict
+        // parent-only cert rule makes an EB below the adopted tip dead for
+        // voting, the candidate tracker keeps per-EB offer info for
+        // DEFAULT_EB_RETENTION_SLOTS slots *below* `tip_rb_slot`.  That
+        // window is what lets us re-fetch an EB (or its TXs) from the peers
+        // that offered it on a block/tx retry.  Only entries strictly older
+        // than `tip_rb_slot - DEFAULT_EB_RETENTION_SLOTS` are dropped.
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let peer = crate::peer::PeerId(1);
-        state.candidates.note_eb_offered(point(5, 0xAA), peer);
-        state.candidates.note_eb_offered(point(8, 0xBB), peer);
-        state.candidates.note_eb_txs_offered(point(5, 0xCC), peer);
-        state.candidates.note_eb_txs_offered(point(8, 0xDD), peer);
+
+        let tip = 8 + DEFAULT_EB_RETENTION_SLOTS;
+        // Retention cutoff: slot < `cutoff` is pruned, slot >= `cutoff` kept.
+        let cutoff = tip - DEFAULT_EB_RETENTION_SLOTS; // == 8
+
+        // Just below the retention window → dropped.
+        state.candidates.note_eb_offered(point(cutoff - 1, 0xAA), peer);
+        state.candidates.note_eb_txs_offered(point(cutoff - 1, 0xCC), peer);
+        // Exactly at the retention boundary (DEFAULT_EB_RETENTION_SLOTS slots
+        // below the tip) → retained for retries.
+        state.candidates.note_eb_offered(point(cutoff, 0xBB), peer);
+        state.candidates.note_eb_txs_offered(point(cutoff, 0xDD), peer);
+        // Well inside the retention window, just below the tip → retained.
+        state.candidates.note_eb_offered(point(tip - 1, 0xEE), peer);
+        state.candidates.note_eb_txs_offered(point(tip - 1, 0xFF), peer);
 
         state.set_chain_tip_context(ChainTipContext {
-            tip_rb_slot: Some(8 + DEFAULT_EB_RETENTION_SLOTS),
+            tip_rb_slot: Some(tip),
             ..Default::default()
         });
         let _ = state.on_slot(30 + DEFAULT_EB_RETENTION_SLOTS, &tx_all);
 
-        assert!(state.candidates.eb_candidates(&point(5, 0xAA)).is_empty());
+        // Older than the retention window: gone.
+        assert!(state.candidates.eb_candidates(&point(cutoff - 1, 0xAA)).is_empty());
         assert!(state
             .candidates
-            .eb_txs_candidates(&point(5, 0xCC))
+            .eb_txs_candidates(&point(cutoff - 1, 0xCC))
             .is_empty());
-        assert_eq!(state.candidates.eb_candidates(&point(8, 0xBB)), vec![peer]);
+        // Within the retention window: the offer info is kept for the whole
+        // DEFAULT_EB_RETENTION_SLOTS span below the tip, so block/tx retries
+        // can still reach `peer` — both at the boundary slot…
+        assert_eq!(state.candidates.eb_candidates(&point(cutoff, 0xBB)), vec![peer]);
         assert_eq!(
-            state.candidates.eb_txs_candidates(&point(8, 0xDD)),
+            state.candidates.eb_txs_candidates(&point(cutoff, 0xDD)),
+            vec![peer]
+        );
+        // …and just below the current tip.
+        assert_eq!(
+            state.candidates.eb_candidates(&point(tip - 1, 0xEE)),
+            vec![peer]
+        );
+        assert_eq!(
+            state.candidates.eb_txs_candidates(&point(tip - 1, 0xFF)),
             vec![peer]
         );
     }
