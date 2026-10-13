@@ -8,7 +8,6 @@ use std::{
     // iterated in order-sensitive paths, so it does not affect determinism.
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     sync::Arc,
-    time::Duration,
 };
 
 use rand_chacha::ChaChaRng;
@@ -28,7 +27,7 @@ use crate::{
     },
     rng::{DrawSite, Rng},
     sim::{
-        NodeImpl,
+        NodeImpl, SimMessage as _,
         linear_leios::attackers::{EBWithholdingEvent, EBWithholdingSender},
         linear_wire::{CpuTask, Message, TimedEvent},
         lottery::{LotteryConfig, LotteryKind, MockLotteryResults, vrf_probabilities},
@@ -110,9 +109,27 @@ struct NodeLeiosState {
     eb_peer_announcements: BTreeMap<EndorserBlockId, Vec<NodeId>>,
     votes: BTreeMap<VoteBundleId, VoteBundleView>,
     votes_by_eb: BTreeMap<EndorserBlockId, BTreeMap<NodeId, usize>>,
+    /// Running sum of `votes_by_eb`, so a quorum crossing is detected in
+    /// O(1) as each bundle is counted rather than by re-summing every
+    /// voter on every arrival.
+    vote_weight_by_eb: BTreeMap<EndorserBlockId, u64>,
+    /// EBs this node has already seen reach quorum, so the crossing is
+    /// reported once per (node, EB).
+    ///
+    /// This set alone cannot carry that guarantee, because pruning drops
+    /// its entries along with the rest of a pruned EB's state.  What
+    /// carries it past a prune is `pruned_ebs`: `count_votes` refuses to
+    /// count into a tombstoned EB at all, so an EB's entry is only ever
+    /// removed from here once nothing can put it back.
+    quorum_reached_ebs: BTreeSet<EndorserBlockId>,
     endorsed_ebs: BTreeMap<EndorserBlockId, u64>,
     incomplete_onchain_ebs: BTreeSet<EndorserBlockId>,
     missing_txs: BTreeMap<TransactionId, Vec<EndorserBlockId>>,
+    /// EBs whose state has been pruned.  A tombstone rather than a plain
+    /// deletion, so the paths that would otherwise rebuild that state from
+    /// a late arrival -- header announcements, on-chain endorsements, and
+    /// vote counting -- can tell "never seen" from "seen and finished
+    /// with".
     pruned_ebs: BTreeSet<EndorserBlockId>,
 }
 
@@ -130,6 +147,8 @@ pub struct LinearLeiosNode {
     clock: Clock,
     lottery: LotteryConfig,
     consumers: Vec<NodeId>,
+    vote_consumers: Vec<(NodeId, bool)>,
+    vote_fanout_rank: Vec<(bool, u64, NodeId)>,
     current_slot: u64,
     txs: BTreeMap<TransactionId, TransactionView>,
     mempool: Mempool,
@@ -171,6 +190,18 @@ impl NodeImpl for LinearLeiosNode {
 
         Self {
             id: config.id,
+            vote_consumers: config
+                .consumers
+                .iter()
+                .map(|peer| {
+                    (
+                        *peer,
+                        sim_config.vote_push_fanout_protects_producers
+                            && config.protected_vote_consumers.contains(peer),
+                    )
+                })
+                .collect(),
+            vote_fanout_rank: Vec::with_capacity(config.consumers.len()),
             sim_config,
             queued: EventResult::default(),
             tracker,
@@ -240,8 +271,8 @@ impl NodeImpl for LinearLeiosNode {
             Message::EB(rb) => self.receive_eb(from, rb),
 
             // Vote propagation
-            Message::AnnounceVotes(id) => self.receive_announce_votes(from, id),
-            Message::RequestVotes(id) => self.receive_request_votes(from, id),
+            Message::AnnounceVotes(id, bytes) => self.receive_announce_votes(from, id, bytes),
+            Message::RequestVotes(id, bytes) => self.receive_request_votes(from, id, bytes),
             Message::Votes(votes) => self.receive_votes(from, votes),
 
             // Per-vote variants are emitted exclusively by the shared-consensus
@@ -277,7 +308,7 @@ impl NodeImpl for LinearLeiosNode {
             CpuTask::RBBlockValidated(rb) => self.finish_validating_rb(rb),
             CpuTask::EBHeaderValidated(from, eb) => self.finish_validating_eb_header(from, eb),
             CpuTask::EBBlockValidated(eb, seen) => self.finish_validating_eb(eb, seen),
-            CpuTask::VTBundleGenerated(votes, _) => self.finish_generating_vote_bundle(votes),
+            CpuTask::VTBundleGenerated(votes, eb) => self.finish_generating_vote_bundle(votes, &eb),
             CpuTask::VTBundleValidated(from, votes) => {
                 self.finish_validating_vote_bundle(from, votes)
             }
@@ -376,6 +407,8 @@ impl LinearLeiosNode {
             }
             self.leios.endorsed_ebs.remove(eb_id);
             self.leios.votes_by_eb.remove(eb_id);
+            self.leios.vote_weight_by_eb.remove(eb_id);
+            self.leios.quorum_reached_ebs.remove(eb_id);
             self.leios.ebs.remove(eb_id);
             self.leios.eb_peer_announcements.remove(eb_id);
             self.leios.pruned_ebs.insert(*eb_id);
@@ -731,10 +764,10 @@ impl LinearLeiosNode {
 
         let parent = self.latest_rb_id();
         let endorsement = parent.and_then(|rb_id| {
-            let earliest_endorse_time = Timestamp::from_secs(rb_id.slot)
-                + (self.sim_config.header_diffusion_time * 3)
-                + Duration::from_secs(self.sim_config.linear_vote_stage_length)
-                + Duration::from_secs(self.sim_config.linear_diffuse_stage_length);
+            let earliest_endorse_time = self
+                .sim_config
+                .voting_window()
+                .inclusion_deadline_at(rb_id.slot);
 
             if earliest_endorse_time > Timestamp::from_secs(slot) {
                 // This RB was generated too quickly after another; hasn't been time to gather all the votes.
@@ -1484,9 +1517,10 @@ impl LinearLeiosNode {
 // Voting
 impl LinearLeiosNode {
     fn vote_for_endorser_block(&mut self, eb: &Arc<EndorserBlock>, seen: Timestamp) {
-        let equivocation_cutoff_time =
-            Timestamp::from_secs(eb.slot) + (self.sim_config.header_diffusion_time * 3);
-        if eb.producer != self.id && self.clock.now() < equivocation_cutoff_time {
+        // CIP-0164 §Equivocation Detection: voting begins 3 * L_hdr after
+        // the slot of the announcing RB, not after the EB was built.
+        let equivocation_cutoff_time = self.sim_config.voting_window().gate_at(eb.slot);
+        if self.clock.now() < equivocation_cutoff_time {
             // If we haven't waited long enough to detect equivocations,
             // schedule voting later.
             self.queued.schedule_event(
@@ -1521,10 +1555,11 @@ impl LinearLeiosNode {
                     .count()
             }
             CommitteeSelectionAlgorithm::Everyone => 1,
-            // CIP-164 PR #1196: certificate weight is the voter's own
+            // CIP-0164 PRs #1196 / #1250: certificate weight is the voter's own
             // stake; the receiver sums these and compares against
             // `quorum_weight_fraction × total_active_stake`.
-            CommitteeSelectionAlgorithm::TopStakeFraction => {
+            CommitteeSelectionAlgorithm::TopStakeFraction
+            | CommitteeSelectionAlgorithm::TopStakeSeats => {
                 if self.sim_config.vote_eligible_nodes.contains(&self.id) {
                     self.sim_config.nodes[self.id.to_inner()].stake as usize
                 } else {
@@ -1562,11 +1597,10 @@ impl LinearLeiosNode {
     }
 
     fn should_vote_for(&self, eb: &EndorserBlock, seen: Timestamp) -> Result<(), NoVoteReason> {
-        let eb_must_be_received_by = Timestamp::from_secs(eb.slot)
-            + (self.sim_config.header_diffusion_time * 3)
-            + Duration::from_secs(self.sim_config.linear_vote_stage_length);
-        if seen > eb_must_be_received_by {
-            // An EB must be received within L_vote slots of its creation.
+        let eb_must_be_received_by = self.sim_config.voting_window().deadline_at(eb.slot);
+        if seen > eb_must_be_received_by || self.clock.now() > eb_must_be_received_by {
+            // Arrival alone is insufficient: validation must finish by
+            // t0 + 3 * L_hdr + L_vote, including CPU queueing.
             return Err(NoVoteReason::LateEB);
         }
         let Some((rb, header_seen)) = self.latest_rb() else {
@@ -1578,7 +1612,7 @@ impl LinearLeiosNode {
             return Err(NoVoteReason::WrongEB);
         }
         let rb_header_must_be_received_by =
-            Timestamp::from_secs(eb.slot) + self.sim_config.header_diffusion_time;
+            self.sim_config.voting_window().header_deadline_at(eb.slot);
         if header_seen >= rb_header_must_be_received_by {
             // The RB header must be received more quickly
             return Err(NoVoteReason::LateRBHeader);
@@ -1596,7 +1630,18 @@ impl LinearLeiosNode {
         Ok(())
     }
 
-    fn finish_generating_vote_bundle(&mut self, votes: VoteBundle) {
+    fn finish_generating_vote_bundle(&mut self, votes: VoteBundle, eb: &EndorserBlock) {
+        // Signing may have waited behind other CPU tasks after eligibility
+        // was checked. Do not publish a vote outside its voting window.
+        if self.clock.now() > self.sim_config.voting_window().deadline_at(eb.slot) {
+            self.tracker
+                .track_no_vote(eb.slot, 0, self.id, eb.id(), NoVoteReason::LateEB);
+            if self.sim_config.emit_conformance_events {
+                self.tracker
+                    .track_linear_no_vote_generated(self.id, eb.id());
+            }
+            return;
+        }
         self.tracker.track_votes_generated(&votes);
         self.count_votes(&votes);
         let id = votes.id;
@@ -1604,12 +1649,128 @@ impl LinearLeiosNode {
         self.leios
             .votes
             .insert(votes.id, VoteBundleView::Received { votes });
+        self.diffuse_vote_bundle(id, None);
+    }
+
+    /// Send a vote bundle onwards to consumers.
+    ///
+    /// `from` is the peer it arrived from, and is skipped unless
+    /// `vote-transport-echo-to-source` is set on a push transport; `None`
+    /// when we produced it.  Under `announce-then-request` this sends the
+    /// identifier at its configured size and the peer asks for the body; under the push strategies
+    /// it sends the body.
+    fn diffuse_vote_bundle(&mut self, id: VoteBundleId, from: Option<NodeId>) {
+        let obsolete = match self.leios.votes.get(&id) {
+            Some(VoteBundleView::Received { votes }) => self.vote_bundle_is_obsolete(votes),
+            _ => false,
+        };
+        let mut recipients = 0u64;
+        let push = self.sim_config.vote_transport.is_push();
+        // The echo is a push-path artefact: it models the Haskell node's
+        // notify server, which pushes bodies and has no per-peer
+        // provenance to exclude the sender with.  The announce path has
+        // no such server and no such gap, and re-announcing to the peer
+        // that just handed us the body only buys a request and a second
+        // copy of a bundle we are holding.  Leaving the guard outside the
+        // push branch silently made the flag change
+        // `announce-then-request` -- the published baseline -- which is
+        // both undocumented and a behaviour nobody asked to measure.
+        let echo = push && self.sim_config.vote_transport_echo_to_source;
+        let body = if push {
+            match self.leios.votes.get(&id) {
+                Some(VoteBundleView::Received { votes }) => Some(votes.clone()),
+                // Nothing to push until the bundle is actually held.
+                _ => return,
+            }
+        } else {
+            None
+        };
+        // Bounded fanout: push the body to at most `k` peers rather than
+        // every consumer.  Only the push path floods, so only the push
+        // path is limited; on the announce path, requests determine which
+        // peers receive bodies.
+        //
+        // The subset is chosen by ranking peers on a hash of
+        // `(sender, bundle, peer)` under the global seed.  That is a pure
+        // function of the seed, so it is identical across runs, platforms
+        // and shard layouts, and independent of arrival order and of how
+        // many draws this node has already made -- none of which is true
+        // of drawing from a per-node stream.  Keying on the bundle means
+        // each vote takes its own subgraph. Neither per-vote delivery nor
+        // quorum coverage is guaranteed by this selection rule.
+        //
+        // Protected connections consume places in the same total cap. Rank
+        // them first, then sample the remaining places with the original hash.
+        // The topology classification and ranking allocation are reused.
+        let bounded = if let (Some(_), Some(k)) = (&body, self.sim_config.vote_push_fanout) {
+            self.vote_fanout_rank.clear();
+            let rng = Rng::new(self.sim_config.seed);
+            for &(peer, protected) in &self.vote_consumers {
+                if echo || Some(peer) != from {
+                    self.vote_fanout_rank.push((
+                        !protected,
+                        rng.draw_u64_with_context(&(self.id, id, peer)),
+                        peer,
+                    ));
+                }
+            }
+            self.vote_fanout_rank.sort_unstable();
+            self.vote_fanout_rank
+                .truncate(usize::try_from(k).unwrap_or(usize::MAX));
+            self.vote_fanout_rank
+                .sort_unstable_by_key(|&(_, _, peer)| peer);
+            true
+        } else {
+            false
+        };
         for peer in &self.consumers {
-            self.queued.send_to(*peer, Message::AnnounceVotes(id));
+            if !echo && Some(*peer) == from {
+                continue;
+            }
+            if bounded
+                && self
+                    .vote_fanout_rank
+                    .binary_search_by_key(peer, |&(_, _, p)| p)
+                    .is_err()
+            {
+                continue;
+            }
+            recipients += 1;
+            match &body {
+                Some(votes) => {
+                    self.tracker.track_votes_sent(votes, self.id, *peer);
+                    self.queued.send_to(*peer, Message::Votes(votes.clone()));
+                }
+                None => {
+                    let announcement =
+                        Message::AnnounceVotes(id, self.sim_config.vote_announcement_size_bytes);
+                    self.tracker.track_votes_announced(
+                        id,
+                        self.id,
+                        *peer,
+                        announcement.bytes_size(),
+                    );
+                    self.queued.send_to(*peer, announcement);
+                }
+            }
+        }
+        if obsolete && recipients > 0 {
+            let (bodies, announcements, bytes) = match &body {
+                Some(votes) => (recipients, 0, recipients * votes.bytes),
+                None => (
+                    0,
+                    recipients,
+                    recipients * self.sim_config.vote_announcement_size_bytes,
+                ),
+            };
+            self.tracker
+                .track_obsolete_votes_sent(id, self.id, bodies, announcements, bytes);
         }
     }
 
-    fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId) {
+    fn receive_announce_votes(&mut self, from: NodeId, id: VoteBundleId, bytes: u64) {
+        self.tracker
+            .track_votes_announcement_received(id, from, self.id, bytes);
         let should_request = match self.leios.votes.get(&id) {
             None => true,
             Some(VoteBundleView::Requested) => {
@@ -1619,12 +1780,21 @@ impl LinearLeiosNode {
         };
         if should_request {
             self.leios.votes.insert(id, VoteBundleView::Requested);
-            self.queued.send_to(from, Message::RequestVotes(id));
+            let request = Message::RequestVotes(id, self.sim_config.vote_request_size_bytes);
+            self.tracker
+                .track_votes_requested(id, self.id, from, request.bytes_size());
+            self.queued.send_to(from, request);
         }
     }
 
-    fn receive_request_votes(&mut self, from: NodeId, id: VoteBundleId) {
+    fn receive_request_votes(&mut self, from: NodeId, id: VoteBundleId, bytes: u64) {
+        self.tracker
+            .track_votes_request_received(id, from, self.id, bytes);
         if let Some(VoteBundleView::Received { votes }) = self.leios.votes.get(&id) {
+            if self.vote_bundle_is_obsolete(votes) {
+                self.tracker
+                    .track_obsolete_votes_sent(id, self.id, 1, 0, votes.bytes);
+            }
             self.tracker.track_votes_sent(votes, self.id, from);
             self.queued.send_to(from, Message::Votes(votes.clone()));
         }
@@ -1632,13 +1802,49 @@ impl LinearLeiosNode {
 
     fn receive_votes(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
         self.tracker.track_votes_received(&votes, from, self.id);
+        if self.vote_bundle_is_obsolete(&votes) {
+            self.tracker
+                .track_obsolete_votes_received(votes.id, self.id, votes.bytes);
+        }
+        // A bundle already held costs nothing beyond the bytes: real nodes test
+        // the seen-set rather than verifying again.  Only the push strategies
+        // can recognise a redundant body this early; the announce path has
+        // already asked for the body it is being handed, so a copy it did not
+        // need is only discovered after validating it (see
+        // `finish_validating_vote_bundle`), and that path is left exactly as
+        // it was.
+        let strategy = self.sim_config.vote_transport;
+        let already_have = strategy.is_push()
+            && match self.leios.votes.get(&votes.id) {
+                // Fully held: a duplicate under every push strategy.
+                Some(VoteBundleView::Received { .. }) => true,
+                // Still validating.  Only early suppression calls this a
+                // duplicate; late suppression pays for the verification, as
+                // the Haskell node does.
+                Some(VoteBundleView::Requested) => strategy.suppresses_in_flight(),
+                None => false,
+            };
+        if already_have {
+            // Report a dropped arrival once, before scheduling any verification.
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
+            return;
+        }
+        if strategy.suppresses_in_flight() {
+            // Mark it in flight so copies arriving while this one validates
+            // are recognised as duplicates rather than validated again.
+            self.leios
+                .votes
+                .entry(votes.id)
+                .or_insert(VoteBundleView::Requested);
+        }
         self.queued
             .schedule_cpu_task(CpuTask::VTBundleValidated(from, votes));
     }
 
     fn finish_validating_vote_bundle(&mut self, from: NodeId, votes: Arc<VoteBundle>) {
+        let obsolete = self.vote_bundle_is_obsolete(&votes);
         let id = votes.id;
-        if self
+        let already_held = self
             .leios
             .votes
             .insert(
@@ -1647,21 +1853,59 @@ impl LinearLeiosNode {
                     votes: votes.clone(),
                 },
             )
-            .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }))
-        {
+            .is_some_and(|v| matches!(v, VoteBundleView::Received { .. }));
+        if obsolete {
+            self.tracker
+                .track_obsolete_votes_validated(id, self.id, already_held);
+        }
+        if already_held {
+            // Late deduplication and request-from-all can validate multiple
+            // copies concurrently. Only the first completion is accepted.
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
             return;
+        } else if obsolete {
+            // Pruning can remove the cached copy while another validation
+            // is queued. This obsolete arrival contributes no tally and
+            // must not be reported as a new acceptance. Preserve its relay
+            // behavior so this accounting correction does not change load.
+            self.tracker.track_votes_duplicate(&votes, from, self.id);
+        } else {
+            self.tracker.track_votes_accepted(id, from, self.id);
+            self.count_votes(&votes);
         }
-        self.count_votes(&votes);
-        for peer in &self.consumers {
-            if *peer == from {
-                continue;
-            }
-            self.queued.send_to(*peer, Message::AnnounceVotes(id));
-        }
+        self.diffuse_vote_bundle(id, Some(from));
+    }
+
+    // Classification is local and phase-specific: a bundle may become
+    // obsolete while its validation is queued. Telemetry never changes routing.
+    fn vote_bundle_is_obsolete(&self, votes: &VoteBundle) -> bool {
+        votes
+            .ebs
+            .keys()
+            .all(|eb| self.leios.pruned_ebs.contains(eb))
     }
 
     fn count_votes(&mut self, votes: &VoteBundle) {
         for (eb_id, count) in votes.ebs.iter() {
+            if self.leios.pruned_ebs.contains(eb_id) {
+                // Pruning drops this EB's tally *and* the record that its
+                // quorum was already reported, so counting a late bundle
+                // into a pruned EB would rebuild the tally from zero,
+                // cross the threshold a second time, and report a second
+                // crossing for the same (node, EB).  The summary reads
+                // each crossing as one observer and weights it by that
+                // node's stake, so the same node landing in the sample
+                // twice skews the stake-weighted median and 95th
+                // percentile the study reports.
+                //
+                // The tombstone is what makes "at most once per (node,
+                // EB)" structural rather than merely asserted by the
+                // `quorum_reached_ebs` doc comment: a pruned EB has been
+                // superseded by endorsed state and must not rebuild a tally.
+                // Late bundles may still be verified and relayed; the
+                // obsolete-work telemetry measures those costs separately.
+                continue;
+            }
             *self
                 .leios
                 .votes_by_eb
@@ -1669,6 +1913,15 @@ impl LinearLeiosNode {
                 .or_default()
                 .entry(votes.id.producer)
                 .or_default() += count;
+            let tally = self.leios.vote_weight_by_eb.entry(*eb_id).or_default();
+            *tally += *count as u64;
+            let weight = *tally;
+            if weight >= self.sim_config.vote_threshold()
+                && self.leios.quorum_reached_ebs.insert(*eb_id)
+            {
+                self.tracker
+                    .track_eb_quorum_reached(self.id, *eb_id, weight);
+            }
         }
     }
 }

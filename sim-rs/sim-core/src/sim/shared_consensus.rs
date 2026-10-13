@@ -183,6 +183,11 @@ fn derive_committee_selection(sim_config: &SimConfiguration) -> CommitteeSelecti
         A::TopStakeFraction => CommitteeSelection::StakeCentile {
             top_centile_of_stake: sim_config.committee_stake_fraction_threshold,
         },
+        // shared-consensus has no seat-count committee; `SimConfiguration::build`
+        // rejects this pairing before a node is ever constructed.
+        A::TopStakeSeats => unreachable!(
+            "top-stake-seats is rejected for the shared-consensus variant at config load"
+        ),
     }
 }
 
@@ -731,7 +736,7 @@ impl NodeImpl for SharedConsensus {
             Message::EBTxs(id, txs) => {
                 self.receive_eb_txs(&mut out, from, id, txs);
             }
-            Message::AnnounceVotes(_) | Message::RequestVotes(_) | Message::Votes(_) => {
+            Message::AnnounceVotes(..) | Message::RequestVotes(..) | Message::Votes(_) => {
                 // shared-consensus adapter emits per-vote, never bundles — every
                 // node in a sim run uses the same adapter, so the
                 // bundle variants can't reach this handler.
