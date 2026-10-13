@@ -839,7 +839,7 @@ type = "HonestAction"
             env: &env,
             state: &state,
             seed: tree.seed(),
-            action_params: None,
+            ..TickCtx::default()
         })
     }
 
@@ -1035,13 +1035,12 @@ type = "Action"
 spec = { kind = "cert-suppressor" }
 "#;
         let mut tree = BtConfig::compile_str(text).unwrap();
-        let env = crate::behaviour::tree::env::DynamicEnv::new();
-        let state = crate::behaviour::tree::env::NativeChainState::default();
-        let ctx = crate::behaviour::tree::env::TickCtx {
+        let env = DynamicEnv::new();
+        let state = NativeChainState::default();
+        let ctx = TickCtx {
             env: &env,
             state: &state,
-            seed: 0,
-            action_params: None,
+            ..TickCtx::default()
         };
         // Wait(2): 2 full slots elapse (attack inactive), then it activates.
         assert!(!tree.tick(&ctx).1.praos.suppress_cert);
@@ -1211,7 +1210,7 @@ spec = { kind = "lie-about-eb-size", scale_num = 0, scale_den = 1, offset = 0 }
             env: &env,
             state: &state,
             seed: 1,
-            action_params: None,
+            ..TickCtx::default()
         });
         assert_eq!(s, Status::Running);
         assert!(out.leios.echo_to_source);
@@ -1243,7 +1242,7 @@ spec = { kind = "lazy-voter" }
             env: &env,
             state: &state,
             seed: 1,
-            action_params: None,
+            ..Default::default()
         });
         assert_eq!(out.leios.vote, VotePolicy::Abstain(NoVoteReason::Declined));
     }

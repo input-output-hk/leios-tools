@@ -2550,10 +2550,10 @@ mod tests {
         state.candidates.note_eb_txs_offered(point(8, 0xDD), peer);
 
         state.set_chain_tip_context(ChainTipContext {
-            tip_rb_slot: Some(8),
+            tip_rb_slot: Some(8 + DEFAULT_EB_RETENTION_SLOTS),
             ..Default::default()
         });
-        let _ = state.on_slot(30, &tx_all);
+        let _ = state.on_slot(30 + DEFAULT_EB_RETENTION_SLOTS, &tx_all);
 
         assert!(state.candidates.eb_candidates(&point(5, 0xAA)).is_empty());
         assert!(state

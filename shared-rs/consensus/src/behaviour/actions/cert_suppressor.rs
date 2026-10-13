@@ -28,18 +28,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for CertSuppressor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn sets_suppress_cert() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = CertSuppressor.contribute(&ctx, &mut out);
         assert_eq!(s, Status::Running);

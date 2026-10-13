@@ -2695,7 +2695,7 @@ mod tests {
         let s = fresh();
         assert_eq!(s.tip_hash(), None);
         // Genesis child is block 0 (genesis is "before block 0").
-        assert_eq!(s.next_block_number(), 0);
+        assert_eq!(s.next_block_number_after(&s.adopted_tip_hash), 0);
         assert_eq!(s.local_tip(), None);
     }
 
@@ -2712,7 +2712,7 @@ mod tests {
         let mut s = fresh();
         install_validated_block(&mut s, 100, 1, 5, None);
         s.adopted_tip_hash = Some(h(1));
-        assert_eq!(s.next_block_number(), 6);
+        assert_eq!(s.next_block_number_after(&s.adopted_tip_hash), 6);
     }
 
     #[test]
@@ -2770,7 +2770,7 @@ mod tests {
             "anchor height set from the intersection tip"
         );
         assert_eq!(s.tip_hash(), Some(h(9)));
-        assert_eq!(s.next_block_number(), 84_001, "forge extends the real tip");
+        assert_eq!(s.next_block_number_after(&s.adopted_tip_hash), 84_001, "forge extends the real tip");
     }
 
     #[test]

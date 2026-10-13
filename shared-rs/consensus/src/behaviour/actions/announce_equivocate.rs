@@ -25,18 +25,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceEquivocate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn sets_equivocate_flag() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = AnnounceEquivocate.contribute(&ctx, &mut out);
         assert_eq!(s, Status::Running);

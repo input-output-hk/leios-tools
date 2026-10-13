@@ -139,6 +139,29 @@ pub struct TickCtx<'a> {
     pub action_params: Option<&'a ActionParamStore>,
 }
 
+impl Default for TickCtx<'_> {
+    /// An all-empty context: empty `env`/`sensors`, default chain state, seed 0,
+    /// and no live action-param overrides. Backed by shared `static` empties so
+    /// the borrows are `'static` (covariantly usable at any `'a`). Tests build
+    /// from this and override only the fields they exercise, e.g.
+    /// `TickCtx { state: &state, ..Default::default() }`.
+    fn default() -> Self {
+        static EMPTY_ENV: DynamicEnv = DynamicEnv(BTreeMap::new());
+        static EMPTY_STATE: NativeChainState = NativeChainState {
+            current_slot: 0,
+            current_epoch: 0,
+            mempool_tx_count: 0,
+        };
+        TickCtx {
+            env: &EMPTY_ENV,
+            sensors: &EMPTY_ENV,
+            state: &EMPTY_STATE,
+            seed: 0,
+            action_params: None,
+        }
+    }
+}
+
 impl<'a> TickCtx<'a> {
     /// Build a context with no live action-param overrides.
     pub fn new(env: &'a DynamicEnv, sensors: &'a DynamicEnv, state: &'a NativeChainState, seed: u64) -> Self {
@@ -281,8 +304,8 @@ mod tests {
         let ctx = TickCtx {
             env: &env,
             state: &state,
-            seed: 0,
             action_params: Some(&store),
+            ..Default::default()
         };
         assert_eq!(
             ctx.action_override("equivocate", "ways"),

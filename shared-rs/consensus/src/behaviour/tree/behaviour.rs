@@ -431,8 +431,7 @@ mod tests {
         let ctx = TickCtx {
             env: &env,
             state,
-            seed: 0,
-            action_params: None,
+            ..TickCtx::default()
         };
         let mut out = ControlSignal::default();
         let s = node.tick(&ctx, &mut out);
@@ -447,8 +446,7 @@ mod tests {
         let ctx = TickCtx {
             env,
             state,
-            seed: 0,
-            action_params: None,
+            ..TickCtx::default()
         };
         let mut out = ControlSignal::default();
         let s = node.tick(&ctx, &mut out);
@@ -841,7 +839,7 @@ mod tests {
             env: &env,
             state: &state,
             seed: 42,
-            action_params: None,
+            ..TickCtx::default()
         });
         assert_eq!(s, Status::Success);
         assert_eq!(out, ControlSignal::default());
@@ -889,8 +887,8 @@ mod tests {
         let ctx = TickCtx {
             env: &env,
             state: &state,
-            seed: 0,
             action_params: Some(&store),
+            ..Default::default()
         };
         let mut out = ControlSignal::default();
         node.tick(&ctx, &mut out);
