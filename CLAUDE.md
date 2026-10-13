@@ -4,14 +4,16 @@ shell commands, and other important information, read the current plan:
 `specs/001-behavior-tree-engine/plan.md`
 <!-- SPECKIT END -->
 
-## Workspace layout (two separate Cargo workspaces)
+## Workspace layout (three separate Cargo workspaces)
 
-This repo has **two independent Cargo workspaces**, not one:
+This repo has **three independent Cargo workspaces**, not one:
 
 - **`shared-rs/`** — members `consensus`, `vrf`, `kes`, `bls`, `tcp-model`
   (crate names `shared-consensus`, `shared-vrf`, …).
 - **`net-rs/`** — members `net-codec`, `net-core`, `net-cli`. Has its own
   detailed `net-rs/CLAUDE.md` — read it when working there.
+- **`sim-rs/`** — members `sim-core`, `sim-cli`. Has its own
+  `sim-rs/CLAUDE.md`.
 
 **Test-command gotcha:** `shared-rs` crates are **not** members of the `net-rs`
 workspace, so `cargo test -p shared-consensus` from `net-rs/` **fails** with
@@ -32,9 +34,9 @@ consumes `shared-consensus`, `shared-vrf`, `shared-kes`, `shared-bls`,
 - Editing these crates **directly changes that node's build.** A change that
   compiles here can break the node; when in doubt, also build
   `net-node` against your edit.
-- The block-production effort keeps both repos on the branch
-  **`prc/block-production`** (this side is PR #77). Keep this checkout on that
-  branch so the node builds.
+- The integration target is **`main`**. The old `prc/block-production`
+  pairing is superseded: PR #77 merged to `main` on 2026-07-29 and the branch
+  is gone. Don't switch a checkout just to follow a historical pairing note.
 - After editing a crate, a downstream `cargo` build may reuse a **stale**
   artifact — `touch` the changed file if a rebuilt binary doesn't reflect the
   change.

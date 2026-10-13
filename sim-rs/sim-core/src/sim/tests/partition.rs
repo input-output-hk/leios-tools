@@ -145,6 +145,7 @@ fn node(producers: &[&str]) -> RawNode {
                 (
                     n.to_string(),
                     RawLinkInfo {
+                        always_forward_votes: false,
                         latency_ms: 5.0,
                         bandwidth_bytes_per_second: None,
                         tcp_envelope: None,

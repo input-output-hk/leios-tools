@@ -79,6 +79,17 @@ pub struct Endorsement<Node: Display = NodeId> {
     pub votes: BTreeMap<Node, usize>,
 }
 
+/// `task_type` carried by the CPU task that verifies a vote bundle.
+/// The run summary counts these tasks *finishing* to report verification
+/// work directly, instead of deriving it from arrivals minus duplicates
+/// (which is wrong for every transport that verifies a copy it turns out
+/// not to need).  Scheduling is not the same thing: a task queued behind a
+/// node's core limit has cost nothing yet and may never run at all, so
+/// counting `CpuTaskScheduled` reports work that has not happened.  Kept
+/// here, next to the events that carry it, because `sim::linear_wire` is
+/// crate-private.
+pub const VOTE_VALIDATION_TASK: &str = "ValVote";
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Event {
@@ -291,6 +302,84 @@ pub enum Event {
         recipient: Node,
         msg_size_bytes: u64,
     },
+    /// A vote bundle's id was offered to a peer, without the body.  Costs
+    /// `vote-announcement-size-bytes`, 8 by default.
+    ///
+    /// `announce-then-request` sends one of these per link and one
+    /// `VTBundleRequested` back for every body it goes on to send, so in
+    /// message count it is the most expensive transport, not the cheapest.
+    /// Nothing counted them before, which is how it came to look cheapest.
+    VTBundleAnnounced {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// A vote bundle's body was asked for after its id was announced.  Costs
+    /// `vote-request-size-bytes`, 8 by default.
+    VTBundleRequested {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// The announcement reached its recipient (distinct from sending it).
+    VTBundleAnnouncementReceived {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// The body request reached its recipient.
+    VTBundleRequestReceived {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// First successful validation of a received, relevant bundle at a Linear
+    /// node. Local generation, duplicates and obsolete votes do not emit this.
+    VTBundleAccepted {
+        id: VoteBundleId<Node>,
+        sender: Node,
+        recipient: Node,
+    },
+    /// A redundant arrival: the recipient already held the bundle, finished
+    /// verifying another copy, or finished validating votes for pruned EBs.
+    /// The bytes were always spent, and under the transports that only
+    /// recognise a redundant copy after verifying it
+    /// the signature check was spent too.
+    VTBundleDuplicate {
+        id: VoteBundleId<Node>,
+        producer: Node,
+        sender: Node,
+        recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// Additional classification of an arrival whose EBs are all locally
+    /// pruned. Its bytes are already included in the normal received totals.
+    VTBundleObsoleteReceived {
+        id: VoteBundleId<Node>,
+        node: Node,
+        msg_size_bytes: u64,
+    },
+    /// A completed verification whose EBs are all locally pruned at completion.
+    /// `already_held` describes the cache before the normal insertion; this
+    /// event neither skips that insertion nor changes subsequent forwarding.
+    VTBundleObsoleteValidated {
+        id: VoteBundleId<Node>,
+        node: Node,
+        already_held: bool,
+    },
+    /// Obsolete outgoing bodies or announcements, already in normal wire totals.
+    /// One event can summarize all recipients of a diffusion invocation.
+    VTBundleObsoleteSent {
+        id: VoteBundleId<Node>,
+        node: Node,
+        bodies: u64,
+        announcements: u64,
+        msg_size_bytes: u64,
+    },
     VTBundleReceived {
         id: VoteBundleId<Node>,
         slot: u64,
@@ -298,6 +387,18 @@ pub enum Event {
         producer: Node,
         sender: Node,
         recipient: Node,
+        msg_size_bytes: u64,
+    },
+    /// A node's tally of votes for an endorser block first reached the
+    /// quorum threshold.  Emitted once per (node, EB), when the votes are
+    /// counted -- so it is charged the validation the node had to do to get
+    /// there.  The earliest of these is the soonest anyone could certify
+    /// that EB, which is what the voting period has to accommodate.
+    EBQuorumReached {
+        id: EndorserBlockId<Node>,
+        slot: u64,
+        node: Node,
+        votes: u64,
     },
 
     /// CIP-0164 single-vote emission (shared-consensus adapter only — one BLS
@@ -401,8 +502,18 @@ impl Event {
             Self::VTLotteryWon { producer, .. }
             | Self::VTBundleGenerated { producer, .. }
             | Self::VTBundleNotGenerated { producer, .. } => Some(producer.id),
-            Self::VTBundleSent { sender, .. } => Some(sender.id),
-            Self::VTBundleReceived { recipient, .. } => Some(recipient.id),
+            Self::VTBundleSent { sender, .. }
+            | Self::VTBundleAnnounced { sender, .. }
+            | Self::VTBundleRequested { sender, .. } => Some(sender.id),
+            Self::VTBundleReceived { recipient, .. }
+            | Self::VTBundleAnnouncementReceived { recipient, .. }
+            | Self::VTBundleRequestReceived { recipient, .. }
+            | Self::VTBundleAccepted { recipient, .. } => Some(recipient.id),
+            Self::VTBundleDuplicate { recipient, .. } => Some(recipient.id),
+            Self::EBQuorumReached { node, .. }
+            | Self::VTBundleObsoleteReceived { node, .. }
+            | Self::VTBundleObsoleteValidated { node, .. }
+            | Self::VTBundleObsoleteSent { node, .. } => Some(node.id),
             Self::VoteGenerated { voter, .. } => Some(voter.id),
             Self::VoteSent { sender, .. } => Some(sender.id),
             Self::VoteReceived { recipient, .. } => Some(recipient.id),
@@ -949,6 +1060,134 @@ impl EventTracker {
         });
     }
 
+    /// We offered a peer a bundle's id rather than its body.  `msg_size_bytes`
+    /// is what the Vote mini-protocol charges for the announcement, taken
+    /// from the message itself so the counter cannot drift from the wire.
+    pub fn track_votes_announced(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleAnnounced {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    /// We asked a peer for the body of a bundle it announced.
+    pub fn track_votes_requested(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleRequested {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_announcement_received(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleAnnouncementReceived {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_request_received(
+        &self,
+        id: VoteBundleId,
+        sender: NodeId,
+        recipient: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleRequestReceived {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_votes_accepted(&self, id: VoteBundleId, sender: NodeId, recipient: NodeId) {
+        self.send(Event::VTBundleAccepted {
+            id: self.to_vote_bundle(id),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+        });
+    }
+
+    /// A bundle arrived that we did not need, either because we already held
+    /// it or because we only found out after verifying it.  Records the
+    /// wasted bytes; the wasted verification shows up in the CPU task count.
+    pub fn track_votes_duplicate(&self, votes: &VoteBundle, sender: NodeId, recipient: NodeId) {
+        self.send(Event::VTBundleDuplicate {
+            id: self.to_vote_bundle(votes.id),
+            producer: self.to_node(votes.id.producer),
+            sender: self.to_node(sender),
+            recipient: self.to_node(recipient),
+            msg_size_bytes: votes.bytes,
+        });
+    }
+
+    pub fn track_obsolete_votes_received(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleObsoleteReceived {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            msg_size_bytes,
+        });
+    }
+
+    pub fn track_obsolete_votes_validated(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        already_held: bool,
+    ) {
+        self.send(Event::VTBundleObsoleteValidated {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            already_held,
+        });
+    }
+
+    pub fn track_obsolete_votes_sent(
+        &self,
+        id: VoteBundleId,
+        node: NodeId,
+        bodies: u64,
+        announcements: u64,
+        msg_size_bytes: u64,
+    ) {
+        self.send(Event::VTBundleObsoleteSent {
+            id: self.to_vote_bundle(id),
+            node: self.to_node(node),
+            bodies,
+            announcements,
+            msg_size_bytes,
+        });
+    }
+
     pub fn track_votes_received(&self, votes: &VoteBundle, sender: NodeId, recipient: NodeId) {
         self.send(Event::VTBundleReceived {
             id: self.to_vote_bundle(votes.id),
@@ -957,6 +1196,18 @@ impl EventTracker {
             producer: self.to_node(votes.id.producer),
             sender: self.to_node(sender),
             recipient: self.to_node(recipient),
+            msg_size_bytes: votes.bytes,
+        });
+    }
+
+    /// This node's tally for `eb` has just reached the quorum threshold.
+    /// Emitted once per (node, EB).
+    pub fn track_eb_quorum_reached(&self, node: NodeId, eb: EndorserBlockId, votes: u64) {
+        self.send(Event::EBQuorumReached {
+            id: self.to_endorser_block(eb),
+            slot: eb.slot,
+            node: self.to_node(node),
+            votes,
         });
     }
 

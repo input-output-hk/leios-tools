@@ -19,7 +19,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{level_filters::LevelFilter, warn};
+use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt};
 
 mod events;
@@ -38,6 +38,9 @@ struct Args {
     #[clap(default_value = None)]
     topology: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// Save per-node Linear Leios vote traffic and fixed one-second byte buckets.
+    #[clap(long)]
+    vote_traffic: Option<PathBuf>,
     #[clap(short, long)]
     parameters: Vec<PathBuf>,
     #[clap(long)]
@@ -147,19 +150,56 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = read_config(&args)?;
 
+    let slots = config.slots;
     let (events_sink, events_source) = mpsc::unbounded_channel();
-    let monitor = tokio::spawn(EventMonitor::new(&config, events_source, args.output).run());
+    let monitor = EventMonitor::new(&config, events_source, args.output)
+        .with_vote_traffic_output(&config, args.vote_traffic)?;
+    let monitor = tokio::spawn(monitor.run());
     pin!(monitor);
 
     let simulation = Simulation::new(config, events_sink).await?;
 
-    select! {
-        result = simulation.run(token) => { result? }
-        result = &mut monitor => { return result?; }
-        _ = ctrlc_source => {}
+    // Keep the simulation future alive while cancelling: dropping a future
+    // cannot stop the sequential engine's spawn_blocking worker.
+    let simulation = simulation.run(token.child_token());
+    pin!(simulation);
+    let (result, monitored) = select! {
+        result = &mut simulation => {
+            if result.is_err() { token.cancel(); }
+            (result, monitor.await)
+        }
+        monitored = &mut monitor => {
+            if !matches!(&monitored, Ok(Ok(_))) { token.cancel(); }
+            (simulation.await, monitored)
+        }
+        _ = ctrlc_source => {
+            token.cancel();
+            (simulation.await, monitor.await)
+        }
     };
-
-    monitor.await??;
+    let (completed_slots, report) = monitored??;
+    result?;
+    if token.is_cancelled() {
+        // Ctrl-C is the documented way to finish an ordinary interactive run.
+        // Its event stream and final stats have already been flushed. A traffic
+        // capture needs the full interval, so keep that failure distinct.
+        anyhow::ensure!(
+            report.is_none(),
+            "simulation interrupted; traffic capture discarded"
+        );
+        info!("Simulation interrupted after {completed_slots} observed slots.");
+        return Ok(());
+    }
+    anyhow::ensure!(
+        slots.is_none_or(|slots| slots == completed_slots),
+        "simulation ended before all requested slots were observed"
+    );
+    if let Some(report) = report {
+        report.publish()?;
+    }
+    if let Some(slots) = slots {
+        info!("Simulation completed: {slots} slots.");
+    }
     Ok(())
 }
 
@@ -177,6 +217,7 @@ mod tests {
             let args = Args {
                 topology: Some(topology?.path()),
                 output: None,
+                vote_traffic: None,
                 parameters: vec![],
                 trace_node: vec![],
                 slots: None,

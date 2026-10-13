@@ -10,7 +10,7 @@ use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use rand_distr::Distribution;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     clock::Timestamp,
@@ -331,6 +331,8 @@ pub struct RawParameters {
     /// - `top-stake-fraction` (CIP-164 PR #1196): threshold =
     ///   `quorum_weight_fraction × total_active_stake`, and per-voter
     ///   weight is stake (not vote count).
+    /// - `top-stake-seats` (CIP-0164 PR #1250): threshold =
+    ///   `quorum_weight_fraction × total_active_stake`; votes carry pool stake.
     #[serde(default = "default_quorum_weight_fraction")]
     pub quorum_weight_fraction: f64,
     pub vote_bundle_size_bytes_constant: u64,
@@ -338,8 +340,56 @@ pub struct RawParameters {
     pub non_persistent_vote_bundle_size_bytes_per_eb: u64,
     #[serde(default)]
     pub committee_selection_algorithm: CommitteeSelectionAlgorithm,
+    #[serde(default)]
+    pub vote_transport: VoteTransport,
+    /// Linear vote-bundle announcements and requests, including identifier and
+    /// application framing, excluding TCP/IP. Legacy studies use 8 bytes each.
+    /// Only `announce-then-request` sends these messages, so a nondefault size
+    /// on a push transport is accepted with a warning and changes nothing.
+    #[serde(default = "default_vote_control_size_bytes")]
+    pub vote_announcement_size_bytes: u64,
+    #[serde(default = "default_vote_control_size_bytes")]
+    pub vote_request_size_bytes: u64,
+    /// Push a vote body back to the peer it arrived from.  Pure waste, and
+    /// off by default, but the Haskell node's notify server has no per-peer
+    /// provenance and so does exactly this.
+    ///
+    /// Applies to the push transports only.  `announce-then-request` has no
+    /// notify server to model, and it is the published baseline, so the flag
+    /// leaves it alone rather than adding a round trip on every link.
+    #[serde(default)]
+    pub vote_transport_echo_to_source: bool,
+    /// Push a vote body to at most this many peers instead of every
+    /// consumer.  Unset means every consumer, which is what both node
+    /// implementations do and is the default.
+    ///
+    /// This is a proposal of ours, not a CIP-0164 rule.  The specification
+    /// caps how many *distinct* votes a node relays per committee member
+    /// per slot, which a bundle key already enforces here; it places no
+    /// bound on how many *copies* of one vote cross the network, and the
+    /// copies are what cost verification time.  Applies to the push
+    /// transports only: `announce-then-request` sends bodies solely on
+    /// request, so a push fanout cap does not apply.
+    ///
+    /// See `vote_push_fanout_protects_producers` for which consumers the
+    /// limit is drawn from.
+    #[serde(default)]
+    pub vote_push_fanout: Option<u64>,
+    /// Prioritize topology links marked `always-forward-votes` within the
+    /// total fanout budget. These identify a relay's own BP consumers without
+    /// inferring ownership from stake. Remaining places are sampled by hash.
+    /// Defaults to false, preserving the 2026-09-10 forwarding rule. Without
+    /// a cap this is accepted with a warning for archived-input compatibility.
+    #[serde(default)]
+    pub vote_push_fanout_protects_producers: bool,
     #[serde(default = "default_committee_stake_fraction_threshold")]
     pub committee_stake_fraction_threshold: f64,
+    /// Committee size for `top-stake-seats`, following CIP-0164 PR #1250
+    /// (proposed value: 900). Each vote carries its pool's active stake.
+    /// If fewer pools exist, all are seated. Quorum is always measured
+    /// against total active stake, including stake outside the committee.
+    #[serde(default = "default_committee_seat_count")]
+    pub committee_seat_count: u64,
 
     // Certificate configuration
     pub cert_generation_cpu_time_ms_constant: f64,
@@ -457,10 +507,61 @@ pub enum CommitteeSelectionAlgorithm {
     WfaLs,
     Everyone,
     TopStakeFraction,
+    /// CIP-0164 PR #1250: the top `committee_seat_count` stake-holding
+    /// pools are seated, ties broken by node identifier ascending (topology
+    /// name order, the simulator's surrogate for pool identifiers).
+    /// Each vote carries its pool's stake, not a unit seat weight.
+    /// Deterministic: membership is a function of the stake distribution
+    /// alone, so no eligibility proof is carried.
+    TopStakeSeats,
+}
+
+/// How a vote bundle reaches a peer.
+///
+/// The original `AnnounceThenRequest` path requests bodies after an
+/// announcement, suppressing requests while its local cache remembers them.
+/// Push sends bodies inline to peers without that round trip. See
+/// `vote-transport` in `config.default.yaml`.
+///
+/// Distinct from `vote-diffusion-strategy`, which is a request-ordering knob
+/// read by the Haskell simulator and ignored here; the two live in the same
+/// shared config file and must not be confused.
+#[derive(Debug, Default, Copy, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VoteTransport {
+    /// Announce the id, wait for a request, then send the body.
+    #[default]
+    AnnounceThenRequest,
+    /// Push the body straight to peers, forwarding a bundle only the first
+    /// time it is seen.  A copy arriving while another is still being
+    /// validated is recognised and dropped before it costs anything.
+    Push,
+    /// As `Push`, but suppression applies only once a bundle is fully held,
+    /// so copies arriving during the validation window are each validated.
+    /// This is the Haskell node's ordering: it verifies before inserting into
+    /// its seen-set and notes "one redundant verification per
+    /// concurrently-received duplicate".  Forwarding still happens once.
+    PushLateDedupe,
+}
+
+impl VoteTransport {
+    /// True when bodies are pushed rather than announced.
+    pub fn is_push(self) -> bool {
+        matches!(self, Self::Push | Self::PushLateDedupe)
+    }
+    /// True when a bundle is marked on receipt, so copies arriving while it
+    /// is still being validated are dropped rather than validated again.
+    pub fn suppresses_in_flight(self) -> bool {
+        matches!(self, Self::Push)
+    }
 }
 
 fn default_committee_stake_fraction_threshold() -> f64 {
     0.95
+}
+
+fn default_committee_seat_count() -> u64 {
+    900
 }
 
 fn default_quorum_weight_fraction() -> f64 {
@@ -759,6 +860,10 @@ pub enum RawNodeLocation {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawLinkInfo {
+    /// On this consumer's upstream connection, always forward votes from the
+    /// upstream node to this consumer when producer protection is enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_forward_votes: bool,
     pub latency_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bandwidth_bytes_per_second: Option<u64>,
@@ -957,6 +1062,7 @@ impl Topology {
                     tx_conflict_fraction: node.tx_conflict_fraction,
                     tx_generation_weight: node.tx_generation_weight,
                     consumers: vec![],
+                    protected_vote_consumers: vec![],
                     behaviours,
                 },
             );
@@ -972,6 +1078,13 @@ impl Topology {
                     .unwrap()
                     .consumers
                     .push(consumer_id);
+                if producer_info.always_forward_votes {
+                    nodes
+                        .get_mut(&producer_id)
+                        .unwrap()
+                        .protected_vote_consumers
+                        .push(consumer_id);
+                }
                 let mut ids = [consumer_id, producer_id];
                 ids.sort();
                 let latency = duration_ms(producer_info.latency_ms);
@@ -1016,11 +1129,12 @@ impl Topology {
 
 fn vote_weighted_average(params: &RawParameters, persistent: f64, non_persistent: f64) -> f64 {
     match params.committee_selection_algorithm {
-        // Everyone and TopStakeFraction voters are all deterministically selected,
-        // so they use persistent vote parameters (no eligibility proofs needed).
-        CommitteeSelectionAlgorithm::Everyone | CommitteeSelectionAlgorithm::TopStakeFraction => {
-            persistent
-        }
+        // Everyone, TopStakeFraction and TopStakeSeats voters are all
+        // deterministically selected, so they use persistent vote
+        // parameters (no eligibility proofs needed).
+        CommitteeSelectionAlgorithm::Everyone
+        | CommitteeSelectionAlgorithm::TopStakeFraction
+        | CommitteeSelectionAlgorithm::TopStakeSeats => persistent,
         CommitteeSelectionAlgorithm::WfaLs => {
             let total = params.persistent_voters + params.non_persistent_voters;
             if total == 0.0 {
@@ -1382,9 +1496,19 @@ pub struct SimConfiguration {
     /// Quorum fraction (CIP-0164 default 0.75).  Compare votes against
     /// `quorum_weight_fraction × expected_total_weight`.
     pub quorum_weight_fraction: f64,
+    pub vote_transport: VoteTransport,
+    pub vote_announcement_size_bytes: u64,
+    pub vote_request_size_bytes: u64,
+    pub vote_transport_echo_to_source: bool,
+    /// Push a vote body to at most this many peers.  `None` means every
+    /// consumer.  See `RawParameters::vote_push_fanout`.
+    pub vote_push_fanout: Option<u64>,
+    /// See `RawParameters::vote_push_fanout_protects_producers`.
+    pub vote_push_fanout_protects_producers: bool,
     /// Quorum denominator in the units the relevant node implementation
     /// sums per-voter weights.  WfaLs/Everyone: seats or node count.
-    /// TopStakeFraction (CIP-164 PR #1196): `total_stake`.
+    /// TopStakeFraction / TopStakeSeats: total active stake, including
+    /// stake outside the selected committee.
     pub expected_total_weight: u64,
     pub(crate) total_stake: u64,
     pub(crate) praos_fallback: bool,
@@ -1448,7 +1572,89 @@ pub struct SimConfiguration {
     pub(crate) behaviour_tree_configs: BTreeMap<NodeId, String>,
 }
 
+/// The CIP-0164 timing of one endorser block's voting window, held as
+/// offsets from `t0`.
+///
+/// `t0` is the start of the slot of the ranking block that announced the
+/// EB, which is the only anchor the specification gives: the EB carries no
+/// slot of its own, and §Certificate Inclusion measures the window "since
+/// the slot of the RB that announced the EB".  Every timing rule below,
+/// and every quorum-timing figure in the run summary, is derived from this
+/// one struct instead of re-deriving `3 * L_hdr` wherever it is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VotingWindow {
+    /// `L_hdr`, the header diffusion period.  A committee member votes
+    /// only if "the RB header arrived within L_hdr".
+    pub header_deadline: Duration,
+    /// `3 * L_hdr`, the equivocation-detection period.  No honest node may
+    /// cast a vote before it ends: "By waiting 3 L_hdr before voting
+    /// begins, the protocol ensures that if any equivocation occurred soon
+    /// enough to matter, all honest nodes will have detected it".
+    pub gate: Duration,
+    /// `3 * L_hdr + L_vote`, the end of the voting period.  A committee
+    /// member may only vote if "it finished validating the EB before
+    /// 3 x L_hdr + L_vote slots after the EB slot", and the quorum is
+    /// collected "during the voting period".
+    pub deadline: Duration,
+    /// `3 * L_hdr + L_vote + L_diff`, the earliest slot at which a
+    /// certificate for the EB may be included in a later ranking block.
+    pub inclusion_deadline: Duration,
+}
+
+impl VotingWindow {
+    /// `t0` for an EB announced by a ranking block in `slot`.
+    pub fn anchor(slot: u64) -> Timestamp {
+        Timestamp::from_secs(slot)
+    }
+
+    /// The instant by which the announcing ranking block's header must
+    /// have arrived for a node to be allowed to vote.
+    pub fn header_deadline_at(self, slot: u64) -> Timestamp {
+        Self::anchor(slot) + self.header_deadline
+    }
+
+    /// The instant the first honest vote for the EB may be cast.
+    pub fn gate_at(self, slot: u64) -> Timestamp {
+        Self::anchor(slot) + self.gate
+    }
+
+    /// The instant the voting period for the EB ends.
+    pub fn deadline_at(self, slot: u64) -> Timestamp {
+        Self::anchor(slot) + self.deadline
+    }
+
+    /// The instant a certificate for the EB may first be included.
+    pub fn inclusion_deadline_at(self, slot: u64) -> Timestamp {
+        Self::anchor(slot) + self.inclusion_deadline
+    }
+}
+
 impl SimConfiguration {
+    /// The voting window every EB in this run gets, as offsets from the
+    /// slot of its announcing ranking block.
+    pub fn voting_window(&self) -> VotingWindow {
+        let gate = self.header_diffusion_time * 3;
+        let deadline = gate + Duration::from_secs(self.linear_vote_stage_length);
+        VotingWindow {
+            header_deadline: self.header_diffusion_time,
+            gate,
+            deadline,
+            inclusion_deadline: deadline + Duration::from_secs(self.linear_diffuse_stage_length),
+        }
+    }
+
+    /// Whether the Linear node's vote tally is denominated in active stake.
+    pub fn vote_weight_is_stake(&self) -> bool {
+        matches!(
+            self.variant,
+            LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+        ) && matches!(
+            self.committee_selection,
+            CommitteeSelectionAlgorithm::TopStakeFraction
+                | CommitteeSelectionAlgorithm::TopStakeSeats
+        )
+    }
+
     /// Absolute quorum threshold in the units the local node
     /// implementation sums per-voter weights — derived from
     /// `quorum_weight_fraction × expected_total_weight`.  Replaces the
@@ -1548,11 +1754,73 @@ impl SimConfiguration {
                     .map(|(id, _)| id)
                     .collect()
             }
+            CommitteeSelectionAlgorithm::TopStakeSeats => {
+                // Only the linear node reads `committee_selection` when it
+                // decides whether and with what weight it votes; the
+                // short/full family and shared-consensus each run their own
+                // lottery and ignore the seating entirely.  Seating a
+                // committee they do not consult while setting a stake-based
+                // quorum denominator they are measured against produces
+                // certification numbers that mean nothing, so every variant
+                // that does not honour the mode is rejected rather than only
+                // the one that was noticed first.
+                if !matches!(
+                    params.leios_variant,
+                    LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+                ) {
+                    bail!(
+                        "committee-selection-algorithm 'top-stake-seats' is implemented for \
+                         the linear Leios variants only ('linear', \
+                         'linear-with-tx-references'); {:?} runs its own vote lottery and \
+                         would ignore the seating while still being measured against a \
+                         stake-based quorum denominator",
+                        params.leios_variant
+                    );
+                }
+                if params.committee_seat_count == 0 {
+                    bail!(
+                        "committee-seat-count is 0, so the committee is empty and no votes \
+                         could contribute to certification"
+                    );
+                }
+                // Only pools — nodes holding stake — can be seated;
+                // zero-stake relays are not candidates.  Highest stake
+                // first, ties broken by node identifier ascending. IDs follow
+                // topology name order and stand in for pool identifiers.
+                let mut pools: Vec<_> = topology
+                    .nodes
+                    .iter()
+                    .filter(|n| n.stake > 0)
+                    .map(|n| (n.id, n.stake))
+                    .collect();
+                pools.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                if pools.is_empty() {
+                    bail!(
+                        "committee-selection-algorithm 'top-stake-seats' needs at least one \
+                         node with stake, but no node in the topology holds any"
+                    );
+                }
+                // Fewer pools than seats is the expected case, not an
+                // error: the 1500-node pseudo-mainnet topology has 458
+                // stake-holding nodes, so a 900-seat request seats 458.
+                pools.truncate(params.committee_seat_count as usize);
+                let seated_stake: u64 = pools.iter().map(|(_, stake)| stake).sum();
+                let threshold = (params.quorum_weight_fraction * total_stake as f64).ceil() as u64;
+                if seated_stake < threshold {
+                    tracing::warn!(
+                        seated_stake,
+                        threshold,
+                        "top-stake-seats committee cannot reach quorum even with every seated pool voting"
+                    );
+                }
+                pools.into_iter().map(|(id, _)| id).collect()
+            }
         };
         // Quorum denominator matches the per-voter weight unit each
         // node implementation sums.  WfaLs: persistent + non-persistent
         // expected vote weight.  Everyone: one seat per topology node.
         // TopStakeFraction: total active stake (PR #1196).
+        // TopStakeSeats: total active stake (PR #1250), not just seated stake.
         let expected_total_weight: u64 = match params.committee_selection_algorithm {
             CommitteeSelectionAlgorithm::WfaLs => {
                 // PV / NPV are f64 in the config; round to the nearest
@@ -1563,8 +1831,116 @@ impl SimConfiguration {
                 (params.persistent_voters + params.non_persistent_voters).round() as u64
             }
             CommitteeSelectionAlgorithm::Everyone => topology.nodes.len() as u64,
-            CommitteeSelectionAlgorithm::TopStakeFraction => total_stake,
+            CommitteeSelectionAlgorithm::TopStakeFraction
+            | CommitteeSelectionAlgorithm::TopStakeSeats => total_stake,
         };
+        if params.vote_announcement_size_bytes == 0 || params.vote_request_size_bytes == 0 {
+            bail!("vote-announcement-size-bytes and vote-request-size-bytes must be positive");
+        }
+        if (params.vote_announcement_size_bytes != 8 || params.vote_request_size_bytes != 8)
+            && !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            )
+        {
+            bail!(
+                "configurable vote announcement/request sizes support the linear Leios variants only"
+            );
+        }
+        if (params.vote_announcement_size_bytes != 8 || params.vote_request_size_bytes != 8)
+            && params.vote_transport.is_push()
+        {
+            // Push sends bodies without announcing them, so these sizes reach
+            // no message. Rejecting them would refuse a size sweep that keeps
+            // one overlay per size across both transports, so say so instead.
+            warn!(
+                "vote announcement/request sizes have no effect with {:?}, which sends bodies without announcing or requesting them",
+                params.vote_transport
+            );
+        }
+        // A knob that is silently ignored is worse than one that is
+        // absent, because a run still produces numbers and nothing says
+        // they came from the default.  Bounded fanout is read in one
+        // place, `linear_leios::diffuse_vote_bundle`, and only on the
+        // push path, so reject every configuration that would not reach
+        // it rather than the one that happened to be noticed.
+        if let Some(fanout) = params.vote_push_fanout {
+            if fanout == 0 {
+                bail!(
+                    "vote-push-fanout is 0, so a vote would never leave the node that cast \
+                     it; the fanout must be positive"
+                );
+            }
+            if !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            ) {
+                bail!(
+                    "vote-push-fanout is implemented for the linear Leios variants only \
+                     ('linear', 'linear-with-tx-references'); {:?} diffuses votes by its own \
+                     path and would ignore the limit",
+                    params.leios_variant
+                );
+            }
+            if !params.vote_transport.is_push() {
+                bail!(
+                    "vote-push-fanout bounds how many peers a vote body is pushed to, but \
+                     vote-transport is {:?}, which sends a body only when a peer asks for \
+                     it; the limit would have no effect",
+                    params.vote_transport
+                );
+            }
+        }
+        if params.vote_push_fanout.is_none() && params.vote_push_fanout_protects_producers {
+            // The archived unrestricted-push traffic overlay enables this
+            // flag. All consumers already receive votes without a cap.
+            warn!(
+                "producer protection has no effect without a vote-push-fanout cap; preserving the configured transport"
+            );
+        }
+        if let Some(fanout) = params.vote_push_fanout
+            && params.vote_push_fanout_protects_producers
+        {
+            if topology
+                .nodes
+                .iter()
+                .all(|node| node.protected_vote_consumers.is_empty())
+            {
+                bail!(
+                    "vote-push-fanout-protects-producers requires topology links marked always-forward-votes"
+                );
+            }
+            for node in &topology.nodes {
+                if node.protected_vote_consumers.len() as u64 > fanout {
+                    bail!(
+                        "node {} has {} protected vote consumers, exceeding vote-push-fanout {}",
+                        node.name,
+                        node.protected_vote_consumers.len(),
+                        fanout
+                    );
+                }
+            }
+            if topology
+                .nodes
+                .iter()
+                .all(|node| node.protected_vote_consumers.len() == node.consumers.len())
+            {
+                bail!("every vote consumer is protected; vote-push-fanout would have no effect");
+            }
+        }
+        if (params.vote_transport.is_push() || params.vote_transport_echo_to_source)
+            && !matches!(
+                params.leios_variant,
+                LeiosVariant::Linear | LeiosVariant::LinearWithTxReferences
+            )
+        {
+            bail!(
+                "vote-transport push modes and vote-transport-echo-to-source are implemented \
+                 for the linear Leios variants only ('linear', 'linear-with-tx-references'); \
+                 {:?} would ignore these settings",
+                params.leios_variant
+            );
+        }
         Ok(Self {
             seed: params.seed,
             timestamp_resolution: duration_ms(params.timestamp_resolution_ms),
@@ -1614,6 +1990,12 @@ impl SimConfiguration {
             persistent_voters: params.persistent_voters,
             non_persistent_voters: params.non_persistent_voters,
             quorum_weight_fraction: params.quorum_weight_fraction,
+            vote_transport: params.vote_transport,
+            vote_announcement_size_bytes: params.vote_announcement_size_bytes,
+            vote_request_size_bytes: params.vote_request_size_bytes,
+            vote_transport_echo_to_source: params.vote_transport_echo_to_source,
+            vote_push_fanout: params.vote_push_fanout,
+            vote_push_fanout_protects_producers: params.vote_push_fanout_protects_producers,
             expected_total_weight,
             vote_slot_length: params.leios_stage_active_voting_slots,
             eb_include_txs_from_previous_stage: params.eb_include_txs_from_previous_stage,
@@ -1694,6 +2076,10 @@ fn default_parallel_threshold() -> usize {
     10
 }
 
+fn default_vote_control_size_bytes() -> u64 {
+    8
+}
+
 fn default_retry_vote_in_window() -> bool {
     true
 }
@@ -1724,6 +2110,7 @@ pub struct NodeConfiguration {
     pub tx_conflict_fraction: Option<f64>,
     pub tx_generation_weight: Option<u64>,
     pub consumers: Vec<NodeId>,
+    pub protected_vote_consumers: Vec<NodeId>,
     pub behaviours: NodeBehaviours,
 }
 
@@ -1775,6 +2162,7 @@ mod consensus_behaviour_tests {
             tx_conflict_fraction: None,
             tx_generation_weight: None,
             consumers: Vec::new(),
+            protected_vote_consumers: Vec::new(),
             behaviours: NodeBehaviours::default(),
         }
     }
@@ -1928,6 +2316,7 @@ mod tcp_envelope_tests {
         b_producers.insert(
             "a".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 50.0,
                 bandwidth_bytes_per_second: Some(1_000_000),
                 tcp_envelope: None,
@@ -2053,6 +2442,7 @@ mod partition_tests {
                 producers.insert(
                     peer.to_string(),
                     RawLinkInfo {
+                        always_forward_votes: false,
                         latency_ms: 10.0,
                         bandwidth_bytes_per_second: None,
                         tcp_envelope: None,
@@ -2254,6 +2644,7 @@ mod partition_tests {
         b_producers.insert(
             "a".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 10.0,
                 bandwidth_bytes_per_second: None,
                 tcp_envelope: None,
@@ -2262,6 +2653,7 @@ mod partition_tests {
         b_producers.insert(
             "c".to_string(),
             RawLinkInfo {
+                always_forward_votes: false,
                 latency_ms: 10.0,
                 bandwidth_bytes_per_second: None,
                 tcp_envelope: None,

@@ -183,6 +183,7 @@ impl GraphBuilder {
             nodes.get_mut(&link.node).unwrap().producers.insert(
                 link.producer,
                 RawLinkInfo {
+                    always_forward_votes: false,
                     latency_ms: link.latency_ms as f64,
                     bandwidth_bytes_per_second: None,
                     tcp_envelope: None,

@@ -133,7 +133,7 @@ pub struct Elections {
     cfg: ElectionsConfig,
     current_slot: u64,
     elections: BTreeMap<[u8; 32], EbElection>,
-    /// Pools ranked by stake DESCENDING (node-id descending tie-break) — the
+    /// Pools ranked by stake DESCENDING (node-id ASCENDING tie-break) — the
     /// CIP-0164 fait-accompli persistent ordering the network puts in a vote's
     /// `voter_id` and indexes the certificate signers bitfield by. Used for
     /// O(1) compact-index → node-id lookup on the vote-receive path. Registry
@@ -149,19 +149,28 @@ pub struct Elections {
 impl Elections {
     pub fn new(cfg: ElectionsConfig) -> Self {
         // The compact voter index IS the CIP-0164 PersistentId: pools ranked by
-        // stake DESCENDING (node-id descending tie-break), NOT the BTreeMap
-        // (lexicographic node-id) order. The network puts this rank in a vote's
-        // `voter_id` and indexes the certificate signers bitfield by it; keying
-        // by BTreeMap order instead makes inbound votes verify under the wrong
-        // committee seat and mis-weights quorum. This comparator is byte-
-        // identical to net-node's cert-bitfield ranking
-        // (`LeiosConsensus::voter_to_persistent`), so that map stays an identity
-        // and the (block-77995-verified) bitfield layout is unchanged.
+        // stake DESCENDING, with an **ASCENDING node-id tie-break**. The network
+        // puts this rank in a vote's `voter_id` and indexes the certificate
+        // signers bitfield by it, so a tie-break in the wrong direction makes
+        // inbound votes verify under the wrong committee seat and mis-weights
+        // quorum. This comparator must stay byte-identical to net-node's
+        // cert-bitfield ranking (`LeiosConsensus::voter_to_persistent`) so that
+        // map remains an identity.
+        //
+        // The tie-break was DESCENDING until 2026-09-23. Measured on the w38
+        // proto-devnet (3 pools at 24T + net-rs at 18T): net-rs ranked the
+        // equal-stake pools eb8865c7=0, 90105953=1, 169ff24f=2, but the network
+        // labelled the same votes 169ff24f=0, 90105953=1, eb8865c7=2 — seats 1
+        // and 3 coincided while 0 and 2 swapped, so ~50% of inbound votes
+        // failed BLS verification ("verifies under a DIFFERENT committee seat",
+        // tally verified_ok=87 / verified_bad=88). Quorum was never reached, so
+        // the node could not certify its own EB and missed the cert-embed
+        // window. Ascending reproduces the network's order.
         let mut voter_ids: Vec<String> = cfg.stake_registry.keys().cloned().collect();
         voter_ids.sort_by(|a, b| {
             let sa = cfg.stake_registry.get(a).copied().unwrap_or(0);
             let sb = cfg.stake_registry.get(b).copied().unwrap_or(0);
-            sb.cmp(&sa).then_with(|| b.cmp(a))
+            sb.cmp(&sa).then_with(|| a.cmp(b))
         });
         let voter_index_map: BTreeMap<String, u16> = voter_ids
             .iter()
@@ -559,6 +568,40 @@ mod tests {
         // Out-of-range / unregistered.
         assert_eq!(e.voter_id_at(3), None);
         assert_eq!(e.voter_index("pool-z"), None);
+    }
+
+    #[test]
+    fn equal_stake_seats_tie_break_on_node_id_ascending() {
+        // Consensus-critical. The compact voter index IS the committee seat the
+        // network puts in a vote's `voter_id` and indexes the cert signers
+        // bitfield by. A DESCENDING tie-break here ordered seats 0 and 2 the
+        // opposite way from the network on the w38 devnet, so ~50% of inbound
+        // votes failed BLS verification and quorum was never reached. Pin the
+        // direction so that cannot regress silently.
+        let mut registry = BTreeMap::new();
+        // Equal stake and inserted out of order, so ONLY the tie-break decides.
+        registry.insert("pool-c".to_string(), 100u64);
+        registry.insert("pool-a".to_string(), 100u64);
+        registry.insert("pool-b".to_string(), 100u64);
+        // Lexicographically first ('0' < 'a') but lower stake, so it must still
+        // rank LAST — stake dominates the tie-break.
+        registry.insert("pool-0".to_string(), 50u64);
+        let e = Elections::new(ElectionsConfig {
+            node_id: "pool-a".to_string(),
+            pipeline: test_pipeline(),
+            committee_selection: CommitteeSelection::EveryoneVotes,
+            persistent_committee: BTreeMap::new(),
+            stake_registry: registry,
+            total_stake: 350,
+            expected_total_weight: 4,
+            quorum_weight_fraction: 0.75,
+        });
+        assert_eq!(e.voter_index("pool-a"), Some(0), "node-id ASCENDING");
+        assert_eq!(e.voter_index("pool-b"), Some(1), "node-id ASCENDING");
+        assert_eq!(e.voter_index("pool-c"), Some(2), "node-id ASCENDING");
+        assert_eq!(e.voter_index("pool-0"), Some(3), "stake beats the tie-break");
+        assert_eq!(e.voter_id_at(0), Some("pool-a"));
+        assert_eq!(e.voter_id_at(3), Some("pool-0"));
     }
 
     #[test]

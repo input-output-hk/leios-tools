@@ -51,6 +51,71 @@ pub struct PraosControl {
     /// parent RB's announced EB, killing that EB's certification (strict
     /// parent-only cert rule) without touching quorum.
     pub suppress_cert: bool,
+    /// AUDIT (`single-bls-cert` action): forge the `leios_certificate` on any
+    /// CertRB this node produces so its `signers` bitfield names the WHOLE
+    /// committee while its aggregate is only this node's OWN BLS vote signature
+    /// over the announcing RB hash. The all-committee bitfield clears the
+    /// ledger's weight gate (`InsufficientWeight`), leaving exactly one thing
+    /// between the block and adoption: whether `verifyLeiosCert` binds the
+    /// aggregate to the named signer set. Honest reject (`InvalidSignature`) =
+    /// aggregate verification holds; honest ADOPT = the verifier trusts the
+    /// bitfield's weight without checking the aggregate — a certificate-forgery
+    /// soundness break (a single committee key forges full-quorum certs). The
+    /// actuator ships the deliberately-invalid cert on purpose, so it also
+    /// bypasses the producer's own pre-publish self-verify drop. Default
+    /// `false` keeps `ControlSignal::default()` honest.
+    pub forge_single_bls_cert: bool,
+    /// AUDIT (`wrong-len-cert` action, T14 variant #2): forge the
+    /// `leios_certificate` on any CertRB this node produces so its `signers`
+    /// bitfield is a DELIBERATELY WRONG length (`⌈committee_size/8⌉ + 1` bytes)
+    /// while otherwise well-formed (an all-committee bitfield over a valid G1
+    /// aggregate). `verifyLeiosCert` compares the bitfield length against the
+    /// committee size FIRST — before any BLS math — and rejects a mismatch as
+    /// `MalformedSigners`, which makes the carrying RB an `InvalidBlock`. This is
+    /// the cheapest-to-reject invalid-cert variant (a length compare), the
+    /// low end of T14's cost-asymmetry axis. Like `forge_single_bls_cert` the
+    /// cert is invalid by construction, so the actuator ships it past the
+    /// producer's own pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_len_cert: bool,
+    /// AUDIT (`wrong-context-cert` action, T14 variant #3): forge the
+    /// `leios_certificate` on any CertRB this node produces so it is well-formed
+    /// in every structural way (correct `⌈committee_size/8⌉` bitfield length, an
+    /// all-committee bitfield, a genuine 48-byte G1 aggregate) but its aggregate
+    /// signs the WRONG message — a deterministically-derived hash (the
+    /// announcing RB hash bitwise-complemented) rather than the announcing RB the
+    /// cert rides on. `verifyLeiosCert` reconstructs the aggregate public key and
+    /// verifies it against the announcing RB's hash (the message each vote
+    /// actually signed), so a valid aggregate over the wrong hash fails with
+    /// `InvalidSignature`. This is the dearest-to-reject variant on T14's
+    /// cost-asymmetry axis — rejection needs full aggregate-pubkey
+    /// reconstruction and a pairing check, unlike `forge_wrong_len_cert`'s cheap
+    /// length compare. Like the other cert-forgery audits the cert is invalid by
+    /// construction, so the actuator ships it past the producer's own
+    /// pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_wrong_context_cert: bool,
+    /// AUDIT (`non-member-cert` action, T14 variant #4): forge the
+    /// `leios_certificate` on any CertRB this node produces so its `signers`
+    /// bitfield has the CORRECT length (`⌈committee_size/8⌉` bytes, so it clears
+    /// the ledger's length check, unlike `forge_wrong_len_cert`) but sets ONLY
+    /// out-of-range bits — bit indices `>= committee_size` living in the padding
+    /// of the final byte — and NO in-range bit. `verifyLeiosCert` applies an
+    /// `idx < committee_size` guard when it decodes the bitfield into named
+    /// signers, so every out-of-range bit is dropped and the effective signer
+    /// set is EMPTY. A certificate that names zero committee seats carries zero
+    /// committee weight, so the ledger rejects it for `InsufficientWeight` — a
+    /// third distinct invalid-cert verdict after `forge_wrong_len_cert`'s
+    /// `MalformedSigners` and `forge_wrong_context_cert` /
+    /// `forge_single_bls_cert`'s `InvalidSignature`. The aggregate is never
+    /// reached: the empty signer set fails the weight gate before any BLS math.
+    /// Requires `committee_size % 8 != 0` (a multiple-of-8 committee has no
+    /// padding bits, so no out-of-range bit is settable within the correct
+    /// length). Like the other cert-forgery audits the cert is invalid by
+    /// construction, so the actuator ships it past the producer's own
+    /// pre-publish self-verify drop. Default `false` keeps
+    /// `ControlSignal::default()` honest.
+    pub forge_non_member_cert: bool,
     /// Announce a fabricated EB on any RB this node produces this slot (the
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
@@ -82,9 +147,14 @@ pub struct PraosControl {
 ///   Dummy. The payload (double-spend, theft, …) lives in the magazine bytes,
 ///   not the node code.
 ///
+/// - [`Malformed`](FakeEbKind::Malformed) — "Malformed EB": the CBOR body is
+///   corrupted at the encoding level (truncated / garbage / empty / wrong CBOR
+///   type). A `hash_matches` flag steers the reject to the content-address gate
+///   or the decoder. Probes at which stage an invalid EB is discarded (T11).
+///
 /// A further variant, "Mega Tx EB" (oversized manifest / declared size, for
 /// resource-exhaustion robustness), is planned (see the fake-eb pen-test plan
-/// in the leios-adversarial-tools repo, which houses the net-node actuation).
+/// in the leios-adversarial-tools repo, which houses the actuation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FakeEbKind {
     /// Phantom Tx EB — `n_txs` unfetchable phantom txs; no bodies pinned.
@@ -101,6 +171,39 @@ pub enum FakeEbKind {
     /// Dummy. Actuation reads the magazine, so the payload (double-spend,
     /// theft, …) lives in the magazine bytes, not the node code.
     Loaded { take: u32 },
+    /// Malformed EB — announce an EB whose CBOR body is corrupted at the
+    /// **encoding** level (not its tx content). `corruption` picks the defect;
+    /// `hash_matches` picks which receiver stage rejects it: `true` announces
+    /// `blake2b_256` of the corrupted bytes so the content-address gate passes
+    /// and the receiver fails at CBOR **decode** (T11 cheap-reject); `false`
+    /// announces the hash of the *clean* bytes so the receiver drops the body at
+    /// the **content-address/hash** gate before decoding. Actuation lives in
+    /// the I/O wrapper. Probes at which stage an invalid EB is discarded, and the
+    /// fetch-then-reject work spent first (T11).
+    Malformed {
+        corruption: Corruption,
+        hash_matches: bool,
+    },
+}
+
+/// How a [`FakeEbKind::Malformed`] EB corrupts its CBOR body. All variants keep
+/// the tx content irrelevant — the defect is in the wire encoding itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Corruption {
+    /// Cut a valid manifest short mid-body: the map header claims N entries but
+    /// the stream ends early. Fails the CBOR decoder.
+    Truncate,
+    /// Replace the body with random bytes: not well-formed CBOR at all.
+    Garbage,
+    /// Serve an empty CBOR array (`[]`, the single byte `0x80`) where a manifest
+    /// map is expected: well-formed CBOR of the wrong type, not an empty byte
+    /// stream. The decoder rejects it on the type mismatch.
+    ZeroBody,
+    /// Keep the declared length nibble but flip the CBOR major type (map → array
+    /// of the same length): structurally valid CBOR of the wrong type, so the
+    /// manifest decoder rejects it cleanly.
+    BadType,
 }
 
 /// Leios-domain actuator inputs.
@@ -193,11 +296,6 @@ pub struct MempoolControl {
     /// to keep the control signal `Eq`; fractional precision is irrelevant for
     /// a flood.
     pub tx_flood_rate: u32,
-    /// `tx-flood` action, optional: slot at which the tx generator may begin
-    /// firing (a coordinated "fire at slot X" gate). `None` = fire immediately
-    /// at `tx_flood_rate`. The I/O wrapper forwards it to the generator's
-    /// `fire_at_slot`, which holds replay until `current_slot() >= X`.
-    pub fire_at_slot: Option<u64>,
 }
 
 /// Whether to cast CIP-0164 votes honestly or abstain.
@@ -305,6 +403,12 @@ mod tests {
         assert!(!d.praos.drop_inbound);
         assert_eq!(d.praos.body_path, None);
         assert!(!d.praos.suppress_cert);
+        // The cert-forgery audit must default off, or the honest node would
+        // ship a deliberately-invalid certificate.
+        assert!(!d.praos.forge_single_bls_cert);
+        assert!(!d.praos.forge_wrong_len_cert);
+        assert!(!d.praos.forge_wrong_context_cert);
+        assert!(!d.praos.forge_non_member_cert);
         assert_eq!(d.praos.fake_eb, None);
         assert_eq!(d.leios.vote, VotePolicy::Honest);
         assert_eq!(d.leios.offer_eb_size, EbSizePolicy::Honest);
@@ -312,8 +416,6 @@ mod tests {
         assert_eq!(d.mempool.tx_filter, TxFilterPolicy::None);
         // tx-flood must default off, or the honest node would flood.
         assert_eq!(d.mempool.tx_flood_rate, 0);
-        // no coordinated fire-slot gate by default.
-        assert_eq!(d.mempool.fire_at_slot, None);
     }
 
     #[test]

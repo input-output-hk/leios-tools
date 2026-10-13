@@ -103,12 +103,20 @@ pub fn build_action(
         )),
         ActionSpec::EchoToSource => Box::new(catalogue::EchoToSource),
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
+        ActionSpec::SingleBlsCert => Box::new(catalogue::single_bls_cert::SingleBlsCert),
+        ActionSpec::WrongLenCert => Box::new(catalogue::wrong_len_cert::WrongLenCert),
+        ActionSpec::WrongContextCert => Box::new(catalogue::wrong_context_cert::WrongContextCert),
+        ActionSpec::NonMemberCert => Box::new(catalogue::non_member_cert::NonMemberCert),
         ActionSpec::PhantomTxEb { n_txs } => Box::new(catalogue::PhantomTxEb::new(*n_txs)),
         ActionSpec::DummyTxEb { n_txs } => Box::new(catalogue::DummyTxEb::new(*n_txs)),
         ActionSpec::HollowEb { declared_bytes } => {
             Box::new(catalogue::HollowEb::new(*declared_bytes))
         }
         ActionSpec::LoadedTxEb { take } => Box::new(catalogue::LoadedTxEb::new(*take)),
+        ActionSpec::MalformedEb {
+            corruption,
+            hash_matches,
+        } => Box::new(catalogue::MalformedEb::new(*corruption, *hash_matches)),
         ActionSpec::AnnounceSizeLie {
             scale_num,
             scale_den,
@@ -127,10 +135,7 @@ pub fn build_action(
             slot_offset: *slot_offset,
         }),
         ActionSpec::WithholdEbAnnounce => Box::new(catalogue::WithholdEbAnnounce),
-        ActionSpec::TxFlood { rate, fire_at_slot } => Box::new(catalogue::TxFlood {
-            rate: *rate,
-            fire_at_slot: *fire_at_slot,
-        }),
+        ActionSpec::TxFlood { rate } => Box::new(catalogue::TxFlood { rate: *rate }),
         ActionSpec::VoteFlood { count } => Box::new(catalogue::VoteFlood { count: *count }),
         ActionSpec::FetchFlood { rate, window_slots } => Box::new(catalogue::FetchFlood {
             rate: *rate,
