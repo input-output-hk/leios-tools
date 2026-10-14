@@ -200,6 +200,45 @@ pub enum Corruption {
     BadType,
 }
 
+/// Which net-flood engine runs. An enum (not a free string) so an invalid
+/// `attack` is rejected at config load and on live `set_param`, instead of
+/// silently falling back to `eb` and producing a misleading experiment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetFloodKind {
+    /// Re-fetch EB bodies over LeiosFetch.
+    #[default]
+    Eb,
+    /// Re-fetch block-body ranges over BlockFetch.
+    Praos,
+}
+
+impl NetFloodKind {
+    /// Parse the wire/`set_param` spelling; `None` for an unknown value (which
+    /// callers reject rather than coercing).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "eb" => Some(Self::Eb),
+            "praos" => Some(Self::Praos),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name (matches the serde spelling).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eb => "eb",
+            Self::Praos => "praos",
+        }
+    }
+}
+
+impl std::fmt::Display for NetFloodKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Leios-domain actuator inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeiosControl {
@@ -280,11 +319,12 @@ pub struct LeiosControl {
     /// (default) keeps `ControlSignal::default()` honest / stops the engine.
     /// Ignored by normal nodes (only a `run_mode = flood-only` node acts on it).
     pub net_flood_active: bool,
-    /// net-flood: which engine — `"eb"` (LeiosFetch) or `"praos"` (BlockFetch).
+    /// net-flood: which engine — EB fetch (LeiosFetch) or Praos fetch (BlockFetch).
     /// Only meaningful with `net_flood_active`.
-    pub net_flood_attack: String,
-    /// net-flood: target pool names (resolved against the node's registry); empty
-    /// means every pool.
+    pub net_flood_attack: NetFloodKind,
+    /// net-flood: target pool names (resolved against the node's registry).
+    /// Fail-closed: empty means flood nothing (the actuator refuses to default to
+    /// every pool, which would include live relays), not every pool.
     pub net_flood_pools: Vec<String>,
     /// net-flood: downstream connections to open per relay.
     pub net_flood_connections_per_relay: u32,

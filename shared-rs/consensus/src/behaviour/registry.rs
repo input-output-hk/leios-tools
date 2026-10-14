@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::behaviour::tree::control::Corruption;
+use crate::behaviour::tree::control::{Corruption, NetFloodKind};
 use crate::leios::NoVoteReason;
 
 /// Serialisable description of a behaviour-tree **leaf action** — the
@@ -209,10 +209,12 @@ pub enum ActionSpec {
     #[serde(rename = "net-flood")]
     NetFlood {
         /// Which flood engine: `"eb"` (LeiosFetch EB bodies) or `"praos"`
-        /// (BlockFetch block-body ranges).
-        #[serde(default = "default_net_flood_attack")]
-        attack: String,
-        /// Target pool names from the node's registry; empty = every pool.
+        /// (BlockFetch block-body ranges). Invalid values are rejected at load.
+        #[serde(default)]
+        attack: NetFloodKind,
+        /// Target pool names from the node's registry. Fail-closed: empty = flood
+        /// nothing (the actuator refuses to default to every pool, which would
+        /// include live relays).
         #[serde(default)]
         pools: Vec<String>,
         /// Downstream connections to open per relay.
@@ -273,10 +275,6 @@ fn default_fetch_flood_rate() -> u32 {
 
 fn default_fetch_flood_window_slots() -> u64 {
     80
-}
-
-fn default_net_flood_attack() -> String {
-    "eb".to_string()
 }
 
 fn default_net_flood_conns() -> u32 {

@@ -14,16 +14,17 @@
 //! this action carries only pool *names*.
 
 use crate::behaviour::tree::actions::LeafAction;
-use crate::behaviour::tree::control::ControlSignal;
+use crate::behaviour::tree::control::{ControlSignal, NetFloodKind};
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
 use crate::behaviour::tree::Status;
 
 /// Drive an embedded net-flood engine against named target pools.
 #[derive(Debug, Clone)]
 pub struct NetFlood {
-    /// `"eb"` (LeiosFetch EB bodies) or `"praos"` (BlockFetch block ranges).
-    pub attack: String,
-    /// Target pool names (from the node's registry); empty = every pool.
+    /// EB fetch (LeiosFetch) or Praos fetch (BlockFetch block ranges).
+    pub attack: NetFloodKind,
+    /// Target pool names (from the node's registry). Fail-closed: empty floods
+    /// nothing (the actuator refuses to default to every pool).
     pub pools: Vec<String>,
     /// Downstream connections to open per relay.
     pub connections_per_relay: u32,
@@ -36,7 +37,7 @@ pub struct NetFlood {
 impl LeafAction<ConsensusCtx, ControlSignal> for NetFlood {
     fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
         out.leios.net_flood_active = true;
-        out.leios.net_flood_attack = self.attack.clone();
+        out.leios.net_flood_attack = self.attack;
         out.leios.net_flood_pools = self.pools.clone();
         // At least one connection while armed; a zero would install the behaviour
         // but open nothing, which is never the intent.
@@ -50,16 +51,25 @@ impl LeafAction<ConsensusCtx, ControlSignal> for NetFlood {
     fn set_param(&mut self, field: &str, value: &toml::Value) {
         match field {
             "attack" => {
-                if let Some(s) = value.as_str() {
-                    self.attack = s.to_string();
+                // Reject an unknown attack name (keep the previous value) rather
+                // than coercing it — a typo like "praoss" must not silently run
+                // the wrong engine.
+                if let Some(kind) = value.as_str().and_then(NetFloodKind::parse) {
+                    self.attack = kind;
                 }
             }
             "pools" => {
+                // Validate the WHOLE array before replacing: if any element isn't a
+                // string, reject the update and keep the previous targets, so a
+                // malformed override (`[1]`, mixed array) can't silently shrink or
+                // empty the target set.
                 if let Some(arr) = value.as_array() {
-                    self.pools = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect();
+                    if arr.iter().all(toml::Value::is_str) {
+                        self.pools = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect();
+                    }
                 }
             }
             "connections_per_relay" => {
@@ -102,7 +112,7 @@ mod tests {
         let state = NativeChainState::default();
         let mut out = ControlSignal::default();
         let s = NetFlood {
-            attack: "praos".to_string(),
+            attack: NetFloodKind::Praos,
             pools: vec!["IOG1".to_string(), "IOG2".to_string()],
             connections_per_relay: 150,
             range_width: 5,
@@ -111,7 +121,7 @@ mod tests {
         .contribute(&ctx(&env, &state), &mut out);
         assert_eq!(s, Status::Running);
         assert!(out.leios.net_flood_active);
-        assert_eq!(out.leios.net_flood_attack, "praos");
+        assert_eq!(out.leios.net_flood_attack, NetFloodKind::Praos);
         assert_eq!(out.leios.net_flood_pools, vec!["IOG1", "IOG2"]);
         assert_eq!(out.leios.net_flood_connections_per_relay, 150);
         assert_eq!(out.leios.net_flood_range_width, 5);
@@ -120,7 +130,7 @@ mod tests {
         // Zero connections clamp up to one while armed.
         let mut out2 = ControlSignal::default();
         NetFlood {
-            attack: "eb".to_string(),
+            attack: NetFloodKind::Eb,
             pools: vec![],
             connections_per_relay: 0,
             range_width: 0,
@@ -137,7 +147,7 @@ mod tests {
     #[test]
     fn set_param_retunes() {
         let mut a = NetFlood {
-            attack: "eb".to_string(),
+            attack: NetFloodKind::Eb,
             pools: vec![],
             connections_per_relay: 100,
             range_width: 1,
@@ -150,7 +160,7 @@ mod tests {
             "pools",
             &toml::Value::Array(vec![toml::Value::String("PIR0".to_string())]),
         );
-        assert_eq!(a.attack, "praos");
+        assert_eq!(a.attack, NetFloodKind::Praos);
         assert_eq!(a.connections_per_relay, 300);
         assert_eq!(a.range_width, 8);
         assert_eq!(a.pools, vec!["PIR0"]);
@@ -158,5 +168,39 @@ mod tests {
         a.set_param("connections_per_relay", &toml::Value::Integer(-3));
         a.set_param("nonsense", &toml::Value::Integer(9));
         assert_eq!(a.connections_per_relay, 0);
+    }
+
+    #[test]
+    fn set_param_rejects_invalid_attack_and_pools() {
+        let mut a = NetFlood {
+            attack: NetFloodKind::Praos,
+            pools: vec!["PIR0".to_string()],
+            connections_per_relay: 100,
+            range_width: 1,
+            tip_offset: 3,
+        };
+        // Unknown attack name is rejected: previous value is kept, not coerced.
+        a.set_param("attack", &toml::Value::String("praoss".to_string()));
+        assert_eq!(a.attack, NetFloodKind::Praos);
+
+        // A non-string element rejects the WHOLE pools update (keep previous),
+        // so a malformed override can't silently empty/shrink the target set.
+        a.set_param("pools", &toml::Value::Array(vec![toml::Value::Integer(1)]));
+        assert_eq!(a.pools, vec!["PIR0"]);
+        a.set_param(
+            "pools",
+            &toml::Value::Array(vec![
+                toml::Value::String("IOG1".to_string()),
+                toml::Value::Integer(2),
+            ]),
+        );
+        assert_eq!(a.pools, vec!["PIR0"]);
+
+        // A fully-valid array still applies.
+        a.set_param(
+            "pools",
+            &toml::Value::Array(vec![toml::Value::String("IOG2".to_string())]),
+        );
+        assert_eq!(a.pools, vec!["IOG2"]);
     }
 }
