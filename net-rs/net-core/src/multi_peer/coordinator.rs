@@ -924,6 +924,7 @@ impl Coordinator {
                     from,
                     to,
                 });
+                self.remove_peer(peer_id, format!("Block fetch failed")).await;
             }
 
             PeerEvent::TxsRequested { count } => {

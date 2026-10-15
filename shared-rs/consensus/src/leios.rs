@@ -40,7 +40,7 @@ use crate::types::Vote;
 
 /// How long an in-flight fetch entry remains "active" before being
 /// considered stale and eligible for retry.
-pub const IN_FLIGHT_TTL: Duration = Duration::from_secs(1);
+pub const IN_FLIGHT_TTL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Voting configuration
@@ -1046,11 +1046,11 @@ impl LeiosState {
 
     fn do_eb_fetch(&mut self, point: &Point, now: Instant) -> Vec<LeiosEffect> {
         self.evict_stale_in_flight(now);
-        if self.in_flight.contains_key(&point) {
+        if self.in_flight.contains_key(point) {
             return Vec::new();
         }
-        let candidates = self.candidates.available_eb_candidates(&point);
-        let peers = self.eb_policy.pick(&point, &candidates, self.rtt.as_ref());
+        let candidates = self.candidates.available_eb_candidates(point);
+        let peers = self.eb_policy.pick(point, &candidates, self.rtt.as_ref());
         if peers.is_empty() {
             return Vec::new();
         };
@@ -1544,29 +1544,9 @@ impl LeiosState {
     pub fn retry_eb_fetch(
         &mut self,
         eb_point: &Point,
+        now: Instant,
     ) -> Vec<LeiosEffect> {
-        self.do_eb_fetch(eb_point, Instant::now())
-/*
-        if self.in_flight.contains_key(&point) {
-            return Vec::new();
-        }
-        let candidates = self.candidates.available_eb_candidates(eb_point);
-        let peers = self
-            .eb_policy
-            .pick(&eb_point, &candidates, self.rtt.as_ref());
-        if peers.is_empty() {
-            tracing::warn!("leios_store: no peers for EB {eb_point}");
-            return Vec::new();
-        }
-        if !self.candidates.start_eb_fetch(eb_point.clone()) {
-            // Already in flight
-            return Vec::new();
-        }
-        vec![LeiosEffect::FetchLeiosBlock {
-            point: eb_point.clone(),
-            peers,
-        }]
- */
+        self.do_eb_fetch(eb_point, now)
     }
 
     // -- Queries ------------------------------------------------------------

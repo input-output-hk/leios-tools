@@ -1236,6 +1236,9 @@ mod tests {
                     PeerEvent::Failed { reason } => {
                         panic!("unexpected failure: {reason}");
                     }
+                    PeerEvent::LeiosBlockFetchFailed { point } => {
+                        panic!("unexpected leios block fetch failure for {point}");
+                    }
                     _ => {}
                 }
             }

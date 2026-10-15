@@ -439,6 +439,9 @@ impl CandidateTracker {
         for attempts in self.eb_txs_attempts.values_mut() {
             attempts.remove(&peer);
         }
+        for attempts in self.eb_attempts.values_mut() {
+            attempts.remove(&peer);
+        }
     }
 
     /// Drop offer / pending / attempt entries for slots strictly older
@@ -456,6 +459,7 @@ impl CandidateTracker {
             .retain(|p| point_slot(p) >= min_slot);
         self.eb_txs_attempts
             .retain(|p, _| point_slot(p) >= min_slot);
+        self.eb_attempts.retain(|p, _| point_slot(p) >= min_slot);
     }
 }
 
