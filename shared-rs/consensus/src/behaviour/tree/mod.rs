@@ -27,8 +27,8 @@ pub use behaviour::{Behaviour, BehaviourId, BehaviourKind, BehaviourTree};
 pub use condition::{CompareOp, Condition, ConditionExpr, ValueRef, ValueResolver};
 pub use config::{BtConfig, ConfigError, ModuleMeta, Run};
 pub use control::{
-    ControlSignal, EbSizePolicy, LeiosControl, MempoolControl, OutboundControl, PraosControl,
-    TxFilterPolicy, VotePolicy,
+    ControlSignal, EbSizePolicy, LeiosControl, MempoolControl, NetFloodKind, OutboundControl,
+    PraosControl, TxFilterPolicy, VotePolicy,
 };
 pub use env::{
     ActionParamStore, ConsensusCtx, DynamicEnv, EnvHandle, EnvValue, NativeChainState,
