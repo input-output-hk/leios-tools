@@ -867,6 +867,10 @@ impl Coordinator {
                 });
             }
 
+            PeerEvent::LeiosBlockFetchFailed { point } => {
+                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { point })
+            }
+
             PeerEvent::LeiosBlockTxsFetched {
                 point,
                 transactions,
@@ -920,6 +924,7 @@ impl Coordinator {
                     from,
                     to,
                 });
+                self.remove_peer(peer_id, format!("Block fetch failed")).await;
             }
 
             PeerEvent::TxsRequested { count } => {

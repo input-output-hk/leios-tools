@@ -54,18 +54,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceFlood {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn sets_flood_count() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = AnnounceFlood {
             count: 500,

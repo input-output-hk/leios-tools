@@ -137,8 +137,7 @@ mod tests {
         TickCtx {
             env,
             state,
-            seed: 0,
-            action_params: None,
+            ..Default::default()
         }
     }
 

@@ -24,18 +24,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for EchoToSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn opens_the_echo_gate() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = EchoToSource.contribute(&ctx, &mut out);
         assert_eq!(s, Status::Running);

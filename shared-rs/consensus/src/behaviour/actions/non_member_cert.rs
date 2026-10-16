@@ -46,18 +46,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for NonMemberCert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn sets_forge_non_member_cert() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = NonMemberCert.contribute(&ctx, &mut out);
         assert_eq!(s, Status::Running);

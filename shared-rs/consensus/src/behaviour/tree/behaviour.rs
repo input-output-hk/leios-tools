@@ -12,6 +12,7 @@
 //! Full operational semantics:
 //! `specs/001-behavior-tree-engine/design/bt-grammar-and-semantics.md` §5.
 
+use std::fmt::Debug;
 use super::actions::LeafAction;
 use super::condition::Condition;
 use super::control::ControlSignal;
@@ -430,8 +431,7 @@ mod tests {
         let ctx = TickCtx {
             env: &env,
             state,
-            seed: 0,
-            action_params: None,
+            ..TickCtx::default()
         };
         let mut out = ControlSignal::default();
         let s = node.tick(&ctx, &mut out);
@@ -446,8 +446,7 @@ mod tests {
         let ctx = TickCtx {
             env,
             state,
-            seed: 0,
-            action_params: None,
+            ..TickCtx::default()
         };
         let mut out = ControlSignal::default();
         let s = node.tick(&ctx, &mut out);
@@ -840,7 +839,7 @@ mod tests {
             env: &env,
             state: &state,
             seed: 42,
-            action_params: None,
+            ..TickCtx::default()
         });
         assert_eq!(s, Status::Success);
         assert_eq!(out, ControlSignal::default());
@@ -872,10 +871,11 @@ mod tests {
         let mut node = Behaviour::new("p", BehaviourKind::Action(Box::new(Tunable(1))));
         let env = DynamicEnv::new();
         let state = NativeChainState::default();
+        let sensors = DynamicEnv::new();
 
         // No store → the leaf's compiled default.
         let mut out = ControlSignal::default();
-        node.tick(&TickCtx::new(&env, &state, 0), &mut out);
+        node.tick(&TickCtx::new(&env, &sensors, &state, 0), &mut out);
         assert_eq!(out.praos.reorg_depth, Some(1));
 
         // An override addressed to this node's id is applied before contribute;
@@ -887,8 +887,8 @@ mod tests {
         let ctx = TickCtx {
             env: &env,
             state: &state,
-            seed: 0,
             action_params: Some(&store),
+            ..Default::default()
         };
         let mut out = ControlSignal::default();
         node.tick(&ctx, &mut out);
