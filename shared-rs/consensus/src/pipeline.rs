@@ -32,6 +32,7 @@ pub enum PipelinePhase {
 /// Election-side aggregations (`Σ weight`, `len()`) are commutative, so
 /// determinism isn't strictly needed here, but the simulator's contract
 /// is uniform: no `HashMap` traversal anywhere in shared-consensus.
+#[derive(Debug)]
 pub struct EbElection {
     /// Hash of the endorser block this election is about (the EB the
     /// announcing RB committed to). Attribute, not the map key.

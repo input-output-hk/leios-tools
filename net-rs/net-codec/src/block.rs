@@ -68,6 +68,7 @@ fn count_and_skip_array(d: &mut Decoder) -> Result<u32, DecodeError> {
 /// `tx_list` is the array of `[tx_body, witness_set, aux]` triples. Return the
 /// length of that inner tx list — the real transaction count — by descending
 /// into the first array-typed element of the wrapper.
+#[allow(dead_code)]
 fn count_leios_tx_list(d: &mut Decoder) -> Result<u32, DecodeError> {
     use minicbor::data::Type;
     fn is_array(t: Type) -> bool {

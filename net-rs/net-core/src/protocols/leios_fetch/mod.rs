@@ -150,7 +150,7 @@ pub async fn fetch_block(
     point: Point,
 ) -> Result<Vec<u8>, ProtocolError> {
     runner
-        .send(&Message::MsgLeiosBlockRequest { point })
+        .send(&Message::MsgLeiosBlockRequest { point: point.clone() })
         .await?;
     let msg = runner.recv().await?;
     match msg {

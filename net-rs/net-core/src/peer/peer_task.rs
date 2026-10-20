@@ -581,7 +581,7 @@ pub(crate) fn spawn_leios_notify(
                         slot,
                         eb_hash,
                         eb_bytes = eb_size,
-                        "leios_notify: EB offered"
+                        "leios_notify: EB offered to us"
                     );
                     let _ = event_sender
                         .send((peer_id, PeerEvent::LeiosBlockOffered { point }))
@@ -687,8 +687,8 @@ pub(crate) fn spawn_leios_fetch(
                             let _ = event_sender
                                 .send((
                                     peer_id,
-                                    PeerEvent::Failed {
-                                        reason: format!("leios_fetch block: {e}"),
+                                    PeerEvent::LeiosBlockFetchFailed {
+                                        point,
                                     },
                                 ))
                                 .await;
@@ -1235,6 +1235,9 @@ mod tests {
                     }
                     PeerEvent::Failed { reason } => {
                         panic!("unexpected failure: {reason}");
+                    }
+                    PeerEvent::LeiosBlockFetchFailed { point } => {
+                        panic!("unexpected leios block fetch failure for {point}");
                     }
                     _ => {}
                 }

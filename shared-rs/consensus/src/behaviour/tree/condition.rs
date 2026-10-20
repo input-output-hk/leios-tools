@@ -128,6 +128,7 @@ impl ValueResolver for TickCtx<'_> {
         match r {
             ValueRef::Chain(name) => self.state.numeric_field(name).map(|n| n as f64),
             ValueRef::Env(name) => self.env.get(name).and_then(EnvValue::as_number),
+            ValueRef::Sensor(name) => self.sensors.get(name).and_then(EnvValue::as_number),
             _ => None,
         }
     }
@@ -275,12 +276,11 @@ fn type_class(v: &ValueRef, env: &BTreeMap<String, EnvValue>) -> Result<TypeClas
                 ev.type_name()
             )),
         },
-        // `sensor.*` and bare idents are meaningless in the consensus grammar,
-        // so consensus validation rejects them; a second instantiation runs its
+        // `sensor.*` and bare idents in consensus mode can be retrieved from
+        // net-cluster; current implementation has them as numeric -- maybe later
+        // we'll change it. A second instantiation runs its
         // own load-time reference check over these variants.
-        ValueRef::Sensor(name) => Err(format!(
-            "sensor reference sensor.{name} is not valid in this condition context"
-        )),
+        ValueRef::Sensor(_name) => Ok(TypeClass::Numeric),
         ValueRef::Ident(name) => Err(format!(
             "reference {name} is not valid in this condition context"
         )),
@@ -658,8 +658,7 @@ mod tests {
         TickCtx {
             env,
             state,
-            seed: 0,
-            action_params: None,
+            ..Default::default()
         }
     }
 

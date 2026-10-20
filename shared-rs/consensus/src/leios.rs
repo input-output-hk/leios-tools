@@ -21,7 +21,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Not;
 use std::time::{Duration, Instant};
-
 use serde::Serialize;
 use tracing::info;
 
@@ -33,7 +32,7 @@ use crate::elections::{Elections, SlotEffect};
 use crate::fetch::{
     CandidateTracker, EbFetchPolicy, EbTxsFetchPolicy, LowestRttFirst, PeerRtt, UniformRtt,
 };
-use crate::mempool::{EbKey, TxBody, TxId};
+use crate::mempool::{EbKey, TxBody, TxId, DEFAULT_EB_RETENTION_SLOTS};
 use crate::peer::PeerId;
 use crate::pipeline::PipelineConfig;
 use crate::types::{hex_prefix, Point};
@@ -41,7 +40,7 @@ use crate::types::Vote;
 
 /// How long an in-flight fetch entry remains "active" before being
 /// considered stale and eligible for retry.
-pub const IN_FLIGHT_TTL: Duration = Duration::from_secs(15);
+pub const IN_FLIGHT_TTL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Voting configuration
@@ -686,7 +685,7 @@ impl LeiosState {
                 ));
             }
         }
-        self.candidates.prune_below_slot(min_keep);
+        self.candidates.prune_below_slot(min_keep.saturating_sub(DEFAULT_EB_RETENTION_SLOTS));
     }
 
     /// Drive the election state machine forward, decide voting for any
@@ -1041,24 +1040,31 @@ impl LeiosState {
             tracing::debug!(node_id = %self.node_id, %point, peer = peer.0, "t22: filtered EB offer (checksum-threshold)");
             return Vec::new();
         }
-        self.evict_stale_in_flight(now);
         self.candidates.note_eb_offered(point.clone(), peer);
-        if self.in_flight.contains_key(&point) {
+        self.do_eb_fetch(&point, now)
+    }
+
+    fn do_eb_fetch(&mut self, point: &Point, now: Instant) -> Vec<LeiosEffect> {
+        self.evict_stale_in_flight(now);
+        if self.in_flight.contains_key(point) {
             return Vec::new();
         }
-        let candidates = self.candidates.eb_candidates(&point);
-        let peers = self.eb_policy.pick(&point, &candidates, self.rtt.as_ref());
+        let candidates = self.candidates.available_eb_candidates(point);
+        let peers = self.eb_policy.pick(point, &candidates, self.rtt.as_ref());
         if peers.is_empty() {
+            return Vec::new();
+        };
+        if !self.candidates.start_eb_fetch(point.clone(), &peers) {
             return Vec::new();
         }
         self.in_flight.insert(point.clone(), now);
         info!(
             node_id = %self.node_id,
             %point,
-            peer_count = peers.len(),
+            ?peers,
             "fetching leios block"
         );
-        vec![LeiosEffect::FetchLeiosBlock { point, peers }]
+        vec![LeiosEffect::FetchLeiosBlock { point: point.clone(), peers }]
     }
 
     /// A peer offered EB transactions.  Caller has already computed the
@@ -1235,6 +1241,7 @@ impl LeiosState {
             return Vec::new();
         }
         self.in_flight.remove(&point);
+        self.candidates.finish_eb_fetch(&point);
         let mut fx = Vec::new();
         if let (Some((eb_key, tx_hashes)), Point::Specific { slot, hash }) = (manifest_hashes, &point) {
             self.eb_tx_hashes.insert(*hash, (*slot, tx_hashes.clone()));
@@ -1251,6 +1258,12 @@ impl LeiosState {
         }
         fx.push(LeiosEffect::ValidateEb { point });
         fx
+    }
+
+    pub fn on_eb_fetch_failed(&mut self, point: &Point) -> Vec<LeiosEffect> {
+        self.in_flight.remove(&point);
+        self.candidates.finish_eb_fetch(&point);
+        vec![]
     }
 
     /// Votes arrived inline (CIP-0164 prototype: full vote bodies are
@@ -1512,7 +1525,7 @@ impl LeiosState {
             // requests for the points again.
             // This repeated processing may happen only for L_hdr*3 + L_vote slots, since
             // after this number of slots the election (voting) process will have no sense.
-            info!("leios_store: all Peers for {point} processed; postponing next wave");
+            info!("leios_store: all Peers for EB Txs {point} processed; postponing next wave");
             self.next_fetch_txs_wave.insert(point);
             return Vec::new();
         }
@@ -1526,6 +1539,14 @@ impl LeiosState {
             bitmap,
             peers,
         }]
+    }
+
+    pub fn retry_eb_fetch(
+        &mut self,
+        eb_point: &Point,
+        now: Instant,
+    ) -> Vec<LeiosEffect> {
+        self.do_eb_fetch(eb_point, now)
     }
 
     // -- Queries ------------------------------------------------------------
@@ -2498,30 +2519,58 @@ mod tests {
 
     #[test]
     fn on_slot_prunes_candidate_tracker_below_chain_tip() {
-        // Chain-progress prune: anything at slot < tip_rb_slot is dead
-        // under the strict parent-only cert rule.  With tip_rb_slot=8,
-        // slot-5 entries drop and slot-8 entries stay.
+        // Chain-progress prune *with retention*: even though a strict
+        // parent-only cert rule makes an EB below the adopted tip dead for
+        // voting, the candidate tracker keeps per-EB offer info for
+        // DEFAULT_EB_RETENTION_SLOTS slots *below* `tip_rb_slot`.  That
+        // window is what lets us re-fetch an EB (or its TXs) from the peers
+        // that offered it on a block/tx retry.  Only entries strictly older
+        // than `tip_rb_slot - DEFAULT_EB_RETENTION_SLOTS` are dropped.
         let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(1), pipeline(), TEST_MAX_FETCH_WAVES);
         let peer = crate::peer::PeerId(1);
-        state.candidates.note_eb_offered(point(5, 0xAA), peer);
-        state.candidates.note_eb_offered(point(8, 0xBB), peer);
-        state.candidates.note_eb_txs_offered(point(5, 0xCC), peer);
-        state.candidates.note_eb_txs_offered(point(8, 0xDD), peer);
+
+        let tip = 8 + DEFAULT_EB_RETENTION_SLOTS;
+        // Retention cutoff: slot < `cutoff` is pruned, slot >= `cutoff` kept.
+        let cutoff = tip - DEFAULT_EB_RETENTION_SLOTS; // == 8
+
+        // Just below the retention window → dropped.
+        state.candidates.note_eb_offered(point(cutoff - 1, 0xAA), peer);
+        state.candidates.note_eb_txs_offered(point(cutoff - 1, 0xCC), peer);
+        // Exactly at the retention boundary (DEFAULT_EB_RETENTION_SLOTS slots
+        // below the tip) → retained for retries.
+        state.candidates.note_eb_offered(point(cutoff, 0xBB), peer);
+        state.candidates.note_eb_txs_offered(point(cutoff, 0xDD), peer);
+        // Well inside the retention window, just below the tip → retained.
+        state.candidates.note_eb_offered(point(tip - 1, 0xEE), peer);
+        state.candidates.note_eb_txs_offered(point(tip - 1, 0xFF), peer);
 
         state.set_chain_tip_context(ChainTipContext {
-            tip_rb_slot: Some(8),
+            tip_rb_slot: Some(tip),
             ..Default::default()
         });
-        let _ = state.on_slot(30, &tx_all);
+        let _ = state.on_slot(30 + DEFAULT_EB_RETENTION_SLOTS, &tx_all);
 
-        assert!(state.candidates.eb_candidates(&point(5, 0xAA)).is_empty());
+        // Older than the retention window: gone.
+        assert!(state.candidates.eb_candidates(&point(cutoff - 1, 0xAA)).is_empty());
         assert!(state
             .candidates
-            .eb_txs_candidates(&point(5, 0xCC))
+            .eb_txs_candidates(&point(cutoff - 1, 0xCC))
             .is_empty());
-        assert_eq!(state.candidates.eb_candidates(&point(8, 0xBB)), vec![peer]);
+        // Within the retention window: the offer info is kept for the whole
+        // DEFAULT_EB_RETENTION_SLOTS span below the tip, so block/tx retries
+        // can still reach `peer` — both at the boundary slot…
+        assert_eq!(state.candidates.eb_candidates(&point(cutoff, 0xBB)), vec![peer]);
         assert_eq!(
-            state.candidates.eb_txs_candidates(&point(8, 0xDD)),
+            state.candidates.eb_txs_candidates(&point(cutoff, 0xDD)),
+            vec![peer]
+        );
+        // …and just below the current tip.
+        assert_eq!(
+            state.candidates.eb_candidates(&point(tip - 1, 0xEE)),
+            vec![peer]
+        );
+        assert_eq!(
+            state.candidates.eb_txs_candidates(&point(tip - 1, 0xFF)),
             vec![peer]
         );
     }

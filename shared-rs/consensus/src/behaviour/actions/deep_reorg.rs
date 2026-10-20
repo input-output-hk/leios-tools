@@ -74,19 +74,16 @@ impl LeafAction<ConsensusCtx, ControlSignal> for DeepReorg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
+    use crate::behaviour::tree::env::NativeChainState;
 
     fn reorg_at(action: &mut DeepReorg, slot: u64) -> Option<u64> {
-        let env = DynamicEnv::new();
         let state = NativeChainState {
             current_slot: slot,
             ..Default::default()
         };
         let ctx = TickCtx {
-            env: &env,
             state: &state,
-            seed: 0,
-            action_params: None,
+            ..Default::default()
         };
         let mut out = ControlSignal::default();
         let s = action.contribute(&ctx, &mut out);

@@ -112,6 +112,10 @@ pub enum NetworkEvent {
         block: Vec<u8>,
     },
 
+    LeiosBlockFetchFailed {
+        point: Point,
+    },
+
     /// Leios: votes delivered inline by a peer (no fetch round-trip).
     LeiosVotesReceived { peer_id: PeerId, votes: Vec<Vote> },
 

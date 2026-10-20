@@ -44,18 +44,10 @@ impl LeafAction<ConsensusCtx, ControlSignal> for AnnounceSlotSkew {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
     #[test]
     fn sets_fake_announce_and_offset() {
-        let env = DynamicEnv::new();
-        let state = NativeChainState::default();
-        let ctx = TickCtx {
-            env: &env,
-            state: &state,
-            seed: 0,
-            action_params: None,
-        };
+        let ctx = TickCtx::default();
         let mut out = ControlSignal::default();
         let s = AnnounceSlotSkew { slot_offset: 40 }.contribute(&ctx, &mut out);
         assert_eq!(s, Status::Running);

@@ -867,6 +867,11 @@ impl Coordinator {
                 });
             }
 
+            PeerEvent::LeiosBlockFetchFailed { point } => {
+                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { point: point.clone() });
+                self.remove_peer(peer_id, format!("Leios block {point} fetch failed")).await;
+            }
+
             PeerEvent::LeiosBlockTxsFetched {
                 point,
                 transactions,
@@ -917,9 +922,10 @@ impl Coordinator {
                 // Notify application with the full range so it can retry.
                 self.emit_event(NetworkEvent::BlockFetchFailed {
                     peer_id: Some(peer_id),
-                    from,
-                    to,
+                    from: from.clone(),
+                    to: to.clone(),
                 });
+                self.remove_peer(peer_id, format!("Block fetch {from}..{to} failed")).await;
             }
 
             PeerEvent::TxsRequested { count } => {
