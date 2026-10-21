@@ -1240,8 +1240,11 @@ impl LeiosState {
             tracing::debug!(node_id = %self.node_id, %point, "t22: filtered EB-received processing (hide_eb_tx)");
             return Vec::new();
         }
-        self.in_flight.remove(&point);
-        self.candidates.finish_eb_fetch(&point);
+        if let Some(peer) = source {
+            if self.candidates.finish_eb_fetch(peer, &point) {
+                self.in_flight.remove(&point);
+            }
+        }
         let mut fx = Vec::new();
         if let (Some((eb_key, tx_hashes)), Point::Specific { slot, hash }) = (manifest_hashes, &point) {
             self.eb_tx_hashes.insert(*hash, (*slot, tx_hashes.clone()));
@@ -1260,11 +1263,11 @@ impl LeiosState {
         fx
     }
 
-    // Finish EB fetch. In particular, it cleans all attempts info, so failed peers can be
-    // requested again.
-    pub fn on_eb_fetch_failed(&mut self, point: &Point) -> Vec<LeiosEffect> {
-        self.in_flight.remove(&point);
-        self.candidates.finish_eb_fetch(&point);
+    /// Finish EB fetch from the given peer. If no peers remained pending, finishes action.
+    pub fn on_eb_fetch_failed(&mut self, source: PeerId, point: &Point) -> Vec<LeiosEffect> {
+        if self.candidates.finish_eb_fetch(source, &point) {
+            self.in_flight.remove(&point);
+        }
         vec![]
     }
 
@@ -2034,7 +2037,7 @@ mod tests {
     }
 
     #[test]
-    fn eb_fetch_timeout_retries_an_unattempted_peer() {
+    fn eb_fetch_ttl_expiry_retries_only_non_pending_peers() {
         let mut state = LeiosState::new(
             "n0".into(),
             elections_for("n0"),
@@ -2047,21 +2050,32 @@ mod tests {
         assert_eq!(state.on_eb_offered(p.clone(), PeerId(1), now).len(), 1);
         assert!(state.on_eb_offered(p.clone(), PeerId(2), now).is_empty());
         assert!(state
-            .do_eb_fetch(&p, now + IN_FLIGHT_TTL - Duration::from_millis(1))
+            .retry_eb_fetch(&p, now + IN_FLIGHT_TTL - Duration::from_millis(1))
             .is_empty());
 
         let retry_at = now + IN_FLIGHT_TTL;
-        let fx = state.do_eb_fetch(&p, retry_at);
+        let fx = state.retry_eb_fetch(&p, retry_at);
         assert!(matches!(fx.as_slice(),
             [LeiosEffect::FetchLeiosBlock { point, peers }]
                 if point == &p && peers == &[PeerId(2)]
         ));
         assert_eq!(state.in_flight.get(&p), Some(&retry_at));
         assert_eq!(state.candidates.state_sizes().4, 1);
+        // TTL expiry permits another fetch, but does not resolve stale requests.
+        assert!(state.candidates.available_eb_candidates(&p).is_empty());
+        let next_retry_at = retry_at + IN_FLIGHT_TTL;
+        assert!(state.retry_eb_fetch(&p, next_retry_at).is_empty());
+        assert!(state.candidates.available_eb_candidates(&p).is_empty());
+        assert!(state.on_eb_fetch_failed(PeerId(1), &p).is_empty());
+        let fx = state.retry_eb_fetch(&p, next_retry_at);
+        assert!(matches!(fx.as_slice(),
+            [LeiosEffect::FetchLeiosBlock { point, peers }]
+                if point == &p && peers == &[PeerId(1)]
+        ));
     }
 
     #[test]
-    fn eb_fetch_finalization_clears_in_flight_and_pending() {
+    fn eb_fetch_last_peer_finalization_clears_in_flight() {
         // Both successful receipt and failure finalize only the matching fetch.
         for received in [true, false] {
             let mut state = LeiosState::new(
@@ -2087,15 +2101,76 @@ mod tests {
                         [LeiosEffect::ValidateEb { point }] if point == &p
                     ));
                 } else {
-                    assert!(state.on_eb_fetch_failed(&p).is_empty());
+                    assert!(state.on_eb_fetch_failed(PeerId(1), &p).is_empty());
                 }
                 assert!(!state.in_flight.contains_key(&p));
                 assert_eq!(state.in_flight.get(&other), Some(&now));
-                assert_eq!(state.candidates.state_sizes().4, 1);
+                assert_eq!(
+                    state.candidates.available_eb_candidates(&p),
+                    vec![PeerId(1)]
+                );
+                assert!(state.candidates.available_eb_candidates(&other).is_empty());
             }
-            state.on_eb_received(Some(PeerId(1)), other, None);
+            state.on_eb_received(Some(PeerId(1)), other.clone(), None);
             assert!(state.in_flight.is_empty());
-            assert_eq!(state.candidates.state_sizes().4, 0);
+            assert_eq!(
+                state.candidates.available_eb_candidates(&other),
+                vec![PeerId(1)]
+            );
+            // The diagnostic counts per-point entries, including empty peer sets.
+            assert_eq!(state.candidates.state_sizes().4, 2);
+        }
+    }
+
+    #[test]
+    fn eb_fetch_finalization_preserves_other_pending_peers() {
+        for received in [[true, true], [true, false], [false, true], [false, false]] {
+            let mut state = LeiosState::new(
+                "n0".into(),
+                elections_for("n0"),
+                cfg(0),
+                pipeline(),
+                TEST_MAX_FETCH_WAVES,
+            );
+            let now = Instant::now();
+            let p = point(10, 1);
+            assert_eq!(state.on_eb_offered(p.clone(), PeerId(1), now).len(), 1);
+            assert!(state.on_eb_offered(p.clone(), PeerId(2), now).is_empty());
+            let retry_at = now + IN_FLIGHT_TTL;
+            assert_eq!(state.retry_eb_fetch(&p, retry_at).len(), 1);
+
+            // An unrelated failure cannot release the in-flight gate.
+            assert!(state.on_eb_fetch_failed(PeerId(3), &p).is_empty());
+            assert_eq!(state.in_flight.get(&p), Some(&retry_at));
+            assert!(state.candidates.available_eb_candidates(&p).is_empty());
+
+            for (peer, received) in [PeerId(1), PeerId(2)].into_iter().zip(received) {
+                // Repeated completion must leave other pending requests intact.
+                for _ in 0..2 {
+                    if received {
+                        let fx = state.on_eb_received(Some(peer), p.clone(), None);
+                        assert!(matches!(fx.as_slice(),
+                            [LeiosEffect::ValidateEb { point }] if point == &p
+                        ));
+                    } else {
+                        assert!(state.on_eb_fetch_failed(peer, &p).is_empty());
+                    }
+                    if peer == PeerId(1) {
+                        assert_eq!(state.in_flight.get(&p), Some(&retry_at));
+                        assert_eq!(
+                            state.candidates.available_eb_candidates(&p),
+                            vec![PeerId(1)]
+                        );
+                        assert!(state.retry_eb_fetch(&p, retry_at).is_empty());
+                    } else {
+                        assert!(!state.in_flight.contains_key(&p));
+                        assert_eq!(
+                            state.candidates.available_eb_candidates(&p),
+                            vec![PeerId(1), PeerId(2)]
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2119,10 +2194,24 @@ mod tests {
 
     #[test]
     fn on_eb_received_validate_only_when_no_manifest() {
-        let mut state = LeiosState::new("n0".into(), elections_for("n0"), cfg(0), pipeline(), TEST_MAX_FETCH_WAVES);
+        let mut state = LeiosState::new(
+            "n0".into(),
+            elections_for("n0"),
+            cfg(0),
+            pipeline(),
+            TEST_MAX_FETCH_WAVES,
+        );
+        let now = Instant::now();
+        assert_eq!(state.on_eb_offered(point(10, 1), PeerId(1), now).len(), 1);
         let fx = state.on_eb_received(None, point(10, 1), None);
         assert_eq!(fx.len(), 1);
         assert!(matches!(fx[0], LeiosEffect::ValidateEb { .. }));
+        // A receipt without a source does not resolve any peer's pending fetch.
+        assert_eq!(state.in_flight.get(&point(10, 1)), Some(&now));
+        assert!(state
+            .candidates
+            .available_eb_candidates(&point(10, 1))
+            .is_empty());
     }
 
     // -- t22 EB-processing filter actuator (control.mempool.tx_filter) --------

@@ -113,6 +113,7 @@ pub enum NetworkEvent {
     },
 
     LeiosBlockFetchFailed {
+        source: PeerId,
         point: Point,
     },
 

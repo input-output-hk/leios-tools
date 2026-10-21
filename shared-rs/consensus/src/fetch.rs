@@ -277,6 +277,16 @@ pub struct CandidateTracker {
     eb_txs_offers: BTreeMap<Point, BTreeSet<PeerId>>,
 
     pending_block_fetches: BTreeSet<Point>,
+
+    /// Dedup and retry mechanics for EB-fetch:
+    /// 1. `pending_eb_fetches` keeps track for all pending fetches for a Point. Invariant:
+    /// one active fetch per EB per Peer.
+    /// 2. If another parallel fetch is started (this happens after current fetches are stalled,
+    /// checked when in-flight TTL expires), it's added to BTreeSet in parallel to pending fetch.
+    /// 3. The currently pending (but stale) Peers are not proposed for the EB for next start
+    /// attempt (despite they're present in eb_offers).
+    /// 4. When peer action is resolved (either EB received or EB timed out), the record is
+    /// removed from `pending_eb_fetches`.
     pending_eb_fetches: BTreeMap<Point, BTreeSet<PeerId>>,
     pending_eb_txs_fetches: BTreeSet<Point>,
 
@@ -380,6 +390,10 @@ impl CandidateTracker {
         self.pending_block_fetches.remove(point);
     }
 
+    /// Starts EB fetch, based on the list of available `peers` for the EB (`point`).
+    /// 1. Checks whether any of the peers is already pending. If yes -- we cannot continue.
+    /// 2. If all peers have no pending requests for the EB, inserts new peers to the
+    /// pending set for the EB.
     pub fn start_eb_fetch(&mut self, point: Point, peers: &[PeerId]) -> bool {
         if self.pending_eb_fetches.get(&point).is_some_and(|x| peers.iter().any(|p| x.contains(p))) {
             // already started
@@ -391,6 +405,8 @@ impl CandidateTracker {
 
         true
     }
+    /// Finds all peers, which: (a) have offered the EB (`point`); (b) do not already have this
+    /// EB request pending.
     pub fn available_eb_candidates(&self, point: &Point) -> Vec<PeerId> {
         let eb_offers = self.eb_candidates(point);
         let Some(peers) = self.pending_eb_fetches.get(point) else {
@@ -401,8 +417,13 @@ impl CandidateTracker {
         tracing::info!("EB fetch: {point}; peers attempted: {peers:?}, offers: {eb_offers:?}, available: {:?}", available);
         available
     }
-    pub fn finish_eb_fetch(&mut self, point: &Point) {
-        self.pending_eb_fetches.remove(point);
+    /// Returns true when no pending fetches remained.
+    pub fn finish_eb_fetch(&mut self, source: PeerId, point: &Point) -> bool {
+        if let Some(peers) = self.pending_eb_fetches.get_mut(point) {
+            peers.remove(&source);
+            return peers.is_empty();
+        }
+        true
     }
 
     /// Start an EB-txs fetch and record which peers were attempted.
@@ -618,17 +639,21 @@ mod tests {
     }
 
     #[test]
-    fn tracker_eb_fetch_dedups_attempted_peers() {
+    fn tracker_eb_fetch_dedups_pending_peers() {
         let mut t = CandidateTracker::new();
         let point = pt(10, 1);
         for peer in [pid(1), pid(2), pid(3)] {
             t.note_eb_offered(point.clone(), peer);
         }
 
+        assert_eq!(
+            t.available_eb_candidates(&point),
+            vec![pid(1), pid(2), pid(3)]
+        );
         assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
         assert!(t.pending_eb_fetches.contains_key(&point));
         assert!(!t.start_eb_fetch(point.clone(), &[pid(1)]));
-        // Reject the whole duplicate batch without marking its new peer attempted.
+        // Reject the whole overlapping batch without marking its new peer pending.
         assert!(!t.start_eb_fetch(point.clone(), &[pid(1), pid(2)]));
         assert_eq!(t.available_eb_candidates(&point), vec![pid(2), pid(3)]);
 
@@ -639,29 +664,51 @@ mod tests {
     }
 
     #[test]
-    fn tracker_eb_fetch_finish_clears_pending_and_preserves_attempts() {
+    fn tracker_eb_fetch_finish_removes_only_the_source_peer() {
         let mut t = CandidateTracker::new();
         let point = pt(10, 1);
         let other = pt(10, 2);
         for p in [&point, &other] {
             t.note_eb_offered(p.clone(), pid(1));
             t.note_eb_offered(p.clone(), pid(2));
-            assert!(t.start_eb_fetch(p.clone(), &[pid(1)]));
+            assert!(t.start_eb_fetch(p.clone(), &[pid(1), pid(2)]));
         }
         assert_eq!(t.pending_eb_fetches.len(), 2);
 
-        t.finish_eb_fetch(&point);
-        t.finish_eb_fetch(&point); // Finalization is idempotent.
-        assert!(!t.pending_eb_fetches.contains_key(&point));
-        assert!(t.pending_eb_fetches.contains_key(&other));
-        // Finishing drops the attempt history, so a previously tried peer
-        // becomes eligible again (see `LeiosState::on_eb_fetch_failed`).
-        assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
+        // Unknown or already-finished peers must not finish another peer's request.
+        assert!(!t.finish_eb_fetch(pid(3), &point));
+        assert!(t.available_eb_candidates(&point).is_empty());
+        assert!(!t.finish_eb_fetch(pid(1), &point));
+        assert!(!t.finish_eb_fetch(pid(1), &point));
+        assert_eq!(t.pending_eb_fetches[&point], BTreeSet::from([pid(2)]));
+        assert_eq!(t.available_eb_candidates(&point), vec![pid(1)]);
+        assert!(t.available_eb_candidates(&other).is_empty());
+
+        // A resolved peer can be requested again while another remains pending.
         assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
-        t.finish_eb_fetch(&point);
-        t.finish_eb_fetch(&other);
-        assert!(t.pending_eb_fetches.is_empty());
+        assert!(!t.start_eb_fetch(point.clone(), &[pid(2)]));
+        assert!(!t.finish_eb_fetch(pid(2), &point));
+        assert_eq!(t.available_eb_candidates(&point), vec![pid(2)]);
+        assert!(t.finish_eb_fetch(pid(1), &point));
+        assert!(t.finish_eb_fetch(pid(1), &point));
+        // Empty per-point sets may remain; only pending peers block candidates.
+        assert!(t.pending_eb_fetches[&point].is_empty());
         assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
+        assert_eq!(t.eb_candidates(&point), vec![pid(1), pid(2)]);
+        assert_eq!(
+            t.pending_eb_fetches[&other],
+            BTreeSet::from([pid(1), pid(2)])
+        );
+        assert!(!t.finish_eb_fetch(pid(1), &other));
+        assert!(t.finish_eb_fetch(pid(2), &other));
+    }
+
+    #[test]
+    fn tracker_eb_fetch_finish_without_pending_requests_is_complete() {
+        let mut t = CandidateTracker::new();
+        let point = pt(10, 1);
+        assert!(t.finish_eb_fetch(pid(1), &point));
+        assert!(t.pending_eb_fetches.is_empty());
     }
 
     // -- PeerRttCache -------------------------------------------------------

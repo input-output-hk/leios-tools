@@ -872,7 +872,7 @@ impl Coordinator {
                 // the offered leios block, then something is wrong.
                 // TODO: maybe make this remove_peer transient? So later reconnect is possible.
                 self.remove_peer(peer_id, format!("Leios block {point} fetch failed")).await;
-                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { point: point.clone() });
+                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { source: peer_id, point: point });
             }
 
             PeerEvent::LeiosBlockTxsFetched {
