@@ -277,10 +277,8 @@ pub struct CandidateTracker {
     eb_txs_offers: BTreeMap<Point, BTreeSet<PeerId>>,
 
     pending_block_fetches: BTreeSet<Point>,
-    pending_eb_fetches: BTreeSet<Point>,
+    pending_eb_fetches: BTreeMap<Point, BTreeSet<PeerId>>,
     pending_eb_txs_fetches: BTreeSet<Point>,
-
-    eb_attempts: BTreeMap<Point, BTreeSet<PeerId>>,
 
     /// Per-EB set of peers we've already asked for EB-txs.  Used to
     /// skip a peer on retry after a partial response.
@@ -344,7 +342,7 @@ impl CandidateTracker {
     pub fn clear_eb_txs_attempts(&mut self, point: &Point) {
         self.eb_txs_attempts.remove(point);
     }
-    
+
     /// EB-txs candidates excluding any peer we've already tried for
     /// this EB (used to advance the retry-after-partial-response flow).
     ///
@@ -383,19 +381,19 @@ impl CandidateTracker {
     }
 
     pub fn start_eb_fetch(&mut self, point: Point, peers: &[PeerId]) -> bool {
-        if self.eb_attempts.get(&point).is_some_and(|x| peers.iter().any(|p| x.contains(p))) {
+        if self.pending_eb_fetches.get(&point).is_some_and(|x| peers.iter().any(|p| x.contains(p))) {
             // already started
             return false;
         }
 
-        let attempts = self.eb_attempts.entry(point).or_insert(BTreeSet::new());
+        let attempts = self.pending_eb_fetches.entry(point).or_insert(BTreeSet::new());
         attempts.append(&mut BTreeSet::from_iter(peers.iter().copied()));
 
         true
     }
     pub fn available_eb_candidates(&self, point: &Point) -> Vec<PeerId> {
         let eb_offers = self.eb_candidates(point);
-        let Some(peers) = self.eb_attempts.get(point) else {
+        let Some(peers) = self.pending_eb_fetches.get(point) else {
             tracing::info!("EB fetch: {point}; all available: {:?}", eb_offers);
             return eb_offers;
         };
@@ -439,7 +437,7 @@ impl CandidateTracker {
         for attempts in self.eb_txs_attempts.values_mut() {
             attempts.remove(&peer);
         }
-        for attempts in self.eb_attempts.values_mut() {
+        for attempts in self.pending_eb_fetches.values_mut() {
             attempts.remove(&peer);
         }
     }
@@ -454,12 +452,11 @@ impl CandidateTracker {
         self.pending_block_fetches
             .retain(|p| point_slot(p) >= min_slot);
         self.pending_eb_fetches
-            .retain(|p| point_slot(p) >= min_slot);
+            .retain(|p, _| point_slot(p) >= min_slot);
         self.pending_eb_txs_fetches
             .retain(|p| point_slot(p) >= min_slot);
         self.eb_txs_attempts
             .retain(|p, _| point_slot(p) >= min_slot);
-        self.eb_attempts.retain(|p, _| point_slot(p) >= min_slot);
     }
 }
 
@@ -618,6 +615,52 @@ mod tests {
         t.prune_below_slot(10);
         assert!(t.eb_candidates(&pt(5, 1)).is_empty());
         assert_eq!(t.eb_candidates(&pt(15, 1)), vec![pid(2)]);
+    }
+
+    #[test]
+    fn tracker_eb_fetch_dedups_attempted_peers() {
+        let mut t = CandidateTracker::new();
+        let point = pt(10, 1);
+        for peer in [pid(1), pid(2), pid(3)] {
+            t.note_eb_offered(point.clone(), peer);
+        }
+
+        assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
+        assert!(t.pending_eb_fetches.contains_key(&point));
+        assert!(!t.start_eb_fetch(point.clone(), &[pid(1)]));
+        // Reject the whole duplicate batch without marking its new peer attempted.
+        assert!(!t.start_eb_fetch(point.clone(), &[pid(1), pid(2)]));
+        assert_eq!(t.available_eb_candidates(&point), vec![pid(2), pid(3)]);
+
+        assert!(t.start_eb_fetch(point.clone(), &[pid(2), pid(3)]));
+        assert!(t.available_eb_candidates(&point).is_empty());
+        assert_eq!(t.pending_eb_fetches.len(), 1);
+        assert_eq!(t.eb_candidates(&point), vec![pid(1), pid(2), pid(3)]);
+    }
+
+    #[test]
+    fn tracker_eb_fetch_finish_clears_pending_and_preserves_attempts() {
+        let mut t = CandidateTracker::new();
+        let point = pt(10, 1);
+        let other = pt(10, 2);
+        for p in [&point, &other] {
+            t.note_eb_offered(p.clone(), pid(1));
+            t.note_eb_offered(p.clone(), pid(2));
+            assert!(t.start_eb_fetch(p.clone(), &[pid(1)]));
+        }
+        assert_eq!(t.pending_eb_fetches.len(), 2);
+
+        t.finish_eb_fetch(&point);
+        t.finish_eb_fetch(&point); // Finalization is idempotent.
+        assert!(!t.pending_eb_fetches.contains_key(&point));
+        assert!(t.pending_eb_fetches.contains_key(&other));
+        // Finishing a failed attempt must not make that peer eligible again.
+        assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
+        assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
+        t.finish_eb_fetch(&point);
+        t.finish_eb_fetch(&other);
+        assert!(t.pending_eb_fetches.is_empty());
+        assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
     }
 
     // -- PeerRttCache -------------------------------------------------------

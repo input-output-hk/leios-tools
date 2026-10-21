@@ -868,8 +868,11 @@ impl Coordinator {
             }
 
             PeerEvent::LeiosBlockFetchFailed { point } => {
-                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { point: point.clone() });
+                // Leios block is requested only when offered, so if we could not retrieved
+                // the offered leios block, then something is wrong.
+                // TODO: maybe make this remove_peer transient? So later reconnect is possible.
                 self.remove_peer(peer_id, format!("Leios block {point} fetch failed")).await;
+                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { point: point.clone() });
             }
 
             PeerEvent::LeiosBlockTxsFetched {
@@ -922,10 +925,9 @@ impl Coordinator {
                 // Notify application with the full range so it can retry.
                 self.emit_event(NetworkEvent::BlockFetchFailed {
                     peer_id: Some(peer_id),
-                    from: from.clone(),
-                    to: to.clone(),
+                    from,
+                    to,
                 });
-                self.remove_peer(peer_id, format!("Block fetch {from}..{to} failed")).await;
             }
 
             PeerEvent::TxsRequested { count } => {

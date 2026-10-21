@@ -164,8 +164,14 @@ pub fn npv_eligibility_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u
     hasher.finalize().as_bytes().to_vec()
 }
 
-pub fn imitate_bls_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u64) -> Vec<u8> {
-    npv_eligibility_signature(voter_id, eb_hash, eb_slot)
+/// Construct determenistic signature for Piranha cluster emulation network.
+/// In spec it is supposed to be BLS, here it's just some deterministic hash.
+pub fn imitate_rb_vote_signature(voter_id: &[u8], announcing_rb_hash: &[u8; 32]) -> Vec<u8> {
+    let mut hasher = blake2b_simd::Params::new().hash_length(48).to_state();
+    hasher.update(b"net-rs/leios/votes-signature");
+    hasher.update(voter_id);
+    hasher.update(announcing_rb_hash);
+    hasher.finalize().as_bytes().to_vec()
 }
 
 /// Re-run the NPV lottery from an eligibility signature and the pool's

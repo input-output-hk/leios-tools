@@ -1260,6 +1260,8 @@ impl LeiosState {
         fx
     }
 
+    // Finish EB fetch. In particular, it cleans all attempts info, so failed peers can be
+    // requested again.
     pub fn on_eb_fetch_failed(&mut self, point: &Point) -> Vec<LeiosEffect> {
         self.in_flight.remove(&point);
         self.candidates.finish_eb_fetch(&point);
@@ -1983,14 +1985,118 @@ mod tests {
         let fx = state.on_eb_offered(point(10, 1), peer, now);
         assert_eq!(fx.len(), 1);
         match &fx[0] {
-            LeiosEffect::FetchLeiosBlock { peers, .. } => {
+            LeiosEffect::FetchLeiosBlock { point: p, peers } => {
+                assert_eq!(*p, point(10, 1));
                 assert_eq!(*peers, vec![peer]);
             }
             other => panic!("expected FetchLeiosBlock, got {other:?}"),
         }
-        // Second offer from the same peer: dedup'd.
-        let fx = state.on_eb_offered(point(10, 1), peer, now);
-        assert!(fx.is_empty());
+        // Offers from both the same and a new peer are dedup'd while in flight.
+        let later = now + Duration::from_millis(1);
+        for offering_peer in [peer, PeerId(2)] {
+            assert!(state
+                .on_eb_offered(point(10, 1), offering_peer, later)
+                .is_empty());
+        }
+        assert_eq!(state.in_flight.get(&point(10, 1)), Some(&now));
+        assert_eq!(state.candidates.state_sizes().4, 1);
+        assert_eq!(
+            state.candidates.eb_candidates(&point(10, 1)),
+            vec![peer, PeerId(2)]
+        );
+        assert_eq!(
+            state.candidates.available_eb_candidates(&point(10, 1)),
+            vec![PeerId(2)]
+        );
+    }
+
+    #[test]
+    fn on_eb_offered_starts_independent_fetches_for_distinct_blocks() {
+        let mut state = LeiosState::new(
+            "n0".into(),
+            elections_for("n0"),
+            cfg(0),
+            pipeline(),
+            TEST_MAX_FETCH_WAVES,
+        );
+        let now = Instant::now();
+        // Even blocks at the same slot have independent fetch state.
+        for p in [point(10, 1), point(10, 2), point(11, 3)] {
+            let fx = state.on_eb_offered(p.clone(), PeerId(1), now);
+            assert!(matches!(fx.as_slice(),
+                [LeiosEffect::FetchLeiosBlock { point, peers }]
+                    if point == &p && peers == &[PeerId(1)]
+            ));
+            assert_eq!(state.in_flight.get(&p), Some(&now));
+        }
+        assert_eq!(state.in_flight.len(), 3);
+        assert_eq!(state.candidates.state_sizes().4, 3);
+    }
+
+    #[test]
+    fn eb_fetch_timeout_retries_an_unattempted_peer() {
+        let mut state = LeiosState::new(
+            "n0".into(),
+            elections_for("n0"),
+            cfg(0),
+            pipeline(),
+            TEST_MAX_FETCH_WAVES,
+        );
+        let now = Instant::now();
+        let p = point(10, 1);
+        assert_eq!(state.on_eb_offered(p.clone(), PeerId(1), now).len(), 1);
+        assert!(state.on_eb_offered(p.clone(), PeerId(2), now).is_empty());
+        assert!(state
+            .do_eb_fetch(&p, now + IN_FLIGHT_TTL - Duration::from_millis(1))
+            .is_empty());
+
+        let retry_at = now + IN_FLIGHT_TTL;
+        let fx = state.do_eb_fetch(&p, retry_at);
+        assert!(matches!(fx.as_slice(),
+            [LeiosEffect::FetchLeiosBlock { point, peers }]
+                if point == &p && peers == &[PeerId(2)]
+        ));
+        assert_eq!(state.in_flight.get(&p), Some(&retry_at));
+        assert_eq!(state.candidates.state_sizes().4, 1);
+    }
+
+    #[test]
+    fn eb_fetch_finalization_clears_in_flight_and_pending() {
+        // Both successful receipt and failure finalize only the matching fetch.
+        for received in [true, false] {
+            let mut state = LeiosState::new(
+                "n0".into(),
+                elections_for("n0"),
+                cfg(0),
+                pipeline(),
+                TEST_MAX_FETCH_WAVES,
+            );
+            let now = Instant::now();
+            let p = point(10, 1);
+            let other = point(10, 2);
+            for point in [&p, &other] {
+                assert_eq!(state.on_eb_offered(point.clone(), PeerId(1), now).len(), 1);
+            }
+            assert_eq!(state.in_flight.len(), 2);
+            assert_eq!(state.candidates.state_sizes().4, 2);
+
+            for _ in 0..2 {
+                if received {
+                    let fx = state.on_eb_received(Some(PeerId(1)), p.clone(), None);
+                    assert!(matches!(fx.as_slice(),
+                        [LeiosEffect::ValidateEb { point }] if point == &p
+                    ));
+                } else {
+                    assert!(state.on_eb_fetch_failed(&p).is_empty());
+                }
+                assert!(!state.in_flight.contains_key(&p));
+                assert_eq!(state.in_flight.get(&other), Some(&now));
+                assert_eq!(state.candidates.state_sizes().4, 1);
+            }
+            state.on_eb_received(Some(PeerId(1)), other, None);
+            assert!(state.in_flight.is_empty());
+            assert_eq!(state.candidates.state_sizes().4, 0);
+        }
     }
 
     #[test]
