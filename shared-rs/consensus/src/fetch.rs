@@ -654,7 +654,8 @@ mod tests {
         t.finish_eb_fetch(&point); // Finalization is idempotent.
         assert!(!t.pending_eb_fetches.contains_key(&point));
         assert!(t.pending_eb_fetches.contains_key(&other));
-        // Finishing a failed attempt must not make that peer eligible again.
+        // Finishing drops the attempt history, so a previously tried peer
+        // becomes eligible again (see `LeiosState::on_eb_fetch_failed`).
         assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
         assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
         t.finish_eb_fetch(&point);
