@@ -421,8 +421,15 @@ impl CandidateTracker {
     pub fn finish_eb_fetch(&mut self, source: PeerId, point: &Point) -> bool {
         if let Some(peers) = self.pending_eb_fetches.get_mut(point) {
             peers.remove(&source);
-            return peers.is_empty();
+            if !peers.is_empty() {
+                return false;
+            }
         }
+        else {
+            return true;
+        }
+
+        self.pending_eb_fetches.remove(point);
         true
     }
 
@@ -704,9 +711,14 @@ mod tests {
     }
 
     #[test]
-    fn tracker_eb_fetch_finish_without_pending_requests_is_complete() {
+    fn tracker_eb_fetch_finish_empty_checks() {
         let mut t = CandidateTracker::new();
         let point = pt(10, 1);
+        t.note_eb_offered(point.clone(), pid(1));
+        assert!(t.start_eb_fetch(point.clone(), &[pid(1)]));
+        assert!(t.finish_eb_fetch(pid(1), &point));
+        assert!(t.pending_eb_fetches.is_empty());
+
         assert!(t.finish_eb_fetch(pid(1), &point));
         assert!(t.pending_eb_fetches.is_empty());
     }
