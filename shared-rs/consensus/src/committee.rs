@@ -164,8 +164,11 @@ pub fn npv_eligibility_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u
     hasher.finalize().as_bytes().to_vec()
 }
 
-/// Construct determenistic signature for Piranha cluster emulation network.
-/// In spec it is supposed to be BLS, here it's just some deterministic hash.
+/// Construct the deterministic stand-in for an RB-vote signature: 48 bytes
+/// derived from `(voter_id, announcing_rb_hash)` via Blake2b. The spec calls
+/// for a BLS signature over the pool's secret key; this crate doesn't model
+/// BLS, so the value is reproducible by anyone with the same inputs and
+/// carries no authentication.
 pub fn imitate_rb_vote_signature(voter_id: &[u8], announcing_rb_hash: &[u8; 32]) -> Vec<u8> {
     let mut hasher = blake2b_simd::Params::new().hash_length(48).to_state();
     hasher.update(b"net-rs/leios/votes-signature");
