@@ -103,9 +103,7 @@ pub enum NetworkEvent {
     LeiosBlockTxsOffered { peer_id: PeerId, point: Point },
 
     /// Leios: a fetched endorser block arrived. `source` is the peer
-    /// it was fetched from (`None` for self-produced EBs, which the
-    /// node feeds through the same receive path so manifest-recording
-    /// fires identically).
+    /// it was fetched from.
     LeiosBlockReceived {
         source: PeerId,
         point: Point,
