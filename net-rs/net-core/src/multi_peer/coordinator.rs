@@ -861,7 +861,7 @@ impl Coordinator {
                     }
                 }
                 self.emit_event(NetworkEvent::LeiosBlockReceived {
-                    source: Some(peer_id),
+                    source: peer_id,
                     point,
                     block,
                 });
@@ -3925,7 +3925,6 @@ mod tests {
                 peer_id,
             } => {
                 assert_eq!(peer_id, PeerId(7));
-            } => {
                 assert_eq!(p, point);
                 assert_eq!(transactions, vec![body2, body0]);
             }

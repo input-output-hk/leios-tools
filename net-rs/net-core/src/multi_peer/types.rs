@@ -107,7 +107,7 @@ pub enum NetworkEvent {
     /// node feeds through the same receive path so manifest-recording
     /// fires identically).
     LeiosBlockReceived {
-        source: Option<PeerId>,
+        source: PeerId,
         point: Point,
         block: Vec<u8>,
     },
