@@ -3922,7 +3922,9 @@ mod tests {
             NetworkEvent::LeiosBlockTxsReceived {
                 point: p,
                 transactions,
-                ..
+                peer_id,
+            } => {
+                assert_eq!(peer_id, PeerId(7));
             } => {
                 assert_eq!(p, point);
                 assert_eq!(transactions, vec![body2, body0]);
