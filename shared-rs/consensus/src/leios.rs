@@ -2117,8 +2117,8 @@ mod tests {
                 state.candidates.available_eb_candidates(&other),
                 vec![PeerId(1)]
             );
-            // The diagnostic counts per-point entries, including empty peer sets.
-            assert_eq!(state.candidates.state_sizes().4, 2);
+            // Per-point entries are dropped once every pending peer resolves.
+            assert_eq!(state.candidates.state_sizes().4, 0);
         }
     }
 
