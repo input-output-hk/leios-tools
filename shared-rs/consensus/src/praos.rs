@@ -575,7 +575,7 @@ impl PraosState {
     /// Block number to assign to the next self-produced block.
     /// Takes `tip`: tip RB hash. If None, then it considers that there is no 
     /// adopted block.
-    /// Default usage: `x.next_block_number_after(x.tip_hash())`
+    /// Default usage: `x.next_block_number_after(&x.tip_hash())`
     /// However, if for some reason tip is not available (e.g. EB is not existing),
     /// then the node may be forced to produce a fork, and the best tip available
     /// should be placed here.
