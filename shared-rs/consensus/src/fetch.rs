@@ -698,8 +698,8 @@ mod tests {
         assert_eq!(t.available_eb_candidates(&point), vec![pid(2)]);
         assert!(t.finish_eb_fetch(pid(1), &point));
         assert!(t.finish_eb_fetch(pid(1), &point));
-        // Empty per-point sets may remain; only pending peers block candidates.
-        assert!(t.pending_eb_fetches[&point].is_empty());
+        // The per-point entry is dropped once no peer has an outstanding request.
+        assert!(!t.pending_eb_fetches.contains_key(&point));
         assert_eq!(t.available_eb_candidates(&point), vec![pid(1), pid(2)]);
         assert_eq!(t.eb_candidates(&point), vec![pid(1), pid(2)]);
         assert_eq!(
