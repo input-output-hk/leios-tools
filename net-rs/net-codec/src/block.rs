@@ -62,49 +62,6 @@ fn count_and_skip_array(d: &mut Decoder) -> Result<u32, DecodeError> {
     }
 }
 
-/// Count the transactions in a Leios (era ≥ 8) block body wrapper.
-///
-/// The wrapper is `[?, tx_list, ?, ?]` (null placeholders around the payload);
-/// `tx_list` is the array of `[tx_body, witness_set, aux]` triples. Return the
-/// length of that inner tx list — the real transaction count — by descending
-/// into the first array-typed element of the wrapper.
-#[allow(dead_code)]
-fn count_leios_tx_list(d: &mut Decoder) -> Result<u32, DecodeError> {
-    use minicbor::data::Type;
-    fn is_array(t: Type) -> bool {
-        matches!(t, Type::Array | Type::ArrayIndef)
-    }
-
-    let mut count = 0u32;
-    let mut found = false;
-    match d.array()? {
-        Some(n) => {
-            for _ in 0..n {
-                if !found && is_array(d.datatype()?) {
-                    count = count_and_skip_array(d)?;
-                    found = true;
-                } else {
-                    d.skip()?;
-                }
-            }
-        }
-        None => loop {
-            let t = d.datatype()?;
-            if t == Type::Break {
-                d.skip()?; // consume the break
-                break;
-            }
-            if !found && is_array(t) {
-                count = count_and_skip_array(d)?;
-                found = true;
-            } else {
-                d.skip()?;
-            }
-        },
-    }
-    Ok(count)
-}
-
 // --- LeiosBlockInfo ---
 
 /// Leios metadata parsed from a block body (CIP-0164).
