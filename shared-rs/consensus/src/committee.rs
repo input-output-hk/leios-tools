@@ -164,6 +164,19 @@ pub fn npv_eligibility_signature(voter_id: &[u8], eb_hash: &[u8; 32], eb_slot: u
     hasher.finalize().as_bytes().to_vec()
 }
 
+/// Construct the deterministic stand-in for an RB-vote signature: 48 bytes
+/// derived from `(voter_id, announcing_rb_hash)` via Blake2b. The spec calls
+/// for a BLS signature over the pool's secret key; this crate doesn't model
+/// BLS, so the value is reproducible by anyone with the same inputs and
+/// carries no authentication.
+pub fn imitate_rb_vote_signature(voter_id: &[u8], announcing_rb_hash: &[u8; 32]) -> Vec<u8> {
+    let mut hasher = blake2b_simd::Params::new().hash_length(48).to_state();
+    hasher.update(b"net-rs/leios/votes-signature");
+    hasher.update(voter_id);
+    hasher.update(announcing_rb_hash);
+    hasher.finalize().as_bytes().to_vec()
+}
+
 /// Re-run the NPV lottery from an eligibility signature and the pool's
 /// stake to count wins. Both prover and verifier compute the same
 /// count without it being transmitted on the wire — mirrors how a

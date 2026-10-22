@@ -81,6 +81,9 @@ pub enum PeerEvent {
 
     /// LeiosFetch: a requested endorser block arrived.
     LeiosBlockFetched { point: Point, block: Vec<u8> },
+    
+    /// LeiosFetch: a requested endorser block fetch failed.
+    LeiosBlockFetchFailed { point: Point },
 
     /// LeiosFetch: requested transactions for an EB arrived.
     LeiosBlockTxsFetched {

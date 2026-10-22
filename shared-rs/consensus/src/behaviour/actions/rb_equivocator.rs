@@ -71,19 +71,16 @@ pub fn equivocation_bucket(seed: u64, ways: u8, peer: PeerId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
+    use crate::behaviour::tree::env::NativeChainState;
 
     fn run(action: &mut RbHeaderEquivocator, slot: u64) -> (Status, ControlSignal) {
-        let env = DynamicEnv::new();
         let state = NativeChainState {
             current_slot: slot,
             ..Default::default()
         };
         let ctx = TickCtx {
-            env: &env,
             state: &state,
-            seed: 0,
-            action_params: None,
+            ..Default::default()
         };
         let mut out = ControlSignal::default();
         let s = action.contribute(&ctx, &mut out);

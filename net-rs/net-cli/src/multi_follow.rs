@@ -169,6 +169,9 @@ pub async fn run(
                     println!("  block fetch failed: {from}..{to}");
                 }
             }
+            NetworkEvent::LeiosBlockFetchFailed { source, point } => {
+                println!("  leios block fetch from {source} failed: {point}");
+            }
             NetworkEvent::TxsRequested { .. } => {} // handled by net-node, not net-cli
             NetworkEvent::PeerSnapshot { .. } | NetworkEvent::IntersectionFound { .. } => {}
         }
