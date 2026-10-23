@@ -13,7 +13,7 @@
 //! parsing happens at the I/O boundary; this crate never interprets the
 //! bytes.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -224,6 +224,13 @@ pub struct HybridWalk {
 pub enum SelectionDecision {
     /// No peer has a chain strictly better than the adopted tip.
     NoBetterChain,
+    /// The adopted chain's tip (or one of its ancestors) has been
+    /// blacklisted, so the tainted suffix must be abandoned even though no
+    /// peer offers a strictly-better chain. Roll our own chain back to
+    /// `ancestor` — the deepest adopted ancestor that is still clean —
+    /// discarding everything above it. `ancestor == [0u8; 32]` means the
+    /// whole adopted chain is tainted and we roll back to Origin.
+    RollbackTainted { ancestor: [u8; 32], tip_block_no: u64 },
     /// A peer has a better tip but its chain doesn't connect to the
     /// adopted chain within the visibility window.
     OrphanCandidate { peer_id: PeerId, tip_block_no: u64 },
@@ -565,6 +572,10 @@ impl PraosState {
             equivocation_bytes_estimate = s.equivocation_bytes_estimate,
             "praos state sizes"
         );
+    }
+
+    fn is_rb_blacklisted(&self, rb: &[u8; 32]) -> bool {
+        self.control.praos.rb_blacklist.contains(rb)
     }
 
     /// Hash of the currently adopted tip, if any.
@@ -1876,20 +1887,41 @@ impl PraosState {
     /// One pass of Haskell-aligned chain selection.  Pure: does not
     /// mutate state.  Tests call this directly to assert classification.
     pub fn select_chain_once_impl(&self, skip: &HashSet<PeerId>) -> SelectionDecision {
-        let (adopted_hash, adopted_bn) = match self.adopted_tip_hash {
-            Some(h) => (h, self.chain_tree.block_number(&h).unwrap_or(0)),
-            None => ([0u8; 32], 0),
+        // A block in the adopted chain may have been blacklisted *after* we
+        // adopted it, invalidating the tip and every heir above the
+        // blacklisted block. The effective adopted tip is the deepest
+        // ancestor of the adopted tip that is still clean (neither
+        // blacklisted nor an heir of a blacklisted block); it — not the raw
+        // adopted tip — is the baseline chain selection must compare against
+        // and the point we minimally roll back to. `ancestors` yields
+        // `[tip, parent, …]`, so the first non-blacklisted entry is the
+        // highest clean block. `None` means the whole adopted chain (down to
+        // its root in the tree) is tainted.
+        let effective_adopted: Option<[u8; 32]> = self.adopted_tip_hash.and_then(|tip| {
+            self.chain_tree
+                .ancestors(tip)
+                .into_iter()
+                .find(|h| !self.chain_tree.is_blacklisted(*h))
+        });
+        // True when a newly-blacklisted ancestor forces us to abandon part
+        // (or all) of the adopted chain, even if no peer has a better one.
+        let adopted_tainted =
+            self.adopted_tip_hash.is_some() && effective_adopted != self.adopted_tip_hash;
+
+        let (adopted_hash, adopted_bn, adopted_set) = match effective_adopted {
+            Some(h) => (h, self.chain_tree.block_number(&h).unwrap_or(0), true),
+            None => ([0u8; 32], 0, false),
         };
         let best = self
             .peer_chains
             .iter()
             .filter(|(peer_id, _)| !skip.contains(peer_id))
             .filter_map(|(peer_id, chain)| {
-                let tip = chain.tip()?;
-                if self.adopted_tip_hash.is_none()
-                    || is_better_tip(tip.block_no, &tip.hash, adopted_bn, &adopted_hash)
+                let chain = chain.trim_by_blacklist(self.chain_tree.get_blacklist());
+                let tip = chain.tip()?.clone();
+                if !adopted_set || is_better_tip(tip.block_no, &tip.hash, adopted_bn, &adopted_hash)
                 {
-                    Some((*peer_id, chain, tip.clone()))
+                    Some((*peer_id, chain, tip))
                 } else {
                     None
                 }
@@ -1902,11 +1934,24 @@ impl PraosState {
 
         let (peer_id, candidate, candidate_tip) = match best {
             Some(b) => b,
-            None => return SelectionDecision::NoBetterChain,
+            None => {
+                // No peer offers a strictly-better chain. If the adopted tip
+                // was invalidated by a blacklisted ancestor we must still roll
+                // our own chain back to the effective (clean) adopted tip,
+                // abandoning only the tainted suffix — a minimal rollback.
+                // `adopted_hash` is the effective tip, or `[0u8; 32]` (Origin)
+                // when the whole adopted chain is tainted.
+                if adopted_tainted {
+                    return SelectionDecision::RollbackTainted {
+                        ancestor: adopted_hash,
+                        tip_block_no: adopted_bn,
+                    };
+                }
+                return SelectionDecision::NoBetterChain;
+            }
         };
 
-        let adopted_ancestors: HashSet<[u8; 32]> = self
-            .adopted_tip_hash
+        let adopted_ancestors: HashSet<[u8; 32]> = effective_adopted
             .map(|h| self.chain_tree.ancestors(h).into_iter().collect())
             .unwrap_or_default();
 
@@ -1939,7 +1984,7 @@ impl PraosState {
                         // either it's already in the adopted chain's
                         // ancestry, or we have no adopted chain (fresh
                         // node) so any parent is acceptable.
-                        if adopted_ancestors.contains(&parent) || self.adopted_tip_hash.is_none() {
+                        if adopted_ancestors.contains(&parent) || !adopted_set {
                             ancestor = Some(parent);
                         }
                     }
@@ -1948,7 +1993,7 @@ impl PraosState {
         }
         if ancestor.is_none() {
             if let Some(anchor) = candidate.anchor() {
-                if anchor.hash == [0u8; 32] && self.adopted_tip_hash.is_none() {
+                if anchor.hash == [0u8; 32] && !adopted_set {
                     ancestor = Some([0u8; 32]);
                 } else if adopted_ancestors.contains(&anchor.hash) {
                     ancestor = Some(anchor.hash);
@@ -2112,7 +2157,7 @@ impl PraosState {
         decision
     }
 
-        /// Try to switch to a specific block as chain tip.  Walks back
+    /// Try to switch to a specific block as chain tip.  Walks back
     /// through chain_tree from `tip_hash` to `adopted_tip` and returns
     /// the contiguous prefix of cached blocks as a replay sequence.
     #[allow(clippy::type_complexity)]
@@ -2208,6 +2253,22 @@ impl PraosState {
         loop {
             match self.select_chain_once(&skip) {
                 SelectionDecision::NoBetterChain => return,
+                SelectionDecision::RollbackTainted {
+                    ancestor,
+                    tip_block_no,
+                } => {
+                    info!(
+                        node_id = %self.node_id,
+                        tip_block_no,
+                        ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                        "select_chain: rolling back blacklist-tainted adopted chain to the deepest clean ancestor"
+                    );
+                    // Minimal rollback: drop the tainted suffix with an empty
+                    // replay — no blocks are re-applied, we just re-anchor at
+                    // the clean ancestor (or Origin when `ancestor` is zero).
+                    self.execute_switch_internal(ancestor, Vec::new(), fx);
+                    return;
+                }
                 SelectionDecision::OrphanCandidate {
                     peer_id,
                     tip_block_no,
@@ -3856,6 +3917,72 @@ mod tests {
             s.select_chain_once(&skip),
             SelectionDecision::NoBetterChain
         ));
+    }
+    #[test]
+    fn evaluate_drops_peer_chain_at_blacklisted_block() {
+        // Peer 1 announces a 5-block chain [1,2,3,4,5]. We first adopt the
+        // whole chain, then block 3 is blacklisted. On re-evaluation chain
+        // selection must trim the peer's chain at the first blacklisted block,
+        // so only [1,2] stays eligible and block 2 becomes the adopted tip —
+        // blocks 3,4,5 are dropped from the adopted tip.
+        let mut s = fresh();
+
+        // All five blocks are fetched and validated, held locally and ready to
+        // adopt. Nothing is adopted yet.
+        install_validated_block(&mut s, 100, 1, 1, None);
+        install_validated_block(&mut s, 101, 2, 2, Some(1));
+        install_validated_block(&mut s, 102, 3, 3, Some(2));
+        install_validated_block(&mut s, 103, 4, 4, Some(3));
+        install_validated_block(&mut s, 104, 5, 5, Some(4));
+
+        // Peer 1 announces the full chain [1,2,3,4,5] (tip = block 5).
+        let pid = PeerId(1);
+        s.record_peer_tip(pid, pt(104, 5), 5, 1, h(1), 100, None);
+        s.record_peer_tip(pid, pt(104, 5), 5, 2, h(2), 101, Some(h(1)));
+        s.record_peer_tip(pid, pt(104, 5), 5, 3, h(3), 102, Some(h(2)));
+        s.record_peer_tip(pid, pt(104, 5), 5, 4, h(4), 103, Some(h(3)));
+        s.record_peer_tip(pid, pt(104, 5), 5, 5, h(5), 104, Some(h(4)));
+        assert_eq!(s.peer_chains.get(&pid).unwrap().len(), 5);
+
+        // First evaluation: no blacklist, so the whole chain is adopted.
+        let mut fx = Vec::new();
+        s.evaluate_and_fetch_internal(Instant::now(), &mut fx);
+
+        // The adopted tip now spans all five blocks.
+        assert_eq!(
+            s.adopted_tip_hash,
+            Some(h(5)),
+            "the whole announced chain is adopted up to block 5"
+        );
+        assert_eq!(
+            s.walk_ancestors_hybrid(h(5)).chain,
+            vec![h(5), h(4), h(3), h(2), h(1)],
+            "adopted tip has all 5 blocks in its ancestry"
+        );
+
+        // Block 3 gets blacklisted.
+        s.chain_tree.update_blacklist(&vec![h(3)]);
+
+        // Second evaluation: the peer chain is trimmed before block 3.
+        let mut fx2 = Vec::new();
+        s.evaluate_and_fetch_internal(Instant::now(), &mut fx2);
+
+        // Block 2 becomes the adopted tip; blocks 3,4,5 are dropped.
+        assert_eq!(
+            s.adopted_tip_hash,
+            Some(h(2)),
+            "adopted tip drops back to block 2, before the blacklisted block 3"
+        );
+        // The rollback is minimal: a single rollback that re-anchors at block
+        // 2's point, with no re-apply of the still-valid blocks 1 and 2 (no
+        // deep rollback to Origin + replay).
+        assert_eq!(fx2.len(), 1, "exactly one effect: the minimal rollback");
+        match &fx2[0] {
+            PraosEffect::ValidatorRollback { target } => {
+                assert_eq!(*target, pt(101, 2), "roll back only to block 2's point");
+            }
+            other => panic!("expected a single ValidatorRollback, got {other:?}"),
+        }
     }
 
     // -- try_switch_to and walk_ancestors_hybrid -------------------------

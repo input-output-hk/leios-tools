@@ -35,7 +35,7 @@
 //!     fallback `block_no` is 0).
 //!   - `prune_below()` removing deep history on long-running forks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 use crate::mempool::EbKey;
@@ -122,6 +122,7 @@ struct ChainNode {
 #[derive(Debug)]
 pub struct ChainTree {
     nodes: HashMap<[u8; 32], ChainNode>,
+    blacklist: HashSet<[u8; 32]>, // list of blocks, which cannot be in best chain
     best_tip: Option<(Point, u64)>, // (point, block_number)
 }
 
@@ -136,7 +137,60 @@ impl ChainTree {
         Self {
             nodes: HashMap::new(),
             best_tip: None,
+            blacklist: HashSet::new(),
         }
+    }
+
+    pub fn update_blacklist(&mut self, blacklist: &Vec<[u8; 32]>) {
+        self.blacklist = HashSet::from_iter(blacklist.iter().cloned());
+    }
+
+    /// Read-only access to the blacklist set of block hashes that cannot be
+    /// part of the best chain.
+    pub fn get_blacklist(&self) -> &HashSet<[u8; 32]> {
+        &self.blacklist
+    }
+
+    pub fn is_blacklisted(&self, mut hash: [u8; 32]) -> bool {
+        loop {
+            if self.blacklist.contains(&hash) {
+                return true;
+            }
+            let Some(prev) = self.prev_hash(&hash) else {
+                return false;
+            };
+            // Missing parents terminate the visible ancestry. A blacklisted hash
+            // that is no longer present in the tree (e.g. pruned) does not
+            // blacklist descendants past this gap.
+            if !self.nodes.contains_key(&prev) {
+                return false;
+            }
+            hash = prev;
+        }
+    }
+
+    /// Update best tip after one block was inserted into chain_tree.
+    /// `point` - block point
+    /// `block_number` - inserted block number
+    /// `hash` - inserted block hash (same as hash in point)
+    /// Returns true if best tip was updated.
+    fn update_best_tip(&mut self, point: Point, block_number: u64, hash: &[u8; 32]) -> bool {
+        if self.is_blacklisted(*hash) {
+            return false;
+        }
+
+        let is_new_best = match &self.best_tip {
+            None => true,
+            Some((_, best_bn)) => {
+                let best_hash = self.best_tip_hash().unwrap_or([0xFF; 32]);
+                is_better_tip(block_number, &hash, *best_bn, &best_hash)
+            }
+        };
+        if is_new_best {
+            self.best_tip = Some((point, block_number));
+        }
+
+        is_new_best
     }
 
     /// Insert a sync-at-tip anchor as a bodyless `ChainStart` root.
@@ -174,18 +228,7 @@ impl ChainTree {
             },
         );
 
-        let is_new_best = match &self.best_tip {
-            None => true,
-            Some((_, best_bn)) => {
-                let best_hash = self.best_tip_hash().unwrap_or([0xFF; 32]);
-                is_better_tip(block_number, &hash, *best_bn, &best_hash)
-            }
-        };
-        if is_new_best {
-            self.best_tip = Some((point, block_number));
-        }
-
-        true
+        self.update_best_tip(point, block_number, &hash)
     }
 
     /// Insert a block. Returns true if this block becomes the new best tip.
@@ -228,19 +271,7 @@ impl ChainTree {
             },
         );
 
-        let is_new_best = match &self.best_tip {
-            None => true,
-            Some((_, best_bn)) => {
-                let best_hash = self.best_tip_hash().unwrap_or([0xFF; 32]);
-                is_better_tip(block_number, &hash, *best_bn, &best_hash)
-            }
-        };
-
-        if is_new_best {
-            self.best_tip = Some((point, block_number));
-        }
-
-        is_new_best
+        self.update_best_tip(point, block_number, &hash)
     }
 
     /// The current best tip (highest block_number).
@@ -359,6 +390,15 @@ impl ChainTree {
     /// operation the caller prunes at `adopted_bn - k` where `best_tip`
     /// is at or above `adopted_bn`, so the recomputation rarely fires.
     pub fn prune_below(&mut self, min_block_number: u64) {
+        // If pruning removes a blacklisted node, descendant tips may become
+        // newly eligible (their blacklisted ancestor disappears behind a gap),
+        // so best_tip must be recomputed even when the current best tip itself
+        // is not pruned.
+        let pruned_blacklisted = self
+            .nodes
+            .iter()
+            .any(|(hash, node)| node.block_number < min_block_number && self.blacklist.contains(hash));
+
         self.nodes
             .retain(|_, node| node.block_number >= min_block_number);
 
@@ -367,7 +407,7 @@ impl ChainTree {
             Some((_, bn)) => *bn < min_block_number,
             None => false,
         };
-        if pruned {
+        if pruned || pruned_blacklisted {
             self.recompute_best_tip();
         }
     }
@@ -393,6 +433,11 @@ impl ChainTree {
     fn recompute_best_tip(&mut self) {
         self.best_tip = None;
         for (hash, node) in &self.nodes {
+            if self.is_blacklisted(*hash) {
+                // Blacklisted or heir of blacklisted cannot be a best tip.
+                continue;
+            }
+
             let is_new_best = match &self.best_tip {
                 None => true,
                 Some((_, best_bn)) => {
@@ -737,6 +782,91 @@ mod tests {
         assert!(!switched, "shorter fork should not become best");
         let (_, bn) = tree.best_tip().unwrap();
         assert_eq!(bn, 3);
+    }
+
+    #[test]
+    fn blacklisted_tip_descendant_is_ignored_but_clean_branch_can_win() {
+        let mut tree = ChainTree::new();
+
+        // Base chain A: 1 -> 2 -> 3 (best tip = 3).
+        tree.insert_simple(
+            [1; 32],
+            Point::Specific {
+                slot: 1,
+                hash: [1; 32],
+            },
+            1,
+            1,
+            None,
+        );
+        tree.insert_simple(
+            [2; 32],
+            Point::Specific {
+                slot: 2,
+                hash: [2; 32],
+            },
+            2,
+            2,
+            Some([1; 32]),
+        );
+        tree.insert_simple(
+            [3; 32],
+            Point::Specific {
+                slot: 3,
+                hash: [3; 32],
+            },
+            3,
+            3,
+            Some([2; 32]),
+        );
+
+        // Side branch B starts at block 1; blacklist its first block.
+        tree.insert_simple(
+            [0xB2; 32],
+            Point::Specific {
+                slot: 2,
+                hash: [0xB2; 32],
+            },
+            2,
+            2,
+            Some([1; 32]),
+        );
+        tree.blacklist.insert([0xB2; 32]);
+
+        // 1) Descendant of a blacklisted block must not become best tip.
+        let switched_blacklisted_descendant = tree.insert_simple(
+            [0xB4; 32],
+            Point::Specific {
+                slot: 4,
+                hash: [0xB4; 32],
+            },
+            4,
+            4,
+            Some([0xB2; 32]),
+        );
+        assert!(
+            !switched_blacklisted_descendant,
+            "descendant of blacklisted node must be ignored"
+        );
+        assert_eq!(
+            tree.best_tip_hash(),
+            Some([3; 32]),
+            "tip must stay unchanged"
+        );
+
+        // 2) Clean extension outside the blacklisted branch should work normally.
+        let switched_clean = tree.insert_simple(
+            [4; 32],
+            Point::Specific {
+                slot: 4,
+                hash: [4; 32],
+            },
+            4,
+            4,
+            Some([3; 32]),
+        );
+        assert!(switched_clean, "non-blacklisted extension must become best tip");
+        assert_eq!(tree.best_tip_hash(), Some([4; 32]));
     }
 
     #[test]
@@ -1172,6 +1302,136 @@ mod tests {
     }
 
     #[test]
+    fn prune_recomputes_best_tip_when_blacklisted_node_was_pruned() {
+        fn build_tree() -> ChainTree {
+            let mut tree = ChainTree::new();
+            // Main chain: 1 -> 2 -> 3 -> 4
+            tree.insert_simple(
+                [1; 32],
+                Point::Specific {
+                    slot: 1,
+                    hash: [1; 32],
+                },
+                1,
+                1,
+                None,
+            );
+            tree.insert_simple(
+                [2; 32],
+                Point::Specific {
+                    slot: 2,
+                    hash: [2; 32],
+                },
+                2,
+                2,
+                Some([1; 32]),
+            );
+            tree.insert_simple(
+                [3; 32],
+                Point::Specific {
+                    slot: 3,
+                    hash: [3; 32],
+                },
+                3,
+                3,
+                Some([2; 32]),
+            );
+            tree.insert_simple(
+                [4; 32],
+                Point::Specific {
+                    slot: 4,
+                    hash: [4; 32],
+                },
+                4,
+                4,
+                Some([3; 32]),
+            );
+
+            // Side branch: 1 -> B2 -> B3 -> B4 -> B5
+            tree.insert_simple(
+                [0xB2; 32],
+                Point::Specific {
+                    slot: 2,
+                    hash: [0xB2; 32],
+                },
+                2,
+                2,
+                Some([1; 32]),
+            );
+            tree.insert_simple(
+                [0xB3; 32],
+                Point::Specific {
+                    slot: 3,
+                    hash: [0xB3; 32],
+                },
+                3,
+                3,
+                Some([0xB2; 32]),
+            );
+            tree.insert_simple(
+                [0xB4; 32],
+                Point::Specific {
+                    slot: 4,
+                    hash: [0xB4; 32],
+                },
+                4,
+                4,
+                Some([0xB3; 32]),
+            );
+            tree.insert_simple(
+                [0xB5; 32],
+                Point::Specific {
+                    slot: 5,
+                    hash: [0xB5; 32],
+                },
+                5,
+                5,
+                Some([0xB4; 32]),
+            );
+            tree
+        }
+
+        let b2 = [0xB2; 32];
+        let b5 = [0xB5; 32];
+
+        // 1) Baseline: no blacklist at all.
+        let mut clean = build_tree();
+        clean.prune_below(3);
+        let clean_tip = clean.best_tip_hash();
+        assert_eq!(clean_tip, Some(b5));
+
+        // 2) Same tree, but with a blacklisted ancestor that gets pruned away.
+        let mut tree = build_tree();
+        tree.blacklist.insert(b2);
+        tree.recompute_best_tip();
+
+        // B5 is ignored while B2 exists and is blacklisted, so main chain tip wins.
+        assert_eq!(tree.best_tip_hash(), Some([4; 32]));
+
+        // Force a stale best_tip that would survive prune_below(3) if no
+        // recompute happened.
+        tree.best_tip = Some((
+            Point::Specific {
+                slot: 3,
+                hash: [3; 32],
+            },
+            3,
+        ));
+
+        // Prune < 3 removes B2 (blacklisted), but keeps B3..B5.
+        tree.prune_below(3);
+
+        // Blacklist itself is not altered.
+        assert!(tree.blacklist.contains(&b2));
+        // Node was pruned from the tree.
+        assert!(!tree.nodes.contains_key(&b2));
+
+        // Tip computation must match the "no blacklist from the beginning"
+        // baseline once blacklisted ancestors are gone.
+        assert_eq!(tree.best_tip_hash(), clean_tip);
+    }
+
+    #[test]
     fn prune_all_clears_best_tip() {
         let mut tree = ChainTree::new();
         tree.insert_simple(
@@ -1189,5 +1449,128 @@ mod tests {
         tree.prune_below(100);
         assert!(tree.best_tip().is_none());
         assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn recompute_best_tip_ignores_blacklisted_branches() {
+        let mut tree = ChainTree::new();
+
+        // Shared prefix: 1 -> 2
+        tree.insert_simple(
+            [1; 32],
+            Point::Specific {
+                slot: 1,
+                hash: [1; 32],
+            },
+            1,
+            1,
+            None,
+        );
+        tree.insert_simple(
+            [2; 32],
+            Point::Specific {
+                slot: 2,
+                hash: [2; 32],
+            },
+            2,
+            2,
+            Some([1; 32]),
+        );
+
+        // Left fork (3 nodes total): 1 -> 2 -> 0xA3
+        let left_tip = [0xA3; 32];
+        tree.insert_simple(
+            left_tip,
+            Point::Specific {
+                slot: 3,
+                hash: left_tip,
+            },
+            3,
+            3,
+            Some([2; 32]),
+        );
+
+        // Right fork (5 nodes total): 1 -> 2 -> 0xB3 -> 0xB4 -> 0xB5
+        let right_3 = [0xB3; 32];
+        let right_4 = [0xB4; 32];
+        let right_5 = [0xB5; 32];
+        tree.insert_simple(
+            right_3,
+            Point::Specific {
+                slot: 3,
+                hash: right_3,
+            },
+            3,
+            3,
+            Some([2; 32]),
+        );
+        tree.insert_simple(
+            right_4,
+            Point::Specific {
+                slot: 4,
+                hash: right_4,
+            },
+            4,
+            4,
+            Some(right_3),
+        );
+        tree.insert_simple(
+            right_5,
+            Point::Specific {
+                slot: 5,
+                hash: right_5,
+            },
+            5,
+            5,
+            Some(right_4),
+        );
+
+        // 2) Initially, right fork tip (5th node total) is best.
+        tree.recompute_best_tip();
+        assert_eq!(tree.best_tip_hash(), Some(right_5));
+
+        // 3-4) Blacklist the 3rd node on the right fork: whole right branch
+        // must be ignored, so left tip wins.
+        tree.blacklist.insert(right_3);
+        tree.recompute_best_tip();
+        assert_eq!(tree.best_tip_hash(), Some(left_tip));
+
+        // 5-6) Move blacklist deeper on right fork: unblacklist right_3,
+        // blacklist right_5. Then right_4 should become the best valid tip.
+        tree.blacklist.remove(&right_3);
+        tree.blacklist.insert(right_5);
+        tree.recompute_best_tip();
+        assert_eq!(tree.best_tip_hash(), Some(right_4));
+    }
+
+    #[test]
+    fn big_recursive_traverse() {
+        fn hash_of(i: u64) -> [u8; 32] {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h
+        }
+
+        fn recursive_walk(tree: &ChainTree, hash: [u8; 32], visited: &mut u64) {
+            *visited += 1;
+            if let Some(parent) = tree.prev_hash(&hash) {
+                recursive_walk(tree, parent, visited);
+            }
+        }
+
+        let mut tree = ChainTree::new();
+
+        // Mainnet K=2160, so no more than 2160 nested calls in real network.
+        let n = 10_000u64;
+        for i in 1..=n {
+            let hash = hash_of(i);
+            let prev = (i > 1).then(|| hash_of(i - 1));
+            tree.insert_simple(hash, Point::Specific { slot: i, hash }, i, i, prev);
+        }
+
+        let mut visited = 0u64;
+        recursive_walk(&tree, hash_of(n), &mut visited);
+
+        assert_eq!(visited, n, "must recursively process all {n} records");
     }
 }

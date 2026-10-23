@@ -1,6 +1,6 @@
 //! Per-peer candidate chain tracking (PeerChain, PeerChainEntry, PeerChainAnchor).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crate::types::Point;
 
@@ -138,6 +138,24 @@ impl PeerChain {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &PeerChainEntry> {
         self.entries.iter()
     }
+
+    /// Copy this chain, trimmed at the first blacklisted entry.
+    ///
+    /// The returned chain holds the entries from oldest up to — but not
+    /// including — the first entry whose hash appears in `blacklist`. The
+    /// `cap` and `anchor` are preserved from the original. If no entry is
+    /// blacklisted, the result is a full copy of the chain.
+    pub fn trim_by_blacklist(&self, blacklist: &HashSet<[u8; 32]>) -> PeerChain {
+        let mut trimmed = PeerChain::new(self.cap);
+        trimmed.anchor = self.anchor.clone();
+        for entry in &self.entries {
+            if blacklist.contains(&entry.hash) {
+                break;
+            }
+            trimmed.entries.push_back(entry.clone());
+        }
+        trimmed
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +274,43 @@ mod tests {
         let a = chain.anchor().unwrap();
         assert_eq!(a.hash, [0u8; 32]);
         assert_eq!(a.point, Point::Origin);
+    }
+
+    #[test]
+    fn trim_by_blacklist_stops_before_first_blacklisted() {
+        let mut chain = PeerChain::new(64);
+        chain.set_anchor(Point::Specific {
+            slot: 0,
+            hash: [0; 32],
+        });
+        chain.append(entry(1, None));
+        chain.append(entry(2, Some(1)));
+        chain.append(entry(3, Some(2)));
+        chain.append(entry(4, Some(3)));
+
+        let blacklist = HashSet::from([[3; 32]]);
+        let trimmed = chain.trim_by_blacklist(&blacklist);
+
+        // Entries 1 and 2 are kept; the blacklisted entry 3 and everything
+        // after it are dropped.
+        assert_eq!(trimmed.len(), 2);
+        assert_eq!(trimmed.iter().next().unwrap().hash, [1; 32]);
+        assert_eq!(trimmed.tip().unwrap().hash, [2; 32]);
+        // Anchor and cap are preserved.
+        assert_eq!(trimmed.cap, chain.cap);
+        assert!(trimmed.anchor().is_some());
+        // Original chain is unchanged.
+        assert_eq!(chain.len(), 4);
+    }
+
+    #[test]
+    fn trim_by_blacklist_no_match_copies_everything() {
+        let mut chain = PeerChain::new(64);
+        chain.append(entry(1, None));
+        chain.append(entry(2, Some(1)));
+
+        let blacklist = HashSet::from([[99; 32]]);
+        let trimmed = chain.trim_by_blacklist(&blacklist);
+        assert_eq!(trimmed.len(), 2);
     }
 }
