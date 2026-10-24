@@ -120,6 +120,9 @@ pub struct PraosControl {
     /// fake-EB pen-test family). `None` = honest; `Some(kind)` picks which
     /// variant — see [`FakeEbKind`].
     pub fake_eb: Option<FakeEbKind>,
+    /// Instruct node to avoid blocks in the blacklist: the chain with them is not
+    /// adopted, and their heirs cannot be produced.
+    pub rb_blacklist: Vec<[u8; 32]>,
 }
 
 /// Which fabricated-EB pen-test to run, and its manifest size. The family
