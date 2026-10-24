@@ -476,6 +476,12 @@ impl PraosState {
     /// once per slot by the I/O wrapper.
     pub fn apply_control(&mut self, control: &crate::behaviour::tree::control::ControlSignal) {
         self.control = control.clone();
+        // Actuate the RB blacklist: push the control's current set all the way
+        // down into the chain tree's `blacklist` field, so blacklisted blocks
+        // (and their heirs) are excluded from chain selection and production.
+        // The set is replaced wholesale each tick, so an empty set — the honest
+        // default, or the `blacklist-blocks` action deselected — clears it.
+        self.chain_tree.update_blacklist(&self.control.praos.rb_blacklist);
     }
 
     /// Replace the block-fetch policy.
@@ -2688,6 +2694,23 @@ mod tests {
         s.apply_control(&cs);
         assert_eq!(s.control.praos.reorg_depth, Some(7));
         assert!(s.control.praos.drop_inbound);
+    }
+
+    #[test]
+    fn apply_control_pushes_rb_blacklist_to_chain_tree() {
+        use crate::behaviour::tree::control::ControlSignal;
+        let mut s = fresh();
+        let mut cs = ControlSignal::default();
+        cs.praos.rb_blacklist.push(h(3));
+        cs.praos.rb_blacklist.push(h(7));
+        // Applying the control signal drives the blacklist all the way down
+        // into the chain tree's blacklist field.
+        s.apply_control(&cs);
+        assert!(s.chain_tree.get_blacklist().contains(&h(3)));
+        assert!(s.chain_tree.get_blacklist().contains(&h(7)));
+        // An honest (empty) control signal clears it again.
+        s.apply_control(&ControlSignal::default());
+        assert!(s.chain_tree.get_blacklist().is_empty());
     }
 
     fn h(seed: u8) -> [u8; 32] {

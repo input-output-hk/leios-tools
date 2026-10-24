@@ -163,6 +163,24 @@ pub fn build_action(
             count: *count,
             n_txs: *n_txs,
         }),
+        ActionSpec::BlacklistBlocks { blocks } => {
+            // Parse the 64-char hex hashes up front; skip (and warn on) any
+            // malformed entry so one bad hash doesn't disable the whole list.
+            let mut parsed = Vec::new();
+            for s in blocks {
+                match crate::types::hash_from_hex::<32>(s) {
+                    Ok(h) => {
+                        parsed.push(h);
+                    }
+                    Err(e) => tracing::warn!(
+                        hash = %s,
+                        error = %e,
+                        "blacklist-blocks: skipping invalid block hash"
+                    ),
+                }
+            }
+            Box::new(catalogue::BlacklistBlocks { blocks: parsed })
+        }
     }
 }
 
@@ -208,5 +226,28 @@ mod tests {
         let (s, out) = tick_once(a.as_mut());
         assert_eq!(s, Status::Running);
         assert_eq!(out.leios.vote, VotePolicy::Abstain(NoVoteReason::Declined));
+    }
+
+    #[test]
+    fn build_action_blacklist_blocks_parses_hex() {
+        let hex = "03".repeat(32); // 64 hex chars → [3u8; 32]
+        let mut a = build_action(&ActionSpec::BlacklistBlocks { blocks: vec![hex] }, 0);
+        let (s, out) = tick_once(a.as_mut());
+        assert_eq!(s, Status::Running);
+        assert!(out.praos.rb_blacklist.contains(&[3u8; 32]));
+    }
+
+    #[test]
+    fn build_action_blacklist_blocks_skips_malformed_hex() {
+        let mut a = build_action(
+            &ActionSpec::BlacklistBlocks {
+                blocks: vec!["not-hex".to_string(), "03".repeat(32)],
+            },
+            0,
+        );
+        let (_s, out) = tick_once(a.as_mut());
+        // The one valid hash is installed; the malformed one is skipped.
+        assert_eq!(out.praos.rb_blacklist.len(), 1);
+        assert!(out.praos.rb_blacklist.contains(&[3u8; 32]));
     }
 }
