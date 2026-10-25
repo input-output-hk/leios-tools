@@ -247,14 +247,12 @@ pub enum ActionSpec {
         #[serde(default = "default_tx_flood_rate")]
         rate: u32,
     },
-    /// blacklist-blocks — mark a fixed list of RB block hashes as blacklisted.
-    /// The chain carrying any of them is never adopted and their heirs can't be
-    /// produced. `blocks` are 64-char hex hashes; the Praos actuator pushes the
-    /// resolved set into the chain tree's `blacklist` field.
+    /// blacklist-blocks — blacklist the ancestor `offset` blocks behind the
+    /// common chain tip supplied through `env.tip` (`0` = the tip itself).
     #[serde(rename = "blacklist-blocks")]
     BlacklistBlocks {
         #[serde(default)]
-        blocks: Vec<String>,
+        offset: u64,
     },
 }
 

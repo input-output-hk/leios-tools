@@ -1,64 +1,55 @@
-//! `blacklist-blocks` — mark a fixed set of RB block hashes as blacklisted.
+//! `blacklist-blocks` — blacklist an RB at an offset from a supplied chain tip.
 //!
-//! Writes the configured block hashes into `praos.rb_blacklist`. The Praos
-//! actuator ([`PraosState::apply_control`](crate::praos::PraosState::apply_control))
-//! pushes that set all the way down into the chain tree's `blacklist` field, so
-//! the blacklisted blocks — and every heir of theirs — can never win chain
-//! selection (the chain carrying them is not adopted) nor be produced upon.
-//!
-//! The set is a *union* contributor: each active `blacklist-blocks` leaf adds
-//! its hashes to the slot's control signal, so several lists compose. An empty
-//! list (or the action deselected) leaves `rb_blacklist` at its honest default,
-//! which clears the chain tree's blacklist on the next actuation. Returns
-//! `Running` while installed.
-
-use std::collections::BTreeSet;
+//! Reads the common cluster `tip` from the behaviour environment and writes it,
+//! together with the configured ancestor offset, into the Praos control signal.
+//! The Praos actuator resolves that pair against its chain tree and installs the
+//! resulting block hash into the blacklist. `offset = 0` blacklists the tip.
 
 use crate::behaviour::tree::actions::LeafAction;
 use crate::behaviour::tree::control::ControlSignal;
 use crate::behaviour::tree::env::{ConsensusCtx, TickCtx};
-use crate::behaviour::tree::Status;
+use crate::behaviour::tree::{EnvValue, Status};
+use crate::types::hash_from_hex;
 
-/// Blacklist a fixed list of 32-byte RB block hashes.
+/// Blacklist the ancestor `blocks_offset` blocks behind `env.tip`.
 #[derive(Debug, Clone, Default)]
 pub struct BlacklistBlocks {
-    /// The block hashes to blacklist.
-    pub blocks: Vec<[u8; 32]>,
+    /// Number of parent links from the supplied tip (`0` = the tip itself).
+    pub blocks_offset: u64,
 }
-
 impl BlacklistBlocks {
-    /// Build from any iterator of 32-byte hashes.
-    pub fn new(blocks: impl IntoIterator<Item = [u8; 32]>) -> Self {
+    pub fn new(blocks_offset: u64) -> Self {
         Self {
-            blocks: blocks.into_iter().collect(),
+            blocks_offset,
         }
     }
 }
 
 impl LeafAction<ConsensusCtx, ControlSignal> for BlacklistBlocks {
-    fn contribute(&mut self, _ctx: &TickCtx, out: &mut ControlSignal) -> Status {
-        // Union into the slot's blacklist so multiple active contributors
-        // New action replaces the list.
-        out.praos.rb_blacklist = self.blocks.clone();
+    fn contribute(&mut self, ctx: &TickCtx, out: &mut ControlSignal) -> Status {
+        let Some(EnvValue::Str(tip)) = ctx.env.get("tip") else {
+            tracing::warn!(
+                "BlacklistBlocks::contribute: missing or non-string 'tip' environment: {:?}",
+                ctx.env.get("tip")
+            );
+            return Status::Failure;
+        };
+        let Ok(tip) = hash_from_hex::<32>(tip) else {
+            tracing::warn!("BlacklistBlocks::contribute: invalid 'tip' environment");
+            return Status::Failure;
+        };
+        out.praos.rb_blacklist_tip = tip;
+        out.praos.rb_blacklist_offset = self.blocks_offset;
         Status::Running
     }
 
-    /// Live-retune the blacklisted set without rebuilding the tree. Accepts a
-    /// TOML array of 64-char hex hashes; malformed entries are skipped.
+    /// Live-retune the ancestor offset without rebuilding the tree.
     fn set_param(&mut self, field: &str, value: &toml::Value) {
-        if field != "blocks" {
+        if field != "offset" {
             return;
         }
-        let Some(arr) = value.as_array() else {
-            return;
-        };
-        self.blocks = Vec::new();
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                if let Ok(h) = crate::types::hash_from_hex::<32>(s) {
-                    self.blocks.push(h);
-                }
-            }
+        if let Some(offset) = value.as_integer() {
+            self.blocks_offset = offset.max(0) as u64;
         }
     }
 }
@@ -66,39 +57,59 @@ impl LeafAction<ConsensusCtx, ControlSignal> for BlacklistBlocks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::behaviour::tree::env::{DynamicEnv, NativeChainState};
 
-    #[test]
-    fn contributes_blocks_to_rb_blacklist() {
-        let ctx = TickCtx::default();
+    fn contribute(action: &mut BlacklistBlocks, tip: Option<EnvValue>) -> (Status, ControlSignal) {
+        let mut env = DynamicEnv::new();
+        if let Some(tip) = tip {
+            env.insert("tip", tip);
+        }
+        let state = NativeChainState::default();
+        let ctx = TickCtx {
+            env: &env,
+            state: &state,
+            ..Default::default()
+        };
         let mut out = ControlSignal::default();
-        let s = BlacklistBlocks::new([[3u8; 32], [7u8; 32]]).contribute(&ctx, &mut out);
-        assert_eq!(s, Status::Running);
-        assert!(out.praos.rb_blacklist.contains(&[3u8; 32]));
-        assert!(out.praos.rb_blacklist.contains(&[7u8; 32]));
-        // Honest default blacklists nothing.
-        assert!(ControlSignal::default().praos.rb_blacklist.is_empty());
+        let status = action.contribute(&ctx, &mut out);
+        (status, out)
     }
 
     #[test]
-    fn contribute_replaces_old_value() {
-        let ctx = TickCtx::default();
-        let mut out = ControlSignal::default();
-        out.praos.rb_blacklist.push([1u8; 32]);
-        BlacklistBlocks::new([[2u8; 32]]).contribute(&ctx, &mut out);
-        assert!(!out.praos.rb_blacklist.contains(&[1u8; 32]));
-        assert!(out.praos.rb_blacklist.contains(&[2u8; 32]));
+    fn contributes_tip_and_offset() {
+        let mut action = BlacklistBlocks::new(7);
+        let (status, out) = contribute(
+            &mut action,
+            Some(EnvValue::Str("03".repeat(32))),
+        );
+        assert_eq!(status, Status::Running);
+        assert_eq!(out.praos.rb_blacklist_tip, [3u8; 32]);
+        assert_eq!(out.praos.rb_blacklist_offset, 7);
     }
 
     #[test]
-    fn set_param_replaces_blocks_from_hex_array() {
-        let mut a = BlacklistBlocks::new([[1u8; 32]]);
-        let hex = "03".repeat(32); // 64 hex chars → [3u8; 32]
-        a.set_param("blocks", &toml::Value::Array(vec![toml::Value::String(hex)]));
-        assert_eq!(a.blocks.len(), 1);
-        assert!(a.blocks.contains(&[3u8; 32]));
-        // Unknown field is ignored.
+    fn contribute_fails_for_missing_or_invalid_tip() {
+        let mut action = BlacklistBlocks::new(2);
+        assert_eq!(contribute(&mut action, None).0, Status::Failure);
+        assert_eq!(
+            contribute(&mut action, Some(EnvValue::Str("not-hex".to_string()))).0,
+            Status::Failure
+        );
+        assert_eq!(
+            contribute(&mut action, Some(EnvValue::U64(3))).0,
+            Status::Failure
+        );
+    }
+
+    #[test]
+    fn set_param_updates_offset() {
+        let mut a = BlacklistBlocks::new(1);
+        a.set_param("offset", &toml::Value::Integer(9));
+        assert_eq!(a.blocks_offset, 9);
+        a.set_param("offset", &toml::Value::Integer(-1));
+        assert_eq!(a.blocks_offset, 0);
         a.set_param("nope", &toml::Value::Integer(1));
-        assert!(a.blocks.contains(&[3u8; 32]));
+        assert_eq!(a.blocks_offset, 0);
     }
 }
 

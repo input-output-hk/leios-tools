@@ -475,13 +475,52 @@ impl PraosState {
     /// produced by the BT tick, storing it for the actuators to read. Called
     /// once per slot by the I/O wrapper.
     pub fn apply_control(&mut self, control: &crate::behaviour::tree::control::ControlSignal) {
+        let previous_request = (
+            self.control.praos.rb_blacklist_tip,
+            self.control.praos.rb_blacklist_offset,
+        );
+        let previous_blacklist = self.chain_tree.get_blacklist().clone();
         self.control = control.clone();
-        // Actuate the RB blacklist: push the control's current set all the way
-        // down into the chain tree's `blacklist` field, so blacklisted blocks
-        // (and their heirs) are excluded from chain selection and production.
-        // The set is replaced wholesale each tick, so an empty set — the honest
-        // default, or the `blacklist-blocks` action deselected — clears it.
-        self.chain_tree.update_blacklist(&self.control.praos.rb_blacklist);
+        // Resolve the requested ancestor against the locally-visible chain.
+        // Unknown tips, ancestry gaps, an out-of-range offset, and the honest
+        // zero-tip default all resolve to an empty list and clear the blacklist.
+        let tip = self.control.praos.rb_blacklist_tip;
+        let offset = self.control.praos.rb_blacklist_offset;
+        let ancestors = self
+            .chain_tree
+            .block_number(&tip)
+            .map(|_| self.chain_tree.ancestors(tip));
+        let blacklisted_hash = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| ancestors.as_ref()?.get(offset).copied());
+        let blacklisted: Vec<_> = blacklisted_hash.into_iter().collect();
+        self.chain_tree.update_blacklist(&blacklisted);
+
+        let request_changed = previous_request != (tip, offset);
+        let blacklist_changed = &previous_blacklist != self.chain_tree.get_blacklist();
+        if request_changed || blacklist_changed {
+            match blacklisted_hash {
+                Some(hash) => info!(
+                    node_id = %self.node_id,
+                    tip = %hex32(&tip),
+                    offset,
+                    blacklisted = %hex32(&hash),
+                    "RB blacklist applied"
+                ),
+                None if tip != [0; 32] => warn!(
+                    node_id = %self.node_id,
+                    tip = %hex32(&tip),
+                    offset,
+                    tip_known = ancestors.is_some(),
+                    visible_ancestors = ancestors.as_ref().map_or(0, Vec::len),
+                    "RB blacklist request could not be resolved; blacklist cleared"
+                ),
+                None => info!(
+                    node_id = %self.node_id,
+                    "RB blacklist cleared"
+                ),
+            }
+        }
     }
 
     /// Replace the block-fetch policy.
@@ -581,7 +620,7 @@ impl PraosState {
     }
 
     fn is_rb_blacklisted(&self, rb: &[u8; 32]) -> bool {
-        self.control.praos.rb_blacklist.contains(rb)
+        self.chain_tree.is_blacklisted(*rb)
     }
 
     /// Hash of the currently adopted tip, if any.
@@ -2697,19 +2736,49 @@ mod tests {
     }
 
     #[test]
-    fn apply_control_pushes_rb_blacklist_to_chain_tree() {
+    fn apply_control_resolves_rb_blacklist_offset_into_chain_tree() {
         use crate::behaviour::tree::control::ControlSignal;
         let mut s = fresh();
+        for seed in 1..=5 {
+            let prev = (seed > 1).then(|| h(seed - 1));
+            s.chain_tree.insert(
+                h(seed),
+                pt(seed as u64, seed),
+                seed as u64,
+                seed as u64,
+                prev,
+                0,
+                None,
+                false,
+            );
+        }
         let mut cs = ControlSignal::default();
-        cs.praos.rb_blacklist.push(h(3));
-        cs.praos.rb_blacklist.push(h(7));
-        // Applying the control signal drives the blacklist all the way down
-        // into the chain tree's blacklist field.
+        cs.praos.rb_blacklist_tip = h(5);
+        cs.praos.rb_blacklist_offset = 2;
         s.apply_control(&cs);
         assert!(s.chain_tree.get_blacklist().contains(&h(3)));
-        assert!(s.chain_tree.get_blacklist().contains(&h(7)));
-        // An honest (empty) control signal clears it again.
+        assert_eq!(s.chain_tree.get_blacklist().len(), 1);
+
+        // An honest control signal has an unknown zero tip and clears it again.
         s.apply_control(&ControlSignal::default());
+        assert!(s.chain_tree.get_blacklist().is_empty());
+    }
+
+    #[test]
+    fn apply_control_clears_blacklist_for_unknown_tip_or_large_offset() {
+        use crate::behaviour::tree::control::ControlSignal;
+        let mut s = fresh();
+        s.chain_tree
+            .insert(h(1), pt(1, 1), 1, 1, None, 0, None, false);
+
+        let mut cs = ControlSignal::default();
+        cs.praos.rb_blacklist_tip = h(9);
+        s.apply_control(&cs);
+        assert!(s.chain_tree.get_blacklist().is_empty());
+
+        cs.praos.rb_blacklist_tip = h(1);
+        cs.praos.rb_blacklist_offset = 1;
+        s.apply_control(&cs);
         assert!(s.chain_tree.get_blacklist().is_empty());
     }
 
