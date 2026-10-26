@@ -48,9 +48,93 @@ pub fn inline_leios_transaction(era: u32, tx: &[u8]) -> Result<(Cow<'_, [u8]>, b
     Ok((Cow::Owned(leios), valid))
 }
 
+/// Encode a validated mempool transaction for a Dijkstra ranking block.
+/// Mempool form is [body, witnesses, auxiliary_data]; the legacy submission
+/// form [body, witnesses, true, auxiliary_data] is also accepted. In-block
+/// form is [body, witnesses, auxiliary_data, true]. Preserve signed fields.
+/// This does not validate scripts: the caller must have accepted the transaction.
+pub fn leios_inline_transaction(tx: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut d = Decoder::new(tx);
+    let count = d.array()?;
+    if !matches!(count, Some(3 | 4) | None) {
+        return Err(Error::message("unsupported mempool transaction shape"));
+    }
+    let start = d.position();
+    for _ in 0..2 {
+        if !matches!(d.datatype()?, Type::Map | Type::MapIndef) {
+            return Err(Error::message(
+                "transaction body and witnesses must be maps",
+            ));
+        }
+        d.skip()?;
+    }
+    let witness_end = d.position();
+    let legacy = count == Some(4) || (count.is_none() && d.datatype()? == Type::Bool);
+    if legacy && !d.bool()? {
+        return Err(Error::message("invalid script flag in mempool transaction"));
+    }
+    let aux_start = d.position();
+    if !matches!(
+        d.datatype()?,
+        Type::Map | Type::MapIndef | Type::Null | Type::Tag
+    ) {
+        return Err(Error::message("unsupported auxiliary data"));
+    }
+    d.skip()?;
+    let aux_end = d.position();
+    if count.is_none() {
+        if d.datatype()? != Type::Break {
+            return Err(Error::message("extra mempool transaction fields"));
+        }
+        d.skip()?;
+    }
+    if d.position() != tx.len() {
+        return Err(Error::message("trailing mempool transaction data"));
+    }
+    let mut inline = Vec::with_capacity(tx.len() + 1);
+    inline.push(0x84);
+    inline.extend_from_slice(&tx[start..witness_end]);
+    inline.extend_from_slice(&tx[aux_start..aux_end]);
+    inline.push(0xf5);
+    Ok(inline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outbound_matches_captured_haskell_inline() {
+        let leios = include_bytes!("../test_data/haskell-leios-tx.cbor");
+        let inline = include_bytes!("../test_data/haskell-inline-tx.cbor");
+        assert_eq!(leios_inline_transaction(leios).unwrap(), inline);
+        let parts = &leios[1..];
+        let mut d = Decoder::new(parts);
+        d.skip().unwrap();
+        d.skip().unwrap();
+        let split = d.position();
+        let legacy = [
+            vec![0x84],
+            parts[..split].to_vec(),
+            vec![0xf5],
+            parts[split..].to_vec(),
+        ]
+        .concat();
+        assert_eq!(leios_inline_transaction(&legacy).unwrap(), inline);
+        assert_eq!(
+            leios_inline_transaction(&[0x9f, 0xa0, 0xa0, 0xf6, 0xff]).unwrap(),
+            [0x84, 0xa0, 0xa0, 0xf6, 0xf5]
+        );
+        for bad in [
+            &[0x84, 0xa0, 0xa0, 0xf4, 0xf6][..],
+            &[0x84, 0xa0, 0xa0, 0xf6, 0xf5],
+            &[0x83, 0xa0, 0xa0],
+            &[0x83, 0xa0, 0xa0, 0xf6, 0x00],
+            &[0x9f, 0xa0, 0xa0, 0xf6],
+            &[0x83, 0x01, 0xa0, 0xf6],
+        ] {
+            assert!(leios_inline_transaction(bad).is_err());
+        }
+    }
     #[test]
     fn captured_haskell_inline_identity() {
         let inline = include_bytes!("../test_data/haskell-inline-tx.cbor");
