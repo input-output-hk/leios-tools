@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use shared_consensus::mempool::TxId;
 use shared_consensus::leios::bitmap_length;
+use shared_consensus::mempool::TxId;
 
 use shared_consensus::behaviour::actions::equivocation_bucket;
 use shared_consensus::behaviour::tree::control::OutboundControl;
@@ -1032,7 +1032,10 @@ pub async fn serve_leios_notify(
                     return;
                 }
             }
-            LnMsg::MsgDone => break,
+            LnMsg::MsgQuit => {
+                let _ = runner.send(&LnMsg::MsgDone).await;
+                break;
+            }
             _ => break,
         }
     }
@@ -1247,7 +1250,9 @@ pub async fn serve_leios_fetch(
                     "leios_fetch: downstream requested EB txs from us"
                 );
                 let transactions = match &point {
-                    Point::Specific { slot, hash } => store.get_block_txs(*slot, hash, &bitmap, peer),
+                    Point::Specific { slot, hash } => {
+                        store.get_block_txs(*slot, hash, &bitmap, peer)
+                    }
                     Point::Origin => None,
                 };
                 let Some(transactions) = transactions else {
@@ -1509,7 +1514,11 @@ mod tests {
             .expect("parked intersect must answer once seeded")
             .expect("client task join");
         let (point, _tip) = result.unwrap().unwrap();
-        assert_eq!(point, make_point(5), "must intersect at the shared point, not Origin");
+        assert_eq!(
+            point,
+            make_point(5),
+            "must intersect at the shared point, not Origin"
+        );
 
         server_handle.abort();
         mux_a.abort();
@@ -1568,13 +1577,10 @@ mod tests {
 
         // Past the deadline the server answers from the unseeded store instead
         // of holding the connection open until the peer kills it.
-        let answered = tokio::time::timeout(
-            PARK_UNSEEDED_INTERSECT_MAX * 2,
-            client_task,
-        )
-        .await
-        .expect("park must expire and answer, not hang until the peer times out")
-        .expect("client task join");
+        let answered = tokio::time::timeout(PARK_UNSEEDED_INTERSECT_MAX * 2, client_task)
+            .await
+            .expect("park must expire and answer, not hang until the peer times out")
+            .expect("client task join");
         assert!(
             answered.is_ok(),
             "the expired park must still produce a well-formed ChainSync reply"

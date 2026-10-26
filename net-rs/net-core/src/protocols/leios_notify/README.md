@@ -1,55 +1,37 @@
-# LeiosNotify (Protocol ID 18) — CIP-0164
+# LeiosNotify (protocol 18)
 
-Client-driven polling for Leios data announcements. Server notifies the client about available endorser blocks (EBs), EB transactions, and votes. The client uses these offers to decide what to fetch via [LeiosFetch](../leios_fetch/).
+Client polling for Leios announcements, endorser-block offers, transaction
+offers, and votes. This implementation uses the **rc-2026w41** wire format.
+It is incompatible with earlier prototype message tags.
 
-## Files
+The codec follows `encodeLeiosNotify` / `decodeLeiosNotify` in
+[ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestNotify.hs).
 
-| File | Description |
-|------|-------------|
-| `mod.rs` | State machine (`State`, `Message`), `Protocol` impl, `LeiosNotifyEvent` helper enum |
-| `codec.rs` | CBOR encode/decode for LeiosNotify messages |
+| Message | Wire value | Transition |
+| --- | --- | --- |
+| Done | `[0]` | Quit → Done |
+| Quit | `[1]` | Idle → Quit |
+| Canceled | `[2]` | Busy → Idle |
+| RequestNext | `[3]` | Idle → Busy |
+| BlockAnnouncement | `[4, header]` | Busy → Idle |
+| BlockOffer | `[5, point, size]` | Busy → Idle |
+| BlockTxsOffer | `[6, point]` | Busy → Idle |
+| Votes | `[7, votes]` | Busy → Idle |
 
-## State Machine
+Wire values are Concise Binary Object Representation (CBOR) arrays. A `point`
+is `[slot, hash32]`; `size` is the offered endorser-block byte size. A vote is
+`[announcing_ranking_block_hash, voter_id, signature]`. Transition names omit
+the `St` prefix used by the Rust enum.
 
-```mermaid
-stateDiagram-v2
-    [*] --> StIdle
-    StIdle --> StBusy : MsgLeiosNotificationRequestNext
-    StIdle --> StDone : MsgDone
-    StBusy --> StIdle : MsgLeiosBlockAnnouncement
-    StBusy --> StIdle : MsgLeiosBlockOffer
-    StBusy --> StIdle : MsgLeiosBlockTxsOffer
-    StBusy --> StIdle : MsgLeiosVotesOffer
-    StDone --> [*]
-```
+The client has agency in Idle; the server has agency in Busy and Quit.
+Done has no agency. Idle and Busy have no timeout (notification long polling).
+Quit waits at most 120 seconds for the server acknowledgement. Messages are
+limited to 65,535 bytes, with a 65,536-byte ingress buffer and at most 1,024 votes.
 
-## Agency Table
+`request_next` returns an announcement, offer, or votes. On Canceled it completes
+the Quit/Done exchange and returns `ProtocolError::Terminated`.
+`done` sends Quit and waits for Done. The helpers are non-pipelined; they do not
+send a concurrent Quit while a request is outstanding.
 
-| State | Agency | Message | Next State |
-|-------|--------|---------|------------|
-| StIdle | **Client** | MsgLeiosNotificationRequestNext | StBusy |
-| StIdle | **Client** | MsgDone | StDone |
-| StBusy | **Server** | MsgLeiosBlockAnnouncement(header) | StIdle |
-| StBusy | **Server** | MsgLeiosBlockOffer(slot, hash) | StIdle |
-| StBusy | **Server** | MsgLeiosBlockTxsOffer(slot, hash) | StIdle |
-| StBusy | **Server** | MsgLeiosVotesOffer(votes) | StIdle |
-| StDone | Nobody | — | — |
-
-## Limits
-
-- **Max message size**: 65,535 bytes
-- **Ingress limit**: 65,536 bytes
-- **Max votes per offer**: 1,024
-- **Timeout**: busy 60s
-
-## Messages
-
-- **MsgLeiosBlockAnnouncement** — RB header that announces an EB (carries the EB hash in CIP-0164 header extension)
-- **MsgLeiosBlockOffer** — an EB is available for fetching (slot + hash)
-- **MsgLeiosBlockTxsOffer** — an EB's transactions are available (slot + hash)
-- **MsgLeiosVotesOffer** — a batch of votes is available (list of `(slot, voter_id)` keys)
-
-## Client Helper
-
-- `request_next(runner) -> Result<LeiosNotifyEvent>` — poll for next notification
-- `LeiosNotifyEvent` enum: `BlockAnnouncement`, `BlockOffer`, `BlockTxsOffer`, `VotesOffer`
+Tests use exact vectors derived from the Haskell encoder and explicitly labelled
+historical payloads with updated tags. These are not fresh live-network captures.

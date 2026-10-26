@@ -1,16 +1,17 @@
 //! CBOR encoding for LeiosNotify messages.
 //!
-//! Wire format (CIP-0164 prototype, cardano-blueprint `leios-prototype`):
-//!   msgLeiosNotificationRequestNext = [0]
-//!   msgLeiosBlockAnnouncement       = [1, announcement]
-//!   msgLeiosBlockOffer              = [2, point, eb_size]   eb_size = word32
-//!   msgLeiosBlockTxsOffer           = [3, point]            point = [slot, hash32]
-//!   msgLeiosVotes                   = [4, [vote, ...]]
-//!   msgClientDone                   = [5]
+//! Wire format (Leios prototype rc-2026w41):
+//!   msgLeiosNotificationRequestNext = [3]
+//!   msgLeiosBlockAnnouncement       = [4, announcement]
+//!   msgLeiosBlockOffer              = [5, point, eb_size]   eb_size = word32
+//!   msgLeiosBlockTxsOffer           = [6, point]            point = [slot, hash32]
+//!   msgLeiosVotes                   = [7, [vote, ...]]
+//!   msgDone                         = [0]
+//!   msgQuit                         = [1]
+//!   msgCanceled                     = [2]
 //!
-//!   vote = [slot, eb_hash, voter_id, vote_signature]
-//!     slot           : uint
-//!     eb_hash        : bytes .size 32
+//!   vote = [announcing_rb_hash, voter_id, vote_signature]
+//!     announcing_rb_hash : bytes .size 32
 //!     voter_id       : word16
 //!     vote_signature : bytes  (BLS signature; length set by the deployment)
 //!
@@ -34,27 +35,27 @@ impl minicbor::Encode<()> for Message {
         match self {
             Message::MsgLeiosNotificationRequestNext => {
                 e.array(1)?;
-                e.u32(0)?;
+                e.u32(3)?;
             }
             Message::MsgLeiosBlockAnnouncement { header } => {
                 e.array(2)?;
-                e.u32(1)?;
+                e.u32(4)?;
                 minicbor::Encode::encode(header, e, &mut ())?;
             }
             Message::MsgLeiosBlockOffer { point, eb_size } => {
                 e.array(3)?;
-                e.u32(2)?;
+                e.u32(5)?;
                 minicbor::Encode::encode(point, e, &mut ())?;
                 e.u32(*eb_size)?;
             }
             Message::MsgLeiosBlockTxsOffer { point } => {
                 e.array(2)?;
-                e.u32(3)?;
+                e.u32(6)?;
                 minicbor::Encode::encode(point, e, &mut ())?;
             }
             Message::MsgLeiosVotes { votes } => {
                 e.array(2)?;
-                e.u32(4)?;
+                e.u32(7)?;
                 e.array(votes.len() as u64)?;
                 for vote in votes {
                     // vote = [announcing_rb_hash, voter_id, vote_signature]
@@ -64,9 +65,17 @@ impl minicbor::Encode<()> for Message {
                     e.bytes(&vote.vote_signature)?;
                 }
             }
+            Message::MsgQuit => {
+                e.array(1)?;
+                e.u32(1)?;
+            }
+            Message::MsgCanceled => {
+                e.array(1)?;
+                e.u32(2)?;
+            }
             Message::MsgDone => {
                 e.array(1)?;
-                e.u32(5)?;
+                e.u32(0)?;
             }
         }
         Ok(())
@@ -79,25 +88,27 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
         let tag = d.u32()?;
 
         let msg = match tag {
-            0 => Message::MsgLeiosNotificationRequestNext,
-            1 => {
+            3 => Message::MsgLeiosNotificationRequestNext,
+            4 => {
                 let header = WrappedHeader::decode(d, &mut ())?;
                 Message::MsgLeiosBlockAnnouncement { header }
             }
-            2 => {
+            5 => {
                 let point = Point::decode(d, &mut ())?;
                 let eb_size = d.u32()?;
                 Message::MsgLeiosBlockOffer { point, eb_size }
             }
-            3 => {
+            6 => {
                 let point = Point::decode(d, &mut ())?;
                 Message::MsgLeiosBlockTxsOffer { point }
             }
-            4 => {
+            7 => {
                 let votes = decode_votes(d)?;
                 Message::MsgLeiosVotes { votes }
             }
-            5 => Message::MsgDone,
+            0 => Message::MsgDone,
+            1 => Message::MsgQuit,
+            2 => Message::MsgCanceled,
             other => {
                 return Err(DecodeError::message(format!(
                     "unknown leios_notify message tag: {other}"
@@ -108,9 +119,9 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
         // Tolerate (and skip) any trailing elements beyond the fields we
         // read — keeps us forward-compatible with added fields.
         let consumed = match tag {
-            0 | 5 => 1,     // tag only
-            1 | 3 | 4 => 2, // tag + payload
-            2 => 3,         // tag + point + eb_size
+            0..=3 => 1,     // tag only
+            4 | 6 | 7 => 2, // tag + payload
+            5 => 3,         // tag + point + eb_size
             _ => unreachable!(),
         };
         skip_trailing(d, len, consumed)?;
@@ -125,6 +136,9 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
 fn skip_trailing(d: &mut Decoder<'_>, len: Option<u64>, consumed: u64) -> Result<(), DecodeError> {
     match len {
         Some(n) => {
+            if n < consumed {
+                return Err(DecodeError::message("LeiosNotify array is too short"));
+            }
             for _ in consumed..n {
                 d.skip()?;
             }
@@ -342,14 +356,14 @@ mod tests {
         assert!(matches!(decoded, Message::MsgDone));
     }
 
-    // -- Capture-based vectors (raw frames from leios-node.play.dev.cardano.org) --
+    // -- Historical payload vectors with w41 message tags --
 
-    /// Real `msgLeiosBlockOffer` bytes captured off the wire:
-    /// `[2, [slot, eb_hash], eb_size]`.
+    /// Historical captured offer payload, re-tagged for w41:
+    /// `[5, [slot, eb_hash], eb_size]`. This is not a fresh w41 capture.
     #[test]
-    fn decode_captured_block_offer() {
+    fn decode_retagged_historical_block_offer() {
         let bytes = hex(
-            "8302821a0005dfc75820630ee36ae6a20e024a30cb582b3fcd1fd3a1aa0df16c1c7be53fea9ac3f1f70b1941d3",
+            "8305821a0005dfc75820630ee36ae6a20e024a30cb582b3fcd1fd3a1aa0df16c1c7be53fea9ac3f1f70b1941d3",
         );
         let decoded: Message = minicbor::decode(&bytes).unwrap();
         match &decoded {
@@ -362,23 +376,17 @@ mod tests {
             }
             other => panic!("expected MsgLeiosBlockOffer, got {other:?}"),
         }
-        // Our encoder reproduces the captured bytes exactly.
+        // Our encoder reproduces the re-tagged vector exactly.
         assert_eq!(minicbor::to_vec(&decoded).unwrap(), bytes);
     }
 
-    /// Synthetic `msgLeiosVotes` bytes shaped like the live wire format:
-    /// `[4, [[slot, eb_hash, voter_id, bls_sig]]]` with a 48-byte BLS
-    /// signature.  Replace with a real captured frame once we have one
-    /// from the dev relay (TODO: capture and lock in the actual sig
-    /// length the deployment is using).
+    /// Historical w27 vote payload with the w41 message tag.
+    /// The payload was captured; the outer tag is adjusted, not captured.
     #[test]
-    fn decode_synthetic_bls_votes() {
-        // Real MsgLeiosVotes captured off the 2026w27 leios-prototype dev
-        // relay. vote = [announcing_rb_hash: hash32, voter_id: word16,
-        // vote_signature: bytes .size 48] (blueprint pr-67 CDDL).
+    fn decode_retagged_historical_votes() {
         let bytes = hex(concat!(
             "82",                                                               // array(2)
-            "04",   // tag = 4 (MsgLeiosVotes)
+            "07",   // tag = 7 (MsgLeiosVotes)
             "81",   // votes array(1)
             "83",   // vote array(3)
             "5820", // bytes(32) header
@@ -413,7 +421,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(2).unwrap();
-        e.u32(4).unwrap();
+        e.u32(7).unwrap();
         e.array(1).unwrap();
         e.array(4).unwrap(); // 4-element vote: 3 known + 1 future field
         e.bytes(&[0xAB; 32]).unwrap(); // announcing_rb_hash
@@ -436,8 +444,8 @@ mod tests {
     fn block_offer_tolerates_trailing_field() {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
-        e.array(4).unwrap(); // [2, point, eb_size, future]
-        e.u32(2).unwrap();
+        e.array(4).unwrap(); // [5, point, eb_size, future]
+        e.u32(5).unwrap();
         e.array(2).unwrap();
         e.u64(5).unwrap();
         e.bytes(&[0u8; 32]).unwrap();
@@ -459,8 +467,8 @@ mod tests {
 
     #[test]
     fn decode_indefinite_outer_array() {
-        // MsgDone [5] as indefinite: 0x9f 0x05 0xff
-        let cbor = &[0x9f, 0x05, 0xff];
+        // MsgDone [0] as indefinite: 0x9f 0x00 0xff
+        let cbor = &[0x9f, 0x00, 0xff];
         let decoded: Message = minicbor::decode(cbor).unwrap();
         assert!(matches!(decoded, Message::MsgDone));
     }
@@ -471,11 +479,11 @@ mod tests {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(3).unwrap();
-        e.u32(2).unwrap();
+        e.u32(5).unwrap();
         e.array(2).unwrap();
         e.u64(0).unwrap();
         e.bytes(&[0u8; 16]).unwrap(); // 16 bytes, not 32
-        e.u32(0).unwrap();
+        e.u32(3).unwrap();
 
         let result: Result<Message, _> = minicbor::decode(&buf);
         assert!(result.is_err());
@@ -486,7 +494,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(2).unwrap();
-        e.u32(4).unwrap();
+        e.u32(7).unwrap();
         let n = MAX_VOTES + 1;
         e.array(n as u64).unwrap();
         for i in 0..n {
@@ -514,5 +522,75 @@ mod tests {
         let truncated = &encoded[..3];
         let result: Result<Message, _> = minicbor::decode(truncated);
         assert!(result.is_err());
+    }
+
+    // Exact CBOR from the w41 Haskell encoder, not a Rust round trip.
+    // ouroboros-consensus c54515e35498e921cbd651a2c19c3360a41d35b8
+    #[test]
+    fn w41_request_next_wire_vector() {
+        let bytes = [0x81, 0x03];
+        let msg: Message = minicbor::decode(&bytes).unwrap();
+        assert!(matches!(msg, Message::MsgLeiosNotificationRequestNext));
+        assert_eq!(minicbor::to_vec(&msg).unwrap(), bytes);
+    }
+
+    #[test]
+    fn w41_notification_wire_vectors() {
+        // Haskell encodeLeiosNotify at c54515e35498e921cbd651a2c19c3360a41d35b8.
+        // Literal protocol tags: independent of this Rust encoder.
+        let vectors = [
+            (Message::MsgDone, vec![0x81, 0x00]),
+            (Message::MsgQuit, vec![0x81, 0x01]),
+            (Message::MsgCanceled, vec![0x81, 0x02]),
+            (
+                Message::MsgLeiosBlockAnnouncement {
+                    header: WrappedHeader::opaque(vec![0x80]),
+                },
+                vec![0x82, 0x04, 0x80],
+            ),
+            (
+                Message::MsgLeiosVotes { votes: vec![] },
+                vec![0x82, 0x07, 0x80],
+            ),
+        ];
+        for (expected, bytes) in vectors {
+            let decoded: Message = minicbor::decode(&bytes).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(minicbor::to_vec(&expected).unwrap(), bytes);
+            assert_eq!(minicbor::to_vec(&decoded).unwrap(), bytes);
+        }
+        let point = Point::Specific {
+            slot: 42,
+            hash: [0xab; 32],
+        };
+        let mut offer = vec![0x83, 0x05, 0x82, 0x18, 0x2a, 0x58, 0x20];
+        offer.extend_from_slice(&[0xab; 32]);
+        offer.extend_from_slice(&[0x18, 0x2a]);
+        let decoded: Message = minicbor::decode(&offer).unwrap();
+        assert!(matches!(
+            decoded,
+            Message::MsgLeiosBlockOffer { eb_size: 42, .. }
+        ));
+        assert_eq!(
+            minicbor::to_vec(Message::MsgLeiosBlockOffer {
+                point: point.clone(),
+                eb_size: 42
+            })
+            .unwrap(),
+            offer
+        );
+        assert_eq!(minicbor::to_vec(&decoded).unwrap(), offer);
+        let mut tx_offer = vec![0x82, 0x06, 0x82, 0x18, 0x2a, 0x58, 0x20];
+        tx_offer.extend_from_slice(&[0xab; 32]);
+        let decoded: Message = minicbor::decode(&tx_offer).unwrap();
+        assert!(matches!(decoded, Message::MsgLeiosBlockTxsOffer { .. }));
+        assert_eq!(
+            minicbor::to_vec(Message::MsgLeiosBlockTxsOffer { point }).unwrap(),
+            tx_offer
+        );
+        assert_eq!(minicbor::to_vec(&decoded).unwrap(), tx_offer);
     }
 }

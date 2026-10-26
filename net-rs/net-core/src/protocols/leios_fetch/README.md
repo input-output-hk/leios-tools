@@ -1,57 +1,31 @@
-# LeiosFetch (Protocol ID 19) — CIP-0164
+# LeiosFetch (protocol 19)
 
-Client-driven request/response for Leios data retrieval. Supports fetching individual endorser blocks (EBs), selective transaction fetching via bitmap addressing, vote batches, and block range streaming. Complements [LeiosNotify](../leios_notify/) which provides the offers.
+Request/response protocol for endorser blocks and their transactions. This
+implementation uses the **rc-2026w41** wire format and requires matching peers.
+Offers arrive separately through [LeiosNotify](../leios_notify/).
 
-## Files
+The codec follows `encodeLeiosFetch` / `decodeLeiosFetch` in
+[ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestFetch.hs).
 
-| File | Description |
-|------|-------------|
-| `mod.rs` | State machine (`State`, `Message`), `Protocol` impl |
-| `codec.rs` | CBOR encode/decode for LeiosFetch messages |
+| Message | Wire value | Transition |
+| --- | --- | --- |
+| Done | `[0]` | Idle → Done |
+| BlockRequest | `[1, point]` | Idle → Block |
+| Block | `[2, block]` | Block → Idle |
+| BlockTxsRequest | `[3, point, bitmaps]` | Idle → BlockTxs |
+| BlockTxs | `[4, point, bitmaps, transactions]` | BlockTxs → Idle |
 
-## State Machine
+Wire values are Concise Binary Object Representation (CBOR) arrays. A `point`
+is `[slot, hash32]`; `bitmaps` maps 16-bit segment indices to 64-bit selection
+masks; `transactions` is a list of transaction bodies. Transition names omit
+the `St` prefix used by the Rust enum.
 
-```mermaid
-stateDiagram-v2
-    [*] --> StIdle
-    StIdle --> StBlock : MsgLeiosBlockRequest
-    StIdle --> StBlockTxs : MsgLeiosBlockTxsRequest
-    StIdle --> StVotes : MsgLeiosVotesRequest
-    StIdle --> StBlockRange : MsgLeiosBlockRangeRequest
-    StIdle --> StDone : MsgDone
-    StBlock --> StIdle : MsgLeiosBlock
-    StBlockTxs --> StIdle : MsgLeiosBlockTxs
-    StVotes --> StIdle : MsgLeiosVoteDelivery
-    StBlockRange --> StBlockRange : MsgLeiosNextBlockAndTxsInRange
-    StBlockRange --> StIdle : MsgLeiosLastBlockAndTxsInRange
-    StDone --> [*]
-```
+The client has agency in Idle; the server has agency in Block and BlockTxs.
+Done has no agency. Responses have a 120-second timeout. Block and transaction
+bodies retain their raw CBOR bytes; the consumer interprets their contents.
+There are no vote-fetch or block-range messages in this implementation.
 
-## Agency Table
-
-| State | Agency | Message | Next State |
-|-------|--------|---------|------------|
-| StIdle | **Client** | MsgLeiosBlockRequest(slot, hash) | StBlock |
-| StIdle | **Client** | MsgLeiosBlockTxsRequest(slot, hash, bitmap) | StBlockTxs |
-| StIdle | **Client** | MsgLeiosVotesRequest(votes) | StVotes |
-| StIdle | **Client** | MsgLeiosBlockRangeRequest(start_slot, end_slot, start_hash, end_hash) | StBlockRange |
-| StIdle | **Client** | MsgDone | StDone |
-| StBlock | **Server** | MsgLeiosBlock(block) | StIdle |
-| StBlockTxs | **Server** | MsgLeiosBlockTxs(transactions) | StIdle |
-| StVotes | **Server** | MsgLeiosVoteDelivery(votes) | StIdle |
-| StBlockRange | **Server** | MsgLeiosNextBlockAndTxsInRange(block, txs) | StBlockRange |
-| StBlockRange | **Server** | MsgLeiosLastBlockAndTxsInRange(block, txs) | StIdle |
-| StDone | Nobody | — | — |
-
-## Limits
-
-- **Max message size**: 65,535 bytes (idle), 16,777,216 bytes (data states, 16MB)
-- **Ingress limit**: 16,777,216 bytes
-- **Max bitmap entries**: 1,024
-- **Max transactions**: 65,536
-- **Max votes**: 1,024
-- **Timeout**: server states 120s (large transfers)
-
-## Bitmap TX Addressing
-
-`MsgLeiosBlockTxsRequest` carries a `BTreeMap<u16, u64>` bitmap for selective transaction fetching. Each entry maps a 16-bit segment index to a 64-bit bitmask, allowing the client to request specific transactions from an EB without downloading the entire set. This is critical for bandwidth efficiency when a node already has most transactions from prior dissemination.
+Decoding bounds block bodies to 16 MiB, individual transactions to 64 KiB,
+transaction lists to 65,536 entries, and bitmaps to 1,024 entries. The in-flight
+ingress buffer has a separate 24 MiB cap. Exact message-tag tests use vectors
+derived from the Haskell encoder, not fresh live-network captures.

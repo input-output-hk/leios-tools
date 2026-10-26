@@ -23,9 +23,8 @@ pub const SIZE_LIMIT: usize = 65_535;
 /// Maximum number of votes in a single MsgLeiosVotes.
 pub const MAX_VOTES: usize = 1024;
 
-/// Timeout for StBusy — unused (long-poll: no timeout, see `timeout()`).
-#[allow(dead_code)]
-pub const TIMEOUT_BUSY: Duration = Duration::from_secs(60);
+/// Bound the wait for the server to acknowledge MsgQuit.
+pub const TIMEOUT_QUIT: Duration = Duration::from_secs(120);
 
 // --- State machine ---
 
@@ -36,6 +35,8 @@ pub enum State {
     StIdle,
     /// Server must send one notification. Server has agency.
     StBusy,
+    /// Client has quit; server must acknowledge. Server has agency.
+    StQuit,
     /// Protocol complete. Nobody has agency.
     StDone,
 }
@@ -43,19 +44,23 @@ pub enum State {
 /// LeiosNotify protocol messages.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Client requests the next notification. [0]
+    /// Client requests the next notification. [3]
     MsgLeiosNotificationRequestNext,
-    /// Server announces an RB header containing an EB announcement. [1, header]
+    /// Server announces an RB header containing an EB announcement. [4, header]
     MsgLeiosBlockAnnouncement { header: WrappedHeader },
-    /// Server offers an endorser block for download. [2, point, eb_size]
+    /// Server offers an endorser block for download. [5, point, eb_size]
     MsgLeiosBlockOffer { point: Point, eb_size: u32 },
-    /// Server offers an EB's transactions for download. [3, point]
+    /// Server offers an EB's transactions for download. [6, point]
     MsgLeiosBlockTxsOffer { point: Point },
     /// Server delivers votes inline (no offer/fetch round-trip).
-    /// [4, [vote, ...]] where vote = [slot, eb_hash, voter_id, signature].
+    /// [7, [vote, ...]] where vote = [announcing_rb_hash, voter_id, signature].
     MsgLeiosVotes { votes: Vec<Vote> },
-    /// Client terminates. [5]
+    /// Server acknowledges termination. [0]
     MsgDone,
+    /// Client requests termination. [1]
+    MsgQuit,
+    /// Server cancels the outstanding notification request. [2]
+    MsgCanceled,
 }
 
 // --- Protocol trait ---
@@ -74,7 +79,7 @@ impl Protocol for LeiosNotify {
     fn agency(state: &State) -> Agency {
         match state {
             State::StIdle => Agency::Client,
-            State::StBusy => Agency::Server,
+            State::StBusy | State::StQuit => Agency::Server,
             State::StDone => Agency::Nobody,
         }
     }
@@ -82,7 +87,9 @@ impl Protocol for LeiosNotify {
     fn transition(state: &State, msg: &Message) -> Result<State, ProtocolError> {
         match (state, msg) {
             (State::StIdle, Message::MsgLeiosNotificationRequestNext) => Ok(State::StBusy),
-            (State::StIdle, Message::MsgDone) => Ok(State::StDone),
+            (State::StIdle, Message::MsgQuit) => Ok(State::StQuit),
+            (State::StQuit, Message::MsgDone) => Ok(State::StDone),
+            (State::StBusy, Message::MsgCanceled) => Ok(State::StIdle),
             (State::StBusy, Message::MsgLeiosBlockAnnouncement { .. }) => Ok(State::StIdle),
             (State::StBusy, Message::MsgLeiosBlockOffer { .. }) => Ok(State::StIdle),
             (State::StBusy, Message::MsgLeiosBlockTxsOffer { .. }) => Ok(State::StIdle),
@@ -103,6 +110,7 @@ impl Protocol for LeiosNotify {
             // Leios data before responding (long-poll pattern, same as
             // ChainSync MsgAwaitReply).
             State::StIdle | State::StBusy | State::StDone => None,
+            State::StQuit => Some(TIMEOUT_QUIT),
         }
     }
 }
@@ -143,15 +151,27 @@ pub async fn request_next(
         }
         Message::MsgLeiosBlockTxsOffer { point } => Ok(LeiosNotifyEvent::BlockTxsOffer { point }),
         Message::MsgLeiosVotes { votes } => Ok(LeiosNotifyEvent::Votes { votes }),
+        Message::MsgCanceled => {
+            // Finish the shutdown handshake rather than treating cancellation
+            // as corrupt data or spinning on further requests.
+            done(runner).await?;
+            Err(ProtocolError::Terminated)
+        }
         other => Err(ProtocolError::InvalidMessage(format!(
             "expected notification, got {other:?}"
         ))),
     }
 }
 
-/// Send MsgDone to terminate the protocol.
+/// Request termination and wait for the server's acknowledgement.
 pub async fn done(runner: &mut Runner<LeiosNotify>) -> Result<(), ProtocolError> {
-    runner.send(&Message::MsgDone).await
+    runner.send(&Message::MsgQuit).await?;
+    match runner.recv().await? {
+        Message::MsgDone => Ok(()),
+        other => Err(ProtocolError::InvalidMessage(format!(
+            "expected MsgDone, got {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -179,8 +199,8 @@ mod tests {
             State::StBusy
         );
         assert_eq!(
-            LeiosNotify::transition(&State::StIdle, &Message::MsgDone).unwrap(),
-            State::StDone
+            LeiosNotify::transition(&State::StIdle, &Message::MsgQuit).unwrap(),
+            State::StQuit
         );
         assert_eq!(
             LeiosNotify::transition(
@@ -372,9 +392,10 @@ mod tests {
                 .await
                 .unwrap();
 
-            // 5. Done
+            // 5. Quit / Done
             let msg = runner.recv().await.unwrap();
-            assert!(matches!(msg, Message::MsgDone));
+            assert!(matches!(msg, Message::MsgQuit));
+            runner.send(&Message::MsgDone).await.unwrap();
         });
 
         let client = tokio::spawn(async move {
@@ -461,7 +482,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut runner = Runner::<LeiosNotify>::new(Role::Server, ss, sr);
             let msg = runner.recv().await.unwrap();
-            assert!(matches!(msg, Message::MsgDone));
+            assert!(matches!(msg, Message::MsgQuit));
+            runner.send(&Message::MsgDone).await.unwrap();
         });
 
         let client = tokio::spawn(async move {
@@ -471,6 +493,58 @@ mod tests {
 
         client.await.unwrap();
         server.await.unwrap();
+        ra.abort();
+        rb.abort();
+    }
+
+    #[test]
+    fn w41_shutdown_agency_and_transitions() {
+        assert_eq!(LeiosNotify::agency(&State::StQuit), Agency::Server);
+        assert_eq!(LeiosNotify::timeout(&State::StQuit), Some(TIMEOUT_QUIT));
+        assert_eq!(
+            LeiosNotify::transition(&State::StBusy, &Message::MsgCanceled).unwrap(),
+            State::StIdle
+        );
+        assert_eq!(
+            LeiosNotify::transition(&State::StQuit, &Message::MsgDone).unwrap(),
+            State::StDone
+        );
+        // This is the old [0] RequestNext that w41 relays rejected in StIdle.
+        assert!(LeiosNotify::transition(&State::StIdle, &Message::MsgDone).is_err());
+        assert!(LeiosNotify::transition(&State::StIdle, &Message::MsgCanceled).is_err());
+        assert!(
+            LeiosNotify::transition(&State::StQuit, &Message::MsgLeiosNotificationRequestNext)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_request_completes_shutdown() {
+        let ((cs, cr), (ss, sr), ra, rb) = make_leios_notify_mux_pair();
+        let server = async {
+            let mut runner = Runner::<LeiosNotify>::new(Role::Server, ss, sr);
+            assert!(matches!(
+                runner.recv().await.unwrap(),
+                Message::MsgLeiosNotificationRequestNext
+            ));
+            runner.send(&Message::MsgCanceled).await.unwrap();
+            assert!(matches!(runner.recv().await.unwrap(), Message::MsgQuit));
+            runner.send(&Message::MsgDone).await.unwrap();
+            assert!(runner.is_done());
+        };
+        let client = async {
+            let mut runner = Runner::<LeiosNotify>::new(Role::Client, cs, cr);
+            assert!(matches!(
+                request_next(&mut runner).await,
+                Err(ProtocolError::Terminated)
+            ));
+            assert!(runner.is_done());
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(client, server);
+        })
+        .await
+        .unwrap();
         ra.abort();
         rb.abort();
     }
