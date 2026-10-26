@@ -276,6 +276,10 @@ pub struct MempoolState {
     pub eb_pinned: BTreeMap<TxId, MempoolTx>,
     /// Highest EB slot observed.  Drives slot-window retention.
     pub max_eb_slot: u64,
+    /// At most one applied chain tip can still have its EB certified by the
+    /// next block. Retain its manifest and closure across arbitrarily long
+    /// slot gaps, independently of newer out-of-order EB announcements.
+    protected_chain_tip_eb: Option<EbKey>,
     /// EB retention window in slots.  Manifests + pinned bodies older
     /// than `max_eb_slot - eb_retention_slots` are evicted on every
     /// `record_eb_manifest` / `produce_eb` call.
@@ -349,6 +353,7 @@ impl MempoolState {
             eb_manifests: BTreeMap::new(),
             eb_pinned: BTreeMap::new(),
             max_eb_slot: 0,
+            protected_chain_tip_eb: None,
             eb_retention_slots,
             control: crate::behaviour::tree::control::ControlSignal::default(),
             control_stats: [0; 2],
@@ -828,6 +833,15 @@ impl MempoolState {
         self.record_eb_manifest(eb_key, manifest.to_vec())
     }
 
+    /// Protect the applied chain tip's EB until its immediate child has
+    /// finished application. The caller must apply the parent's transactions
+    /// before moving this protection to the child (or clearing it). Only one
+    /// closure is exempt from slot retention, so idle chains do not grow it.
+    pub fn protect_chain_tip_eb(&mut self, eb_key: Option<EbKey>) -> Vec<MempoolEffect> {
+        self.protected_chain_tip_eb = eb_key;
+        self.prune_eb_slot_window()
+    }
+
     /// Receiver-side: register the manifest of an EB whose body bytes
     /// the wrapper has just decoded.  Bodies arrive separately via
     /// `merge_eb_body` as LeiosFetch responses come in.  No-op if a
@@ -930,7 +944,9 @@ impl MempoolState {
         if cutoff == 0 {
             return Vec::new();
         }
-        self.eb_manifests.retain(|key, _| key.slot >= cutoff);
+        let protected = self.protected_chain_tip_eb;
+        self.eb_manifests
+            .retain(|key, _| key.slot >= cutoff || Some(*key) == protected);
         let still_referenced: BTreeSet<TxId> = self
             .eb_manifests
             .values()
@@ -1839,6 +1855,41 @@ mod tests {
         s.admit_validated(id.clone(), body.clone(), sz, 0, false);
         s.merge_eb_body(eb_tx(id, body, sz), false, 0);
         assert_eq!(s.eb_pinned.len(), 0);
+    }
+
+    #[test]
+    fn active_parent_survives_child_announcement_before_certificate_application() {
+        let mut s = MempoolState::new_with_eb_retention(100, 100);
+        let parent = eb_key(929, 1);
+        let child = eb_key(1040, 2);
+        let id = TxId::new_with_array([0xAA; 32]);
+        let body = TxBody::new_with_vec(vec![0xAA]);
+        s.admit_internal(id.clone(), body.clone(), 1, 929, false);
+        s.record_eb_manifest(parent, vec![id.clone()]);
+        s.pin_eb_transactions(&parent, std::slice::from_ref(&id));
+        s.protect_chain_tip_eb(Some(parent));
+
+        // The child's EB arrives first, 111 slots later. Age alone must not
+        // erase the transaction identifiers needed to apply its certificate.
+        s.record_eb_manifest(child, vec![]);
+        assert_eq!(s.get_eb_manifest(&parent), Some(std::slice::from_ref(&id)));
+        assert!(s.eb_pinned.contains_key(&id));
+        let manifest = s.get_eb_manifest(&parent).unwrap().to_vec();
+        s.on_block_applied(&Some(parent), &manifest);
+        s.protect_chain_tip_eb(Some(child));
+        assert!(s.get_eb_manifest(&parent).is_none());
+        assert!(!s.eb_pinned.contains_key(&id));
+        assert!(!s.contains(&id));
+        s.admit_internal(id.clone(), body, 1, 1193, false);
+        assert!(!s.contains(&id), "late peer replay must remain spent");
+
+        // Protection is bounded to one EB, and clearing it restores normal
+        // pruning (including a child that announces no further EB).
+        s.record_eb_manifest(eb_key(2000, 3), vec![]);
+        assert!(s.get_eb_manifest(&child).is_some());
+        s.protect_chain_tip_eb(None);
+        assert!(s.get_eb_manifest(&child).is_none());
+        assert_eq!(s.eb_manifests.len(), 1);
     }
 
     #[test]
