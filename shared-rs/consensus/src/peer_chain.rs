@@ -29,6 +29,7 @@ pub struct PeerChainEntry {
 ///
 /// - **Bounded size**: `len() <= cap` after every `append()`.
 /// - **No duplicate hashes**: `append()` scans for existing hash (O(n)).
+/// - **Monotonic block numbers**: every appended entry is higher than the tip.
 /// - **Announcement order**: entries are push_back in ChainSync order.
 /// - **Conservative rollback**: unknown points in `rollback_to()` are no-ops.
 ///
@@ -43,7 +44,7 @@ pub struct PeerChainEntry {
 ///   ChainSync intersection) provides a fallback — `select_chain_once`
 ///   can use it as a guaranteed common ancestor even when the entry
 ///   window is too narrow.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PeerChain {
     pub entries: VecDeque<PeerChainEntry>,
     pub cap: usize,
@@ -85,15 +86,24 @@ impl PeerChain {
     }
 
     /// Append a new header. If the queue would exceed `cap`, drop oldest.
-    /// Idempotent on the same hash — a duplicate announcement is a no-op.
-    pub fn append(&mut self, entry: PeerChainEntry) {
+    /// Returns `false` for a duplicate hash or a block number that does not
+    /// advance the current peer tip.
+    pub fn append(&mut self, entry: PeerChainEntry) -> bool {
         if self.entries.iter().any(|e| e.hash == entry.hash) {
-            return;
+            return false;
+        }
+        if self
+            .entries
+            .back()
+            .is_some_and(|tip| entry.block_no <= tip.block_no)
+        {
+            return false;
         }
         self.entries.push_back(entry);
         while self.entries.len() > self.cap {
             self.entries.pop_front();
         }
+        true
     }
 
     /// Truncate the chain to the given point (inclusive). If the point
@@ -146,15 +156,26 @@ impl PeerChain {
     /// `cap` and `anchor` are preserved from the original. If no entry is
     /// blacklisted, the result is a full copy of the chain.
     pub fn trim_by_blacklist(&self, blacklist: &HashSet<[u8; 32]>) -> PeerChain {
+        if blacklist.is_empty() {
+            return self.clone();
+        }
+        let Some(fst) = self.find_earliest(blacklist) else {
+            return self.clone();
+        };
+
         let mut trimmed = PeerChain::new(self.cap);
         trimmed.anchor = self.anchor.clone();
-        for entry in &self.entries {
-            if blacklist.contains(&entry.hash) {
-                break;
-            }
-            trimmed.entries.push_back(entry.clone());
-        }
+        trimmed.entries.append(&mut VecDeque::from_iter(self.entries.iter().take(fst).cloned()));
         trimmed
+    }
+
+    pub fn find_earliest(&self, oneof: &HashSet<[u8; 32]>) -> Option<usize> {
+        for (idx,entry) in self.entries.iter().enumerate() {
+            if oneof.contains(&entry.hash) {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
@@ -198,6 +219,40 @@ mod tests {
         chain.append(entry(1, None));
         chain.append(entry(1, None));
         assert_eq!(chain.len(), 1);
+    }
+
+    #[test]
+    fn append_rejects_non_monotonic_block_number() {
+        let mut chain = PeerChain::new(64);
+        assert!(chain.append(entry(10, None)));
+
+        let mut same_height = entry(11, Some(10));
+        same_height.block_no = 10;
+        assert!(!chain.append(same_height));
+
+        let mut lower = entry(12, Some(10));
+        lower.block_no = 9;
+        assert!(!chain.append(lower));
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.tip().unwrap().block_no, 10);
+    }
+
+    #[test]
+    fn rollback_allows_replacement_at_removed_height() {
+        let mut chain = PeerChain::new(64);
+        chain.append(entry(1, None));
+        chain.append(entry(2, Some(1)));
+        chain.rollback_to(&Point::Specific {
+            slot: 1,
+            hash: [1; 32],
+        });
+
+        let mut replacement = entry(3, Some(1));
+        replacement.block_no = 2;
+        assert!(chain.append(replacement));
+        assert_eq!(chain.tip().unwrap().block_no, 2);
+        assert_eq!(chain.tip().unwrap().hash, [3; 32]);
     }
 
     #[test]

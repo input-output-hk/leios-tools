@@ -141,8 +141,16 @@ impl ChainTree {
         }
     }
 
-    pub fn update_blacklist(&mut self, blacklist: &Vec<[u8; 32]>) {
-        self.blacklist = HashSet::from_iter(blacklist.iter().cloned());
+    pub fn update_blacklist(&mut self, blacklist: &[[u8; 32]]) {
+        let blacklist = HashSet::from_iter(blacklist.iter().copied());
+        if self.blacklist == blacklist {
+            return;
+        }
+        self.blacklist = blacklist;
+        // `best_tip` is a cached query result. A policy update can invalidate
+        // its current branch, or make a previously-tainted branch eligible
+        // again, so both blacklist and unblacklist require recomputation.
+        self.recompute_best_tip();
     }
 
     /// Read-only access to the blacklist set of block hashes that cannot be
@@ -867,6 +875,30 @@ mod tests {
         );
         assert!(switched_clean, "non-blacklisted extension must become best tip");
         assert_eq!(tree.best_tip_hash(), Some([4; 32]));
+    }
+
+    #[test]
+    fn updating_blacklist_recomputes_existing_best_tip() {
+        let mut tree = ChainTree::new();
+        for seed in 1..=3 {
+            tree.insert_simple(
+                [seed; 32],
+                Point::Specific {
+                    slot: seed as u64,
+                    hash: [seed; 32],
+                },
+                seed as u64,
+                seed as u64,
+                (seed > 1).then(|| [seed - 1; 32]),
+            );
+        }
+        assert_eq!(tree.best_tip_hash(), Some([3; 32]));
+
+        tree.update_blacklist(&[[2; 32]]);
+        assert_eq!(tree.best_tip_hash(), Some([1; 32]));
+
+        tree.update_blacklist(&[]);
+        assert_eq!(tree.best_tip_hash(), Some([3; 32]));
     }
 
     #[test]
