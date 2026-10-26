@@ -14,6 +14,7 @@
 //! bytes.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -24,7 +25,7 @@ use crate::fetch::{BlockFetchPolicy, LowestRttFirst, PeerRtt, UniformRtt};
 use crate::mempool::EbKey;
 use crate::peer::PeerId;
 use crate::peer_chain::{PeerChain, PeerChainEntry};
-use crate::types::{hex_prefix, short_hash, Point};
+use crate::types::{hex_prefix, hex_prefix_option, short_hash, Point};
 
 /// How long an in-flight fetch entry remains "active" before being
 /// considered stale and eligible for retry.  The coordinator may
@@ -251,6 +252,68 @@ pub enum SelectionDecision {
         missing: Vec<Point>,
         tip_block_no: u64,
     },
+}
+
+impl fmt::Display for SelectionDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoBetterChain => f.write_str("NoBetterChain"),
+            Self::RollbackTainted {
+                ancestor,
+                tip_block_no,
+            } => write!(
+                f,
+                "RollbackTainted {{ ancestor: {}, tip_block_no: {tip_block_no} }}",
+                hex_prefix(ancestor)
+            ),
+            Self::OrphanCandidate {
+                peer_id,
+                tip_block_no,
+            } => write!(
+                f,
+                "OrphanCandidate {{ peer_id: {peer_id}, tip_block_no: {tip_block_no} }}"
+            ),
+            Self::Switched {
+                peer_id,
+                ancestor,
+                replay,
+                tip_block_no,
+            } => {
+                let replay = replay
+                    .iter()
+                    .map(|hash| hex_prefix(hash))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "Switched {{ peer_id: {peer_id}, ancestor: {}, replay: [{replay}], tip_block_no: {tip_block_no} }}",
+                    hex_prefix(ancestor)
+                )
+            }
+            Self::WaitingForBlocks {
+                peer_id,
+                ancestor,
+                anchor_point,
+                missing,
+                tip_block_no,
+            } => {
+                let anchor_point = anchor_point
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".to_string());
+                let missing = missing
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "WaitingForBlocks {{ peer_id: {peer_id}, ancestor: {}, anchor_point: {anchor_point}, missing: [{missing}], tip_block_no: {tip_block_no} }}",
+                    hex_prefix(ancestor)
+                )
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,7 +897,7 @@ impl PraosState {
                 let entries = self
                     .chain_tree
                     .snapshot(hash, 10, block_no, eb_manifest_count);
-                let tip_hash = Some(format!("{:02x}{:02x}", hash[30], hash[31]));
+                let tip_hash = Some(short_hash(&hash));
                 (entries, block_no, tip_hash)
             }
             None => (Vec::new(), None, None),
@@ -940,19 +1003,10 @@ impl PraosState {
                     %peer_id,
                     prev_block_no,
                     %prev_point,
-                    prev_hash = format!(
-                        "{:02x}{:02x}{:02x}{:02x}",
-                        prev_hash[0], prev_hash[1], prev_hash[2], prev_hash[3]
-                    ),
+                    prev_hash = %hex_prefix(&prev_hash),
                     new_block_no = header_block_no,
-                    new_prev_hash_expected = format!(
-                        "{:02x}{:02x}{:02x}{:02x}",
-                        prev_hash[0], prev_hash[1], prev_hash[2], prev_hash[3]
-                    ),
-                    new_prev_hash_actual = header_prev_hash.map(|h| format!(
-                        "{:02x}{:02x}{:02x}{:02x}",
-                        h[0], h[1], h[2], h[3]
-                    )).unwrap_or_else(|| "none".to_string()),
+                    new_prev_hash_expected = %hex_prefix(&prev_hash),
+                    new_prev_hash_actual = %hex_prefix_option(header_prev_hash.as_ref()),
                     gap_block_count = header_block_no.saturating_sub(prev_block_no).saturating_sub(1),
                     "ChainSync forwarded a non-contiguous header: upstream skipped one or more blocks between the last announced tip and this one"
                 );
@@ -1168,11 +1222,11 @@ impl PraosState {
                     lx.push(announced_eb_key);
                 }
                 else {
-                    tracing::error!("Point: {point:?}, has certified_eb but prev={prev_hash:?} has no announced_eb");
+                    tracing::error!("Point: {point}, has certified_eb but prev={} has no announced_eb", hex_prefix(prev_hash));
                 }
             }
             else {
-                tracing::error!("Point: {point:?}, has certified_eb but prev_hash is absent");
+                tracing::error!("Point: {point}, has certified_eb but prev_hash is absent");
             }
         }
 
@@ -1698,8 +1752,9 @@ impl PraosState {
         if let Some(best) = self.chain_tree.best_tip_hash() {
             if let Err(Some(gap_point)) = self.try_switch_to(best) {
                 let tip = self.chain_tree.best_tip().unwrap();
-                tracing::info!("Bridging gap between {gap_point}..{}/{}; adopted tip hash {:?}",
-                    tip.0, tip.1, self.adopted_tip_hash
+                let adopted_tip = hex_prefix_option(self.adopted_tip_hash.as_ref());
+                tracing::info!("Bridging gap between {gap_point}..{}/{}; adopted tip hash {adopted_tip}",
+                    tip.0, tip.1
                 );
 
                 // Only bridge when we have a real lower-bound block: a
@@ -2125,7 +2180,7 @@ impl PraosState {
         let ancestor = match ancestor {
             Some(a) => a,
             None => {
-                let hex_tail = short_hash; // |h: &[u8; 32]| format!("{:02x}{:02x}", h[30], h[31]);
+                let hex_tail = short_hash;
                 let hex_tail_opt = |h: &Option<[u8; 32]>| {
                     h.as_ref().map(hex_tail).unwrap_or_else(|| "<none>".into())
                 };
@@ -2205,7 +2260,7 @@ impl PraosState {
                         node_id = %self.node_id,
                         %peer_id,
                         tip_block_no = candidate_tip.block_no,
-                        ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                        ancestor = %short_hash(&ancestor),
                         "select_chain: fork mismatch (replay doesn't reach ancestor); skipping peer"
                     );
                     return SelectionDecision::OrphanCandidate {
@@ -2233,7 +2288,7 @@ impl PraosState {
 
     pub fn select_chain_once(&self, skip: &HashSet<PeerId>) -> SelectionDecision {
         let decision = self.select_chain_once_impl(skip);
-        info!("select_chain_once: {decision:?}");
+        info!("select_chain_once: {decision}");
         decision
     }
 
@@ -2346,7 +2401,7 @@ impl PraosState {
                     info!(
                         node_id = %self.node_id,
                         tip_block_no,
-                        ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                        ancestor = %short_hash(&ancestor),
                         "select_chain: rolling back blacklist-tainted adopted chain to the deepest clean ancestor"
                     );
                     // Minimal rollback: drop the tainted suffix with an empty
@@ -2387,7 +2442,7 @@ impl PraosState {
                         %peer_id,
                         tip_block_no,
                         replay_len = replay.len(),
-                        ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                        ancestor = %short_hash(&ancestor),
                         "select_chain: fork switch"
                     );
                     self.execute_switch_internal(ancestor, replay, fx);
@@ -2407,7 +2462,7 @@ impl PraosState {
                         tip_block_no,
                         missing_len = missing.len(),
                         has_anchor_gap = anchor_point.is_some(),
-                        ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                        ancestor = %short_hash(&ancestor),
                         "select_chain: fetching missing blocks"
                     );
                     let now2 = now;
@@ -2427,7 +2482,7 @@ impl PraosState {
             info!(
                 node_id = %self.node_id,
                 replay_len = replay.len(),
-                ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                ancestor = %short_hash(&ancestor),
                 "chain selection: switching to stored blocks"
             );
             self.execute_switch_internal(ancestor, replay, fx);
@@ -2465,7 +2520,7 @@ impl PraosState {
                     None => {
                         warn!(
                             node_id = %self.node_id,
-                            ancestor = format!("{:02x}{:02x}", ancestor[30], ancestor[31]),
+                            ancestor = %short_hash(&ancestor),
                             "select_chain: ancestor point not in chain_tree; aborting switch"
                         );
                         return;
@@ -2486,7 +2541,7 @@ impl PraosState {
                 None => {
                     warn!(
                         node_id = %self.node_id,
-                        hash = format!("{:02x}{:02x}", hash[30], hash[31]),
+                        hash = %short_hash(&hash),
                         "select_chain: replay block not in cache; aborting switch"
                     );
                     return;
@@ -2523,14 +2578,13 @@ impl PraosState {
                     });
                     self.queued_validator_tip = Some(parent_hash);
                 } else {
-                    let hex = |h: &[u8; 32]| format!("{:02x}{:02x}", h[30], h[31]);
                     debug!(
                         node_id = %self.node_id,
-                        parent = hex(&parent_hash),
+                        parent = %short_hash(&parent_hash),
                         queued_tip = self
                             .queued_validator_tip
                             .as_ref()
-                            .map(|h| format!("{:02x}{:02x}", h[30], h[31]))
+                            .map(short_hash)
                             .as_deref()
                             .unwrap_or("<none>"),
                         block = format!("{}", point),
@@ -2769,6 +2823,21 @@ pub struct LeiosCertSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_decision_display_uses_hex_prefixes_for_hashes() {
+        let decision = SelectionDecision::Switched {
+            peer_id: PeerId(3),
+            ancestor: [0xab; 32],
+            replay: vec![[0xcd; 32], [0xef; 32]],
+            tip_block_no: 8,
+        };
+
+        assert_eq!(
+            decision.to_string(),
+            "Switched { peer_id: peer-3, ancestor: abababababababab, replay: [cdcdcdcdcdcdcdcd, efefefefefefefef], tip_block_no: 8 }"
+        );
+    }
 
     #[test]
     fn apply_control_stores_praos_domain_slice() {
