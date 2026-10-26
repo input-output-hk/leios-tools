@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use shared_consensus::mempool::TxId;
 use shared_consensus::leios::bitmap_length;
+use shared_consensus::mempool::TxId;
 
 use shared_consensus::behaviour::actions::equivocation_bucket;
 use shared_consensus::behaviour::tree::control::OutboundControl;
@@ -1247,7 +1247,9 @@ pub async fn serve_leios_fetch(
                     "leios_fetch: downstream requested EB txs from us"
                 );
                 let transactions = match &point {
-                    Point::Specific { slot, hash } => store.get_block_txs(*slot, hash, &bitmap, peer),
+                    Point::Specific { slot, hash } => {
+                        store.get_block_txs(*slot, hash, &bitmap, peer)
+                    }
                     Point::Origin => None,
                 };
                 let Some(transactions) = transactions else {
@@ -1509,7 +1511,76 @@ mod tests {
             .expect("parked intersect must answer once seeded")
             .expect("client task join");
         let (point, _tip) = result.unwrap().unwrap();
-        assert_eq!(point, make_point(5), "must intersect at the shared point, not Origin");
+        assert_eq!(
+            point,
+            make_point(5),
+            "must intersect at the shared point, not Origin"
+        );
+
+        server_handle.abort();
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test]
+    async fn chainsync_server_accepts_anchor_before_first_block_arrives() {
+        // Regression: a sync-at-tip node (anchored above genesis) whose store is
+        // still empty at boot must NOT answer a downstream's intersection yet —
+        // answering would advertise tip=Genesis, which a downstream at a real tip
+        // rejects as ForkTooDeep and then cold-backs-off for minutes, orphaning
+        // every block we forge in the gap. The server must park the intersect
+        // until the store holds a chain, then answer with the shared point.
+        let cs_proto = ProtocolConfig {
+            id: chainsync::PROTOCOL_ID,
+            traffic_class: TrafficClass::Priority,
+            ingress_limit: chainsync::INGRESS_LIMIT,
+            egress_queue_size: 16,
+        };
+        let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&cs_proto);
+
+        // Empty store, marked anchored-above-genesis (sync-at-tip pre-seed).
+        let (store, _rx) = ChainStore::new(100);
+        store.set_anchored_above_genesis(true);
+        assert!(!store.is_seeded(), "empty anchored store is not seeded");
+
+        let server_handle = tokio::spawn(serve_chainsync(
+            server_send,
+            server_recv,
+            store.clone(),
+            PeerId(0),
+            None,
+            crate::peer::new_downstream_flag(),
+        ));
+
+        // Client asks to intersect at a real point (+ Origin fallback).
+        let client_task = tokio::spawn(async move {
+            let mut client = Runner::<ChainSync>::new(Role::Client, client_send, client_recv);
+            chainsync::find_intersection(&mut client, vec![make_point(5), Point::Origin]).await
+        });
+
+        // While the store is empty the server must stay silent (parked).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !client_task.is_finished(),
+            "intersect must be parked while the store is unseeded (else ForkTooDeep)"
+        );
+
+        // Seed only the actual upstream intersection: no block lottery wait.
+        store.set_intersection_anchor(make_point(5), 4);
+        assert_eq!(store.stored_count(), 0, "no body has arrived yet");
+
+        // Now the parked intersect resolves to the shared real point — never Origin.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), client_task)
+            .await
+            .expect("parked intersect must answer once seeded")
+            .expect("client task join");
+        let (point, _tip) = result.unwrap().unwrap();
+        assert_eq!(
+            point,
+            make_point(5),
+            "must intersect at the shared point, not Origin"
+        );
 
         server_handle.abort();
         mux_a.abort();
@@ -1568,13 +1639,10 @@ mod tests {
 
         // Past the deadline the server answers from the unseeded store instead
         // of holding the connection open until the peer kills it.
-        let answered = tokio::time::timeout(
-            PARK_UNSEEDED_INTERSECT_MAX * 2,
-            client_task,
-        )
-        .await
-        .expect("park must expire and answer, not hang until the peer times out")
-        .expect("client task join");
+        let answered = tokio::time::timeout(PARK_UNSEEDED_INTERSECT_MAX * 2, client_task)
+            .await
+            .expect("park must expire and answer, not hang until the peer times out")
+            .expect("client task join");
         assert!(
             answered.is_ok(),
             "the expired park must still produce a well-formed ChainSync reply"
