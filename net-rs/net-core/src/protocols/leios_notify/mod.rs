@@ -8,6 +8,7 @@ pub mod codec;
 
 use std::time::Duration;
 
+use crate::mux::{CodecRecv, CodecSend};
 use crate::protocols::{Agency, Protocol, ProtocolError, Runner};
 use crate::types::{Point, Vote, WrappedHeader};
 
@@ -134,6 +135,10 @@ pub async fn request_next(
         .send(&Message::MsgLeiosNotificationRequestNext)
         .await?;
     let msg = runner.recv().await?;
+    notification_event(msg)
+}
+
+fn notification_event(msg: Message) -> Result<LeiosNotifyEvent, ProtocolError> {
     match msg {
         Message::MsgLeiosBlockAnnouncement { header } => {
             Ok(LeiosNotifyEvent::BlockAnnouncement { header })
@@ -146,6 +151,69 @@ pub async fn request_next(
         other => Err(ProtocolError::InvalidMessage(format!(
             "expected notification, got {other:?}"
         ))),
+    }
+}
+
+/// Match the reference prototype's maximum outstanding request credits.
+/// Its notification pump drops events when the client has no free credits,
+/// so a one-request-at-a-time client can lose a quorum's final vote.
+pub const PIPELINE_DEPTH: usize = 100;
+
+/// Bounded pipelined notification client. Each response consumes exactly one
+/// request credit, which is replenished before handing the event to the caller.
+/// The ordinary `Runner` models one exchange and cannot represent concurrent
+/// outstanding requests; this client tracks those obligations explicitly.
+/// Receive limits and message decoding are identical to the serial client.
+/// Waiting for a notification is an untimed long poll. Drop the client to stop
+/// the protocol; sending `MsgDone` with outstanding replies is not valid.
+pub struct PipelinedClient {
+    send: CodecSend,
+    recv: CodecRecv,
+    outstanding: usize,
+}
+
+struct RequestCredits(usize);
+
+impl minicbor::Encode<()> for RequestCredits {
+    fn encode<W: minicbor::encode::Write>(
+        &self,
+        encoder: &mut minicbor::Encoder<W>,
+        ctx: &mut (),
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        for _ in 0..self.0 {
+            Message::MsgLeiosNotificationRequestNext.encode(encoder, ctx)?;
+        }
+        Ok(())
+    }
+}
+
+impl PipelinedClient {
+    pub fn new(send: CodecSend, recv: CodecRecv) -> Self {
+        Self {
+            send,
+            recv,
+            outstanding: 0,
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<LeiosNotifyEvent, ProtocolError> {
+        if self.outstanding < PIPELINE_DEPTH {
+            // Queue the initial request window as one small CBOR stream chunk.
+            // One mux segment per two-byte request needlessly exhausts bounded
+            // ingress segment queues before the peer's reader can run.
+            self.send
+                .send(&RequestCredits(PIPELINE_DEPTH - self.outstanding))
+                .await?;
+            self.outstanding = PIPELINE_DEPTH;
+        }
+        let msg: Message = self.recv.recv(SIZE_LIMIT).await?;
+        let event = notification_event(msg)?;
+        self.outstanding -= 1;
+        self.send
+            .send(&Message::MsgLeiosNotificationRequestNext)
+            .await?;
+        self.outstanding += 1;
+        Ok(event)
     }
 }
 
@@ -297,6 +365,69 @@ mod tests {
             running_a,
             running_b,
         )
+    }
+
+    #[tokio::test]
+    async fn pipeline_preserves_vote_burst_and_replenishes_credits() {
+        let ((cs, cr), (ss, mut sr), ra, rb) = make_leios_notify_mux_pair();
+        let server = tokio::spawn(async move {
+            // Reproduce the reference credit gate: gather the initial credits
+            // before releasing a burst. A serial client stalls here and cannot
+            // preserve the burst that a zero-credit pump would discard.
+            for _ in 0..PIPELINE_DEPTH {
+                assert!(matches!(
+                    sr.recv::<Message>(SIZE_LIMIT).await.unwrap(),
+                    Message::MsgLeiosNotificationRequestNext
+                ));
+            }
+            for voter_id in 0..4 {
+                ss.send(&Message::MsgLeiosVotes {
+                    votes: vec![Vote {
+                        announcing_rb_hash: [0x76; 32],
+                        voter_id,
+                        vote_signature: vec![voter_id as u8; 48],
+                    }],
+                })
+                .await
+                .unwrap();
+            }
+            // The client must replace precisely the four consumed credits.
+            for _ in 0..4 {
+                assert!(matches!(
+                    sr.recv::<Message>(SIZE_LIMIT).await.unwrap(),
+                    Message::MsgLeiosNotificationRequestNext
+                ));
+            }
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                sr.recv::<Message>(SIZE_LIMIT)
+            )
+            .await
+            .is_err());
+            // Invalid server agency/message is still rejected.
+            ss.send(&Message::MsgLeiosNotificationRequestNext)
+                .await
+                .unwrap();
+        });
+        let mut client = PipelinedClient::new(cs, cr);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for voter_id in 0..4 {
+                match client.next().await.unwrap() {
+                    LeiosNotifyEvent::Votes { votes } => assert_eq!(votes[0].voter_id, voter_id),
+                    other => panic!("expected votes, got {other:?}"),
+                }
+                assert_eq!(client.outstanding, PIPELINE_DEPTH);
+            }
+            assert!(matches!(
+                client.next().await,
+                Err(ProtocolError::InvalidMessage(_))
+            ));
+            server.await.unwrap();
+        })
+        .await
+        .expect("pipelined burst completes");
+        ra.abort();
+        rb.abort();
     }
 
     #[tokio::test]
