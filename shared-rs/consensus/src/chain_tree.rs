@@ -35,8 +35,7 @@
 //!     fallback `block_no` is 0).
 //!   - `prune_below()` removing deep history on long-running forks.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-
+use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use crate::mempool::EbKey;
 use crate::types;

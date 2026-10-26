@@ -13,7 +13,7 @@
 //! parsing happens at the I/O boundary; this crate never interprets the
 //! bytes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -630,10 +630,6 @@ impl PraosState {
             equivocation_bytes_estimate = s.equivocation_bytes_estimate,
             "praos state sizes"
         );
-    }
-
-    fn is_rb_blacklisted(&self, rb: &[u8; 32]) -> bool {
-        self.chain_tree.is_blacklisted(*rb)
     }
 
     /// Hash of the currently adopted tip, if any.
