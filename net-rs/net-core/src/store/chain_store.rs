@@ -297,8 +297,8 @@ impl ChainStore {
         // still empty at boot — offering Origin then would hand a follower a
         // cursor we later mis-serve (see `anchored_above_genesis`).
         let len = inner.blocks.len() as u64;
-        let roots_at_genesis =
-            !inner.anchored_above_genesis && (len == 0 || inner.block_no + 1 == len);
+        let roots_at_genesis = !inner.anchored_above_genesis
+            && (len == 0 || inner.block_no.checked_add(1) == Some(len));
         for candidate in points {
             if *candidate == Point::Origin {
                 if roots_at_genesis {
@@ -358,9 +358,12 @@ impl ChainStore {
         // Origin cursor from when our store was still empty at boot, so guard
         // the serve too (find_intersection stops OFFERING Origin) and await
         // instead — the follower re-intersects at a real point once we hold one
-        // it shares. (A genesis-rooted node that merely evicted its early blocks
-        // is NOT anchored and keeps serving from the front, as before.)
-        if after == 0 && inner.anchored_above_genesis {
+        // it shares. Recheck the actual stored history: a later peer can clear
+        // the initial join flag, and capacity eviction can remove block zero.
+        let roots_at_genesis = !inner.anchored_above_genesis
+            && (inner.blocks.is_empty()
+                || inner.block_no.checked_add(1) == Some(inner.blocks.len() as u64));
+        if after == 0 && !roots_at_genesis {
             return NextForCursor::AtTip;
         }
         match inner.blocks.get(after) {
@@ -581,7 +584,10 @@ mod tests {
 
         // Reorg past block 2.
         store.rollback_to(&p1);
-        assert!(store.get_range(&p2, &p2).is_empty(), "live chain dropped it");
+        assert!(
+            store.get_range(&p2, &p2).is_empty(),
+            "live chain dropped it"
+        );
 
         // But the orphan cache still serves its body (single-block request).
         let served = store.get_orphans(&p2, &p2);
@@ -602,7 +608,11 @@ mod tests {
         store.append_block(p3, h3, b3, 3); // evicts p1
 
         assert!(store.get_range(&p1, &p1).is_empty(), "p1 evicted from live");
-        assert_eq!(store.get_orphans(&p1, &p1).len(), 1, "p1 retained for fetch");
+        assert_eq!(
+            store.get_orphans(&p1, &p1).len(),
+            1,
+            "p1 retained for fetch"
+        );
     }
 
     #[test]
@@ -715,11 +725,11 @@ mod tests {
             Some(make_point(3))
         );
 
-        // Origin cursor serves from the front (now block 2 after eviction).
-        assert_eq!(
-            next_point(store.next_after_cursor(&None)),
-            Some(make_point(2))
-        );
+        // Evicted history cannot be served as if its front were block zero.
+        assert!(matches!(
+            store.next_after_cursor(&None),
+            NextForCursor::AtTip
+        ));
         // Cursor at the tip (block 4) → nothing after → AtTip.
         assert!(matches!(
             store.next_after_cursor(&Some(make_point(4))),
@@ -854,6 +864,26 @@ mod tests {
             None,
             "anchored-above-genesis chain must not claim Origin"
         );
+    }
+
+    #[test]
+    fn origin_cursor_rechecks_history_after_other_peer_intersects() {
+        let (store, _rx) = ChainStore::new(100);
+        assert!(store.find_intersection(&[Point::Origin]).is_some());
+        store.set_anchored_above_genesis(true);
+        let (p, h, b) = make_block(3);
+        store.append_block(p.clone(), h, b, 2);
+        // A second peer intersects at Origin; this must not make a truncated
+        // store's first header legal to send as block zero.
+        store.set_anchored_above_genesis(false);
+        for cursor in [None, Some(Point::Origin)] {
+            assert!(matches!(
+                store.next_after_cursor(&cursor),
+                NextForCursor::AtTip
+            ));
+        }
+        assert!(store.find_intersection(&[Point::Origin]).is_none());
+        assert!(store.find_intersection(&[p]).is_some());
     }
 
     #[test]
