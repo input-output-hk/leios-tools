@@ -99,10 +99,39 @@ impl BodyPath {
         leios: &LeiosState,
         endorsement_present: bool,
     ) -> Self {
+        Self::decide_excluding(
+            mempool,
+            rb_body_max_bytes,
+            eb_body_max_bytes,
+            leios,
+            endorsement_present,
+            &std::collections::BTreeSet::new(),
+        )
+    }
+
+    /// Select against the post-certificate transaction set without removing the
+    /// excluded parent transactions. Commit with `produce_selected_eb`, then
+    /// apply the certificate through the ordinary block lifecycle. Exclusions
+    /// are ignored when no certificate is selected for inclusion.
+    pub fn decide_excluding(
+        mempool: &mut MempoolState,
+        rb_body_max_bytes: usize,
+        eb_body_max_bytes: usize,
+        leios: &LeiosState,
+        endorsement_present: bool,
+        excluded: &std::collections::BTreeSet<TxId>,
+    ) -> Self {
         if leios.has_endorsed_unvalidated_eb() {
             return BodyPath::default();
         }
-        if mempool.total_bytes > rb_body_max_bytes {
+        if mempool
+            .txs
+            .iter()
+            .filter(|tx| !endorsement_present || !excluded.contains(tx.id()))
+            .map(|tx| tx.size())
+            .sum::<usize>()
+            > rb_body_max_bytes
+        {
             // Overflow: fill the RB body first (skipped under cert per
             // CIP-0164), then announce the residual via a fresh EB.
             //
@@ -120,7 +149,11 @@ impl BodyPath {
             };
             let mut manifest: Vec<TxId> = Vec::new();
             let mut bytes = 0usize;
-            for tx in mempool.txs.iter() {
+            for tx in mempool
+                .txs
+                .iter()
+                .filter(|tx| !endorsement_present || !excluded.contains(tx.id()))
+            {
                 let next = bytes + tx.size();
                 if next > eb_body_max_bytes && !manifest.is_empty() {
                     break;
@@ -155,9 +188,35 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    #[test]
+    fn exclusion_selection_and_commit_preserve_parent_until_application() {
+        let mut pool = MempoolState::new(10);
+        populate(&mut pool, &[(1, 100), (2, 100), (3, 100)]);
+        let excluded = std::collections::BTreeSet::from([TxId::new_with_array([2; 32])]);
+        let selected =
+            BodyPath::decide_excluding(&mut pool, 0, 1000, &empty_leios(), true, &excluded);
+        assert_eq!(pool.len(), 3);
+        assert_eq!(
+            selected.manifest,
+            vec![TxId::new_with_array([1; 32]), TxId::new_with_array([3; 32])]
+        );
+        let key = EbKey::new(10, [9; 32]);
+        pool.produce_selected_eb(key, &selected.manifest);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.total_bytes(), 100);
+        assert_eq!(
+            pool.txs.front().unwrap().id(),
+            &TxId::new_with_array([2; 32])
+        );
+        assert!(selected
+            .manifest
+            .iter()
+            .all(|id| pool.get_body_by_id(id).is_some()));
+    }
+
     fn pending(id: u8, size: u32) -> MempoolTx {
         MempoolTx {
-            tx: Arc::new(TxInfo{
+            tx: Arc::new(TxInfo {
                 tx_id: TxId::new_with_slice(&[id; 32]),
                 body: TxBody::new_with_vec(vec![0u8; size as usize]),
                 size,
@@ -206,7 +265,7 @@ mod tests {
             retry_vote_in_window: true,
             evaluate_votes: true,
         };
-            crate::leios::LeiosState::new("test".into(), elections, voting, pipeline, 7)
+        crate::leios::LeiosState::new("test".into(), elections, voting, pipeline, 7)
     }
 
     // EB cap big enough to never matter for these unit cases.
