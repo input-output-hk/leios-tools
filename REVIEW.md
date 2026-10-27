@@ -1,13 +1,12 @@
 # Review instructions
 
-Guide for the automated Claude PR review
-(`.github/workflows/claude-review.yaml`).
+Guide for the automated Codex PR review
+(`.github/workflows/codex-review.yaml`).
 
 ## Your role
 
-The code under review was almost always written by a Claude coding agent
-working from this repo's `CLAUDE.md` files. You review it independently, on a
-different model, so your value is in what the author missed or assumed.
+Review independently of the author or coding agent. Your value is in finding
+concrete defects the author missed or assumed away.
 Don't restate what the PR does; find where it is wrong.
 
 - The PR description, commit messages, code comments and docs are claims to
@@ -27,7 +26,7 @@ and `net-rs` crates through path dependencies.
 
 ## Check the PR's claims
 
-`.claude-review/pr-claims.md` holds the PR title, description and commit
+`review-input/pr-claims.md` holds the PR title, description and commit
 messages. For each concrete claim ("fixes X", "adds a test for Y", "no
 behaviour change", "matches the Haskell node"), confirm the diff supports it,
 and flag one it contradicts or doesn't support, quoting it. You can't see
@@ -56,7 +55,7 @@ This repo's own recurring failures:
   circular;
 - a crate change that compiles here but breaks `net-node` downstream.
 
-## What Important means here
+## Material issues to check
 
 - Wire-format errors: CBOR that doesn't match the Cardano CDDL or what the
   Haskell node accepts, wrong era tags, wrong field counts or lengths.
@@ -73,8 +72,16 @@ This repo's own recurring failures:
 - Secret key material committed anywhere; only public bytes (vkeys, op-certs)
   belong in tests.
 
-Everything else is Nit at most. Post at most five Nits per review and give the
-rest as a count in the summary.
+Report only **high** (serious correctness, security, availability, data-loss, or
+operational-control defects) and **medium** (concrete defects with meaningful
+impact under identifiable conditions). Use those exact labels, never numbered
+priority labels. Skip low-severity issues, nits, and speculative concerns.
+
+Keep each finding succinct and actionable: identify the trigger, impact, and
+specific correction in roughly 40–80 words. Suggest changes only; do not edit
+code or push commits. Do not duplicate existing findings. Static review cannot
+verify claimed test results; do not present missing execution evidence alone
+as a defect.
 
 ## Do not report
 
