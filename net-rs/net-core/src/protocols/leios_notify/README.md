@@ -67,7 +67,8 @@ Tests use byte vectors derived from the Haskell encoder and captured payloads co
 - **Max message size**: 65,535 bytes
 - **Ingress limit**: 65,536 bytes
 - **Max votes per message**: 1,024
-- **Timeout**: no timeout in idle or busy (notification long polling); quit waits at most 120s for the server acknowledgement
+- **Timeout**: untimed notification long poll; shutdown has one 120-second deadline covering outstanding replies and the server acknowledgement
+- **Client request pipeline**: 100 outstanding requests, replenished before event delivery. This keeps credits available for notification bursts; the reference server can drop notifications when credits run out. The serial helper remains available for one-shot protocol clients.
 
 ## Messages
 
@@ -76,13 +77,20 @@ Tests use byte vectors derived from the Haskell encoder and captured payloads co
 - **MsgLeiosBlockTxsOffer** — an EB's transactions are available (`point`)
 - **MsgLeiosVotes** — a batch of votes delivered inline, each containing the announcing RB hash, voter identifier, and signature
 
-## Client Helper
+## Client Helpers
 
 - `request_next(runner) -> Result<LeiosNotifyEvent, ProtocolError>` — poll for the next notification. On `MsgCanceled`, complete the `MsgQuit`/`MsgDone` exchange and return `ProtocolError::Terminated`.
 - `LeiosNotifyEvent` enum: `BlockAnnouncement`, `BlockOffer`, `BlockTxsOffer`, `Votes`
 - `done(runner) -> Result<(), ProtocolError>` — send `MsgQuit` and wait for `MsgDone`.
 
-The helpers are non-pipelined; they do not send a concurrent `MsgQuit` while a request is outstanding.
+The runner helpers are non-pipelined; they do not send a concurrent `MsgQuit` while a request is outstanding.
+
+The production peer task uses `PipelinedClient::next()`. Its `shutdown()` sends
+`MsgQuit` once, stops replenishing requests, and drains one notification or
+`MsgCanceled` for each outstanding request before accepting `MsgDone`. Notifications
+already in flight are discarded during draining. A cancellation received by
+`next()` also starts this shutdown and returns `ProtocolError::Terminated` after
+completion. Calling `shutdown()` again neither repeats Quit nor resets its deadline.
 
 ## Server
 

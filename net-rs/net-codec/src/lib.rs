@@ -19,6 +19,8 @@ mod block;
 mod eb;
 mod encode;
 mod header;
+mod transaction;
+pub use transaction::{inline_leios_transaction, leios_inline_transaction};
 
 pub use block::{BlockBody, LeiosBlockInfo};
 pub use eb::{decode_overflow_eb, encode_overflow_eb};
