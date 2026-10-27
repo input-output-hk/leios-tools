@@ -1,36 +1,85 @@
-# LeiosNotify (protocol 18)
+# LeiosNotify (Protocol ID 18) — CIP-0164
 
-Client polling for Leios announcements, endorser-block offers, transaction
-offers, and votes.
+Client-driven polling for Leios data announcements. Server notifies the client about available endorser blocks (EBs), EB transactions, and votes. The client uses these offers to decide what to fetch via [LeiosFetch](../leios_fetch/). Votes are delivered inline.
 
-The codec follows `encodeLeiosNotify` / `decodeLeiosNotify` in
-[ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestNotify.hs).
+The codec follows `encodeLeiosNotify` / `decodeLeiosNotify` in [ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestNotify.hs).
 
-| Message | Wire value | Transition |
-| --- | --- | --- |
-| Done | `[0]` | Quit → Done |
-| Quit | `[1]` | Idle → Quit |
-| Canceled | `[2]` | Busy → Idle |
-| RequestNext | `[3]` | Idle → Busy |
-| BlockAnnouncement | `[4, header]` | Busy → Idle |
-| BlockOffer | `[5, point, size]` | Busy → Idle |
-| BlockTxsOffer | `[6, point]` | Busy → Idle |
-| Votes | `[7, votes]` | Busy → Idle |
+## Files
 
-Wire values are Concise Binary Object Representation (CBOR) arrays. A `point`
-is `[slot, hash32]`; `size` is the offered endorser-block byte size. A vote is
-`[announcing_ranking_block_hash, voter_id, signature]`. Transition names omit
-the `St` prefix used by the Rust enum.
+| File | Description |
+|------|-------------|
+| `mod.rs` | State machine (`State`, `Message`), `Protocol` impl, `LeiosNotifyEvent` helper enum |
+| `codec.rs` | CBOR encode/decode for LeiosNotify messages |
 
-The client has agency in Idle; the server has agency in Busy and Quit.
-Done has no agency. Idle and Busy have no timeout (notification long polling).
-Quit waits at most 120 seconds for the server acknowledgement. Messages are
-limited to 65,535 bytes, with a 65,536-byte ingress buffer and at most 1,024 votes.
+**Legend:** CBOR = Concise Binary Object Representation; impl = implementation.
 
-`request_next` returns an announcement, offer, or votes. On Canceled it completes
-the Quit/Done exchange and returns `ProtocolError::Terminated`.
-`done` sends Quit and waits for Done. The helpers are non-pipelined; they do not
-send a concurrent Quit while a request is outstanding.
+## State Machine
 
-Tests use byte vectors derived from the Haskell encoder and captured payloads
-combined with explicit message tags.
+```mermaid
+stateDiagram-v2
+    [*] --> StIdle
+    StIdle --> StBusy : MsgLeiosNotificationRequestNext
+    StIdle --> StQuit : MsgQuit
+    StQuit --> StDone : MsgDone
+    StBusy --> StIdle : MsgCanceled
+    StBusy --> StIdle : MsgLeiosBlockAnnouncement
+    StBusy --> StIdle : MsgLeiosBlockOffer
+    StBusy --> StIdle : MsgLeiosBlockTxsOffer
+    StBusy --> StIdle : MsgLeiosVotes
+    StDone --> [*]
+```
+
+## Agency Table
+
+| State | Agency | Message | Next State |
+|-------|--------|---------|------------|
+| StIdle | **Client** | MsgLeiosNotificationRequestNext | StBusy |
+| StIdle | **Client** | MsgQuit | StQuit |
+| StQuit | **Server** | MsgDone | StDone |
+| StBusy | **Server** | MsgCanceled | StIdle |
+| StBusy | **Server** | MsgLeiosBlockAnnouncement(header) | StIdle |
+| StBusy | **Server** | MsgLeiosBlockOffer(point, eb_size) | StIdle |
+| StBusy | **Server** | MsgLeiosBlockTxsOffer(point) | StIdle |
+| StBusy | **Server** | MsgLeiosVotes(votes) | StIdle |
+| StDone | Nobody | — | — |
+
+**Legend:** Agency = the side allowed to send the next message; `St` and `Msg` are the state and message prefixes used in the Rust enums. `point` identifies an endorser block by slot and hash; `eb_size` is its offered byte size; `header` is a ranking-block header; `votes` is a list of votes delivered inline.
+
+## Wire Format
+
+| Message | CBOR array |
+|---------|------------|
+| MsgDone | `[0]` |
+| MsgQuit | `[1]` |
+| MsgCanceled | `[2]` |
+| MsgLeiosNotificationRequestNext | `[3]` |
+| MsgLeiosBlockAnnouncement | `[4, header]` |
+| MsgLeiosBlockOffer | `[5, point, eb_size]` |
+| MsgLeiosBlockTxsOffer | `[6, point]` |
+| MsgLeiosVotes | `[7, votes]` |
+
+**Legend:** CBOR = Concise Binary Object Representation; `point` = `[slot, hash32]`, where `hash32` is a 32-byte hash; `header` is a ranking-block header; `eb_size` is the offered endorser-block byte size. Each entry in `votes` is `[announcing_ranking_block_hash, voter_id, signature]`, identifying the announcing block, voter, and vote signature.
+
+Tests use byte vectors derived from the Haskell encoder and captured payloads combined with explicit message tags.
+
+## Limits
+
+- **Max message size**: 65,535 bytes
+- **Ingress limit**: 65,536 bytes
+- **Max votes per message**: 1,024
+- **Timeout**: no timeout in idle or busy (notification long polling); quit waits at most 120s for the server acknowledgement
+
+## Messages
+
+- **MsgLeiosBlockAnnouncement** — ranking-block (RB) header that announces an EB (carries the EB hash in the CIP-0164 header extension)
+- **MsgLeiosBlockOffer** — an EB is available for fetching (`point` and `eb_size`)
+- **MsgLeiosBlockTxsOffer** — an EB's transactions are available (`point`)
+- **MsgLeiosVotes** — a batch of votes delivered inline, each containing the announcing RB hash, voter identifier, and signature
+
+## Client Helper
+
+- `request_next(runner) -> Result<LeiosNotifyEvent, ProtocolError>` — poll for the next notification. On `MsgCanceled`, complete the `MsgQuit`/`MsgDone` exchange and return `ProtocolError::Terminated`.
+- `LeiosNotifyEvent` enum: `BlockAnnouncement`, `BlockOffer`, `BlockTxsOffer`, `Votes`
+- `done(runner) -> Result<(), ProtocolError>` — send `MsgQuit` and wait for `MsgDone`.
+
+The helpers are non-pipelined; they do not send a concurrent `MsgQuit` while a request is outstanding.
