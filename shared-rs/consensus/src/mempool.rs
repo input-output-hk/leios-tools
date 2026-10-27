@@ -29,14 +29,14 @@
 //! Locally-generated transactions skip the dance via
 //! [`MempoolState::admit_validated`].
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fmt::Display;
-use std::sync::Arc;
-use serde::Serialize;
-use tracing::info;
 use crate::behaviour::tree::control::TxWithholdingPolicy;
 use crate::peer::PeerId;
 use crate::types::hex_prefix;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Display;
+use std::sync::Arc;
+use tracing::info;
 
 /// Slot-window retention for EB-pinned bodies.  Holds wide enough that
 /// every active voting / certification window stays serveable; pruned
@@ -60,10 +60,7 @@ impl Display for EbKey {
 
 impl EbKey {
     pub fn new(slot: u64, hash: [u8; 32]) -> Self {
-        Self {
-            slot,
-            hash,
-        }
+        Self { slot, hash }
     }
 }
 
@@ -237,6 +234,9 @@ pub enum TxRejectReason {
 /// Treat them as state-machine internals: prefer the public methods,
 /// which preserve invariants.
 pub struct MempoolState {
+    // Bounded replay filter; conservative across rollback, like receipt-time pruning.
+    applied: BTreeSet<TxId>,
+    applied_order: VecDeque<TxId>,
     /// Admitted transactions in arrival order — the "free" pool drained
     /// for RB body inclusion.
     pub txs: VecDeque<MempoolTx>,
@@ -276,6 +276,10 @@ pub struct MempoolState {
     pub eb_pinned: BTreeMap<TxId, MempoolTx>,
     /// Highest EB slot observed.  Drives slot-window retention.
     pub max_eb_slot: u64,
+    /// At most one applied chain tip can still have its EB certified by the
+    /// next block. Retain its manifest and closure across arbitrarily long
+    /// slot gaps, independently of newer out-of-order EB announcements.
+    protected_chain_tip_eb: Option<EbKey>,
     /// EB retention window in slots.  Manifests + pinned bodies older
     /// than `max_eb_slot - eb_retention_slots` are evicted on every
     /// `record_eb_manifest` / `produce_eb` call.
@@ -338,6 +342,8 @@ impl MempoolState {
     pub fn new_with_eb_retention(capacity: usize, eb_retention_slots: u64) -> Self {
         Self {
             txs: VecDeque::new(),
+            applied: BTreeSet::new(),
+            applied_order: VecDeque::new(),
             tx_index: BTreeSet::new(),
             total_bytes: 0,
             capacity,
@@ -347,6 +353,7 @@ impl MempoolState {
             eb_manifests: BTreeMap::new(),
             eb_pinned: BTreeMap::new(),
             max_eb_slot: 0,
+            protected_chain_tip_eb: None,
             eb_retention_slots,
             control: crate::behaviour::tree::control::ControlSignal::default(),
             control_stats: [0; 2],
@@ -397,11 +404,28 @@ impl MempoolState {
     /// not in the mempool.
     pub fn on_block_applied(&mut self, eb_key: &Option<EbKey>, included_tx_ids: &[TxId]) {
         if included_tx_ids.is_empty() {
-            let eb_key = eb_key.map(|k| k.to_string()).unwrap_or("(none)".to_string());
-            info!("Applying EB {eb_key}: empty EB, {} remaining txs in mempool", self.txs.len());
+            let eb_key = eb_key
+                .map(|k| k.to_string())
+                .unwrap_or("(none)".to_string());
+            info!(
+                "Applying EB {eb_key}: empty EB, {} remaining txs in mempool",
+                self.txs.len()
+            );
             return;
         }
 
+        for id in included_tx_ids {
+            if self.applied.insert(id.clone()) {
+                self.applied_order.push_back(id.clone());
+                // Enforce the bound per insertion, including large remote blocks.
+                if self.applied_order.len() > 65_536 {
+                    if let Some(old) = self.applied_order.pop_front() {
+                        self.applied.remove(&old);
+                    }
+                }
+            }
+            self.pending_validation.remove(id);
+        }
         let included: BTreeSet<&TxId> = included_tx_ids.iter().collect();
         let before = self.txs.len();
         self.txs.retain(|tx| !included.contains(&tx.id()));
@@ -415,7 +439,9 @@ impl MempoolState {
                 self.prune_from_peer_sets(tx_id);
             }
         }
-        let eb_key = eb_key.map(|k| k.to_string()).unwrap_or("(none)".to_string());
+        let eb_key = eb_key
+            .map(|k| k.to_string())
+            .unwrap_or("(none)".to_string());
         info!(
             "Applying EB {eb_key}: has {} txs, removed {} txs from mempool, {after} remaining txs",
             included_tx_ids.len(),
@@ -424,8 +450,10 @@ impl MempoolState {
     }
 
     /// A block was rolled back.  Mempool entries that were dropped on
-    /// `on_block_applied` for that block stay dropped (they re-enter
-    /// via the normal arrival path if the wrapper re-submits them).
+    /// `on_block_applied` stay dropped. The bounded replay filter deliberately
+    /// survives rollback, matching conservative receipt-time pruning. Re-admission
+    /// is possible after 65,536 distinct later applied IDs evict the marker.
+    /// A ledger-aware rollback/revalidation policy is outside this pool's scope.
     /// No-op today; here for parity with the Praos / Leios surface
     /// and to give wrappers a hook for future re-admit logic.
     pub fn on_block_rolled_back(&mut self) {}
@@ -466,22 +494,30 @@ impl MempoolState {
 
     /// Look up a tx body by id.
     pub fn get_body_by_id(&self, id: &TxId) -> Option<TxBody> {
-        self.get_record_by_id(id).map(|record| record.body().clone())
+        self.get_record_by_id(id)
+            .map(|record| record.body().clone())
     }
 
     /// Check current transaction WRT filtering rules.
     /// Return true if the tx should remain; false if it should not be transmitted.
-    pub fn filter_transaction(&self, current_slot: u64, tx_id: &TxId, is_leios_fetch: bool) -> bool {
-        let (delay, only_ours, tx_submission, tx_fetch) = if let TxWithholdingPolicy::WithholdTxs {
-            withholding_slots: delay_for_slots,
-            tx_producer_only: only_ours,
-            withhold_tx_submission: tx_submission,
-            withhold_leios_fetch: tx_fetch,
-        } = &self.control.mempool.tx_withholding_filter {
-            (*delay_for_slots, *only_ours, *tx_submission, *tx_fetch)
-        } else {
-            return true;
-        };
+    pub fn filter_transaction(
+        &self,
+        current_slot: u64,
+        tx_id: &TxId,
+        is_leios_fetch: bool,
+    ) -> bool {
+        let (delay, only_ours, tx_submission, tx_fetch) =
+            if let TxWithholdingPolicy::WithholdTxs {
+                withholding_slots: delay_for_slots,
+                tx_producer_only: only_ours,
+                withhold_tx_submission: tx_submission,
+                withhold_leios_fetch: tx_fetch,
+            } = &self.control.mempool.tx_withholding_filter
+            {
+                (*delay_for_slots, *only_ours, *tx_submission, *tx_fetch)
+            } else {
+                return true;
+            };
 
         // Retain transaction, if the protocol is not withheld
         if (is_leios_fetch && !tx_fetch) || (!is_leios_fetch && !tx_submission) {
@@ -489,7 +525,8 @@ impl MempoolState {
         }
 
         let Some(record) = self.get_record_by_id(tx_id) else {
-            tracing::warn!("filter_transaction: transaction {} not found in mempool",
+            tracing::warn!(
+                "filter_transaction: transaction {} not found in mempool",
                 tx_id.hex_short()
             );
 
@@ -530,13 +567,16 @@ impl MempoolState {
                 return Vec::new();
             }
 
-            unann.iter().filter(
-                |tx| {
+            unann
+                .iter()
+                .filter(|tx| {
                     let leave = self.filter_transaction(current_slot, tx, false);
                     control_stats[leave as usize] += 1;
                     leave
-                }
-            ).take(max_count).cloned().collect()
+                })
+                .take(max_count)
+                .cloned()
+                .collect()
         };
         for leave in [true, false] {
             self.control_stats[leave as usize] += control_stats[leave as usize];
@@ -586,7 +626,12 @@ impl MempoolState {
     /// needs to send the tx body to that peer).  Used by the
     /// admit-fan-out path to announce a single just-admitted tx to
     /// every connected peer in `O(log N)` per peer.
-    pub fn mark_announced_to_peer(&mut self, peer_id: PeerId, tx_id: &TxId, current_slot: u64) -> bool {
+    pub fn mark_announced_to_peer(
+        &mut self,
+        peer_id: PeerId,
+        tx_id: &TxId,
+        current_slot: u64,
+    ) -> bool {
         self.ensure_peer_registered(peer_id);
 
         if !self.filter_transaction(current_slot, tx_id, false) {
@@ -764,11 +809,37 @@ impl MempoolState {
         }
         info!(
             "Inserting (locally produced) manifest {eb_key} with {} txs ({} ours, {} non-ours)",
-            manifest.len(), ours_cnt, manifest.len()-ours_cnt
+            manifest.len(),
+            ours_cnt,
+            manifest.len() - ours_cnt
         );
         self.eb_manifests.insert(eb_key, manifest.clone());
         let fx = self.bump_eb_slot(eb_key.slot);
         (manifest, fx)
+    }
+
+    /// Commit an explicitly selected manifest, which need not be a FIFO prefix.
+    /// Preserve excluded entries and pinned bodies. The caller holds exclusive
+    /// access between selection and this operation.
+    pub fn produce_selected_eb(&mut self, eb_key: EbKey, manifest: &[TxId]) -> Vec<MempoolEffect> {
+        self.pin_eb_transactions(&eb_key, manifest);
+        let selected: BTreeSet<&TxId> = manifest.iter().collect();
+        self.txs.retain(|tx| !selected.contains(tx.id()));
+        for id in manifest {
+            self.tx_index.remove(id);
+            self.prune_from_peer_sets(id);
+        }
+        self.total_bytes = self.txs.iter().map(|tx| tx.size()).sum();
+        self.record_eb_manifest(eb_key, manifest.to_vec())
+    }
+
+    /// Protect the applied chain tip's EB until its immediate child has
+    /// finished application. The caller must apply the parent's transactions
+    /// before moving this protection to the child (or clearing it). Only one
+    /// closure is exempt from slot retention, so idle chains do not grow it.
+    pub fn protect_chain_tip_eb(&mut self, eb_key: Option<EbKey>) -> Vec<MempoolEffect> {
+        self.protected_chain_tip_eb = eb_key;
+        self.prune_eb_slot_window()
     }
 
     /// Receiver-side: register the manifest of an EB whose body bytes
@@ -786,14 +857,13 @@ impl MempoolState {
 
     pub fn pin_eb_transactions(&mut self, _eb_key: &EbKey, manifest: &[TxId]) {
         for to_pin in manifest {
-            let Some(body) = self
-                .txs
-                .iter()
-                .find(|tx| tx.id() == to_pin) else {
-                    continue;
-                };
+            let Some(body) = self.txs.iter().find(|tx| tx.id() == to_pin) else {
+                continue;
+            };
 
-            self.eb_pinned.entry(to_pin.clone()).or_insert_with(|| body.clone());
+            self.eb_pinned
+                .entry(to_pin.clone())
+                .or_insert_with(|| body.clone());
         }
     }
 
@@ -807,14 +877,8 @@ impl MempoolState {
         if self.contains(&tx.tx_id) || self.eb_pinned.contains_key(&tx.tx_id) {
             return;
         }
-        self.eb_pinned.insert(
-            tx.tx_id.clone(),
-            MempoolTx {
-                tx,
-                ours,
-                slot,
-            }
-        );
+        self.eb_pinned
+            .insert(tx.tx_id.clone(), MempoolTx { tx, ours, slot });
     }
 
     /// True iff the body for `tx_id` is locally available — either
@@ -880,7 +944,9 @@ impl MempoolState {
         if cutoff == 0 {
             return Vec::new();
         }
-        self.eb_manifests.retain(|key, _| key.slot >= cutoff);
+        let protected = self.protected_chain_tip_eb;
+        self.eb_manifests
+            .retain(|key, _| key.slot >= cutoff || Some(*key) == protected);
         let still_referenced: BTreeSet<TxId> = self
             .eb_manifests
             .values()
@@ -909,6 +975,12 @@ impl MempoolState {
         slot: u64,
         ours: bool,
     ) -> Vec<MempoolEffect> {
+        if self.applied.contains(&tx_id) {
+            return vec![MempoolEffect::TxRejected {
+                tx_id,
+                reason: TxRejectReason::AlreadyKnown,
+            }];
+        }
         let mut fx = Vec::new();
         if self.txs.len() >= self.capacity {
             if let Some(old) = self.txs.pop_front() {
@@ -935,11 +1007,7 @@ impl MempoolState {
             set.insert(tx_id.clone());
         }
         self.txs.push_back(MempoolTx {
-            tx: Arc::new(TxInfo {
-                tx_id,
-                body,
-                size,
-            }),
+            tx: Arc::new(TxInfo { tx_id, body, size }),
             ours,
             slot,
         });
@@ -975,7 +1043,11 @@ mod tests {
     /// `AlreadyKnown` and discards.  Otherwise records the body and
     /// emits `ValidateTx`; the wrapper validates and reports back via
     /// [`Self::on_tx_validated`] or [`Self::on_tx_validation_failed`].
-    pub fn on_tx_received(pool: &mut MempoolState, tx_id: TxId, body: TxBody) -> Vec<MempoolEffect> {
+    pub fn on_tx_received(
+        pool: &mut MempoolState,
+        tx_id: TxId,
+        body: TxBody,
+    ) -> Vec<MempoolEffect> {
         if pool.pending_validation.contains_key(&tx_id) || pool.contains(&tx_id) {
             return vec![MempoolEffect::TxRejected {
                 tx_id,
@@ -990,7 +1062,12 @@ mod tests {
     /// queue is at capacity, evicts the oldest tx and emits a
     /// `TxRejected { reason: QueueFull }` for it.  No-op if the
     /// tx_id wasn't pending validation.
-    pub fn on_tx_validated(pool: &mut MempoolState, tx_id: TxId, size: u32, slot: u64) -> Vec<MempoolEffect> {
+    pub fn on_tx_validated(
+        pool: &mut MempoolState,
+        tx_id: TxId,
+        size: u32,
+        slot: u64,
+    ) -> Vec<MempoolEffect> {
         let Some(body) = pool.pending_validation.remove(&tx_id) else {
             return Vec::new();
         };
@@ -1000,7 +1077,11 @@ mod tests {
 
     /// Validator rejected `tx_id`.  Drops the pending body and emits
     /// `TxRejected { ValidationFailed }`.
-    pub fn on_tx_validation_failed(pool: &mut MempoolState, tx_id: TxId, reason: String) -> Vec<MempoolEffect> {
+    pub fn on_tx_validation_failed(
+        pool: &mut MempoolState,
+        tx_id: TxId,
+        reason: String,
+    ) -> Vec<MempoolEffect> {
         pool.pending_validation.remove(&tx_id);
         vec![MempoolEffect::TxRejected {
             tx_id,
@@ -1036,7 +1117,7 @@ mod tests {
 
     fn tx(id: u8, size: u32) -> (TxId, TxBody, u32) {
         (
-            TxId::new_with_slice( & [id; 32]),
+            TxId::new_with_slice(&[id; 32]),
             TxBody::new_with_vec(vec![0u8; size as usize]),
             size,
         )
@@ -1070,11 +1151,7 @@ mod tests {
     /// Build an `Arc<TxInfo>` with an explicit tx-id (which need not match
     /// the body hash), for exercising the receiver-side `merge_eb_body` path.
     fn eb_tx(tx_id: TxId, body: TxBody, size: u32) -> Arc<TxInfo> {
-        Arc::new(TxInfo {
-            tx_id,
-            body,
-            size,
-        })
+        Arc::new(TxInfo { tx_id, body, size })
     }
 
     #[test]
@@ -1213,6 +1290,28 @@ mod tests {
     // -- Block lifecycle ---------------------------------------------------
 
     #[test]
+    fn applied_replay_filter_is_bounded_idempotent_and_conservative_on_rollback() {
+        let mut pool = MempoolState::new(10);
+        let ids: Vec<_> = (0u64..65_537)
+            .map(|n| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&n.to_be_bytes());
+                TxId::new_with_array(bytes)
+            })
+            .collect();
+        pool.on_block_applied(&None, &ids);
+        pool.on_block_applied(&None, &ids[1..]);
+        assert_eq!(pool.applied.len(), 65_536);
+        assert_eq!(pool.applied_order.len(), 65_536);
+        assert!(!pool.applied.contains(&ids[0]));
+        pool.on_block_rolled_back();
+        pool.admit_validated(ids[1].clone(), TxBody::new_with_vec(vec![0]), 1, 1, false);
+        assert!(pool.is_empty());
+        pool.admit_validated(ids[0].clone(), TxBody::new_with_vec(vec![0]), 1, 1, false);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
     fn on_block_applied_removes_included_txs() {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
@@ -1243,7 +1342,10 @@ mod tests {
     fn on_block_applied_unknown_ids_is_noop() {
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
-        s.on_block_applied(&Some(EbKey::new(0, [0u8; 32])), &[TxId::new_with_slice(&[99u8; 32])]);
+        s.on_block_applied(
+            &Some(EbKey::new(0, [0u8; 32])),
+            &[TxId::new_with_slice(&[99u8; 32])],
+        );
         assert_eq!(s.len(), 1);
     }
 
@@ -1355,7 +1457,10 @@ mod tests {
         admit(&mut s, 2, 100);
         let peer = pid(0);
         let _ = s.peek_unannounced_for_peer(peer, 10, 0);
-        s.on_block_applied(&Some(EbKey::new(0, [0u8; 32])), &[TxId::new_with_slice(&[1u8; 32])]);
+        s.on_block_applied(
+            &Some(EbKey::new(0, [0u8; 32])),
+            &[TxId::new_with_slice(&[1u8; 32])],
+        );
         let advertised = s.peer_advertised.get(&peer).unwrap();
         assert!(!advertised.contains(&TxId::new_with_slice(&[1u8; 32])));
         assert!(advertised.contains(&TxId::new_with_slice(&[2u8; 32])));
@@ -1479,9 +1584,9 @@ mod tests {
         // withheld tx must not eat into the per-call announcement budget.
         let mut s = MempoolState::new(10);
         apply_withhold(&mut s, 100, true); // withhold only our own txs
-        // The owed set iterates in ascending TxId order, so the two withheld
-        // (ours) txs — ids 1 & 2 — are visited before any announceable peer
-        // tx (ids 3, 4, 5).
+                                           // The owed set iterates in ascending TxId order, so the two withheld
+                                           // (ours) txs — ids 1 & 2 — are visited before any announceable peer
+                                           // tx (ids 3, 4, 5).
         admit_full(&mut s, 1, 100, 0, true); // ours → withheld
         admit_full(&mut s, 2, 100, 0, true); // ours → withheld
         admit_full(&mut s, 3, 100, 0, false); // peer → announceable
@@ -1570,7 +1675,15 @@ mod tests {
 
         // EB bodies merged from peers are never ours, stamped with the slot.
         let (eb_id, eb_body, eb_sz) = tx(4, 10);
-        s.merge_eb_body(Arc::new(TxInfo { tx_id: eb_id.clone(), body: eb_body, size: eb_sz }), false, 43);
+        s.merge_eb_body(
+            Arc::new(TxInfo {
+                tx_id: eb_id.clone(),
+                body: eb_body,
+                size: eb_sz,
+            }),
+            false,
+            43,
+        );
         let eb = s.eb_pinned.get(&eb_id).unwrap();
         assert!(!eb.ours);
         assert_eq!(eb.slot, 43);
@@ -1655,12 +1768,20 @@ mod tests {
         assert_eq!(s.missing_eb_indices(&eb), vec![0, 1]);
 
         // Merge the second body first (out-of-order delivery is fine).
-        s.merge_eb_body(eb_tx(id_b.clone(), TxBody::new_with_vec(vec![0xB0]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(id_b.clone(), TxBody::new_with_vec(vec![0xB0]), 1),
+            false,
+            0,
+        );
         assert_eq!(s.missing_eb_indices(&eb), vec![0]);
         assert!(s.has_tx(&id_b));
 
         // Then the first.
-        s.merge_eb_body(eb_tx(id_a.clone(), TxBody::new_with_vec(vec![0xA0]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(id_a.clone(), TxBody::new_with_vec(vec![0xA0]), 1),
+            false,
+            0,
+        );
         assert!(s.missing_eb_indices(&eb).is_empty());
     }
 
@@ -1673,8 +1794,16 @@ mod tests {
         let eb = eb_key(30, 0x33);
         s.record_eb_manifest(eb, ids.clone());
         // Only bodies for indices 1 and 3 are locally available.
-        s.merge_eb_body(eb_tx(ids[1].clone(), TxBody::new_with_vec(vec![0x11]), 1), false, 0);
-        s.merge_eb_body(eb_tx(ids[3].clone(), TxBody::new_with_vec(vec![0x33]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(ids[1].clone(), TxBody::new_with_vec(vec![0x11]), 1),
+            false,
+            0,
+        );
+        s.merge_eb_body(
+            eb_tx(ids[3].clone(), TxBody::new_with_vec(vec![0x33]), 1),
+            false,
+            0,
+        );
 
         // Server gets a bitmap request for [0, 1, 2, 3, 4]; returns only the
         // bodies it has, in ascending index order.
@@ -1700,9 +1829,17 @@ mod tests {
         let mut s = MempoolState::new(10);
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(40, 0x40), vec![id.clone()]);
-        s.merge_eb_body(eb_tx(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1),
+            false,
+            0,
+        );
         // Second call with a different (faked) body must not overwrite.
-        s.merge_eb_body(eb_tx(id.clone(), TxBody::new_with_vec(vec![0xFF]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(id.clone(), TxBody::new_with_vec(vec![0xFF]), 1),
+            false,
+            0,
+        );
         assert_eq!(
             s.get_body_by_id(&id),
             Some(TxBody::new_with_vec(vec![0xCC]))
@@ -1721,6 +1858,41 @@ mod tests {
     }
 
     #[test]
+    fn active_parent_survives_child_announcement_before_certificate_application() {
+        let mut s = MempoolState::new_with_eb_retention(100, 100);
+        let parent = eb_key(929, 1);
+        let child = eb_key(1040, 2);
+        let id = TxId::new_with_array([0xAA; 32]);
+        let body = TxBody::new_with_vec(vec![0xAA]);
+        s.admit_internal(id.clone(), body.clone(), 1, 929, false);
+        s.record_eb_manifest(parent, vec![id.clone()]);
+        s.pin_eb_transactions(&parent, std::slice::from_ref(&id));
+        s.protect_chain_tip_eb(Some(parent));
+
+        // The child's EB arrives first, 111 slots later. Age alone must not
+        // erase the transaction identifiers needed to apply its certificate.
+        s.record_eb_manifest(child, vec![]);
+        assert_eq!(s.get_eb_manifest(&parent), Some(std::slice::from_ref(&id)));
+        assert!(s.eb_pinned.contains_key(&id));
+        let manifest = s.get_eb_manifest(&parent).unwrap().to_vec();
+        s.on_block_applied(&Some(parent), &manifest);
+        s.protect_chain_tip_eb(Some(child));
+        assert!(s.get_eb_manifest(&parent).is_none());
+        assert!(!s.eb_pinned.contains_key(&id));
+        assert!(!s.contains(&id));
+        s.admit_internal(id.clone(), body, 1, 1193, false);
+        assert!(!s.contains(&id), "late peer replay must remain spent");
+
+        // Protection is bounded to one EB, and clearing it restores normal
+        // pruning (including a child that announces no further EB).
+        s.record_eb_manifest(eb_key(2000, 3), vec![]);
+        assert!(s.get_eb_manifest(&child).is_some());
+        s.protect_chain_tip_eb(None);
+        assert!(s.get_eb_manifest(&child).is_none());
+        assert_eq!(s.eb_manifests.len(), 1);
+    }
+
+    #[test]
     fn slot_retention_drops_old_eb_manifest_and_pinned_bodies() {
         // Tight window so the test stays small.
         let mut s = MempoolState::new_with_eb_retention(100, 5);
@@ -1728,7 +1900,11 @@ mod tests {
         let evicted_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let evictions_initial = s.record_eb_manifest(old_eb, vec![evicted_id.clone()]);
         assert!(evictions_initial.is_empty(), "no evictions on first record");
-        s.merge_eb_body(eb_tx(evicted_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(evicted_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1),
+            false,
+            0,
+        );
         assert!(s.has_tx(&evicted_id));
         assert!(s.get_eb_manifest(&old_eb).is_some());
 
@@ -1758,7 +1934,11 @@ mod tests {
         // Old EB with a pinned body.
         let old_id = TxId::new_with_slice(&[0xAAu8; 32]);
         let _ = s.record_eb_manifest(eb_key(1, 0x01), vec![old_id.clone()]);
-        s.merge_eb_body(eb_tx(old_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(old_id.clone(), TxBody::new_with_vec(vec![0xAA]), 1),
+            false,
+            0,
+        );
 
         // Produce a new EB far past the retention window — the
         // producer-side path also evicts the aged closure.
@@ -1782,7 +1962,11 @@ mod tests {
         let id = TxId::new_with_slice(&[0xCCu8; 32]);
         s.record_eb_manifest(eb_key(1, 0x01), vec![id.clone()]);
         s.record_eb_manifest(eb_key(95, 0x02), vec![id.clone()]);
-        s.merge_eb_body(eb_tx(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1), false, 0);
+        s.merge_eb_body(
+            eb_tx(id.clone(), TxBody::new_with_vec(vec![0xCC]), 1),
+            false,
+            0,
+        );
         // Bump max so the slot=1 EB falls out of the window but slot=95 stays.
         s.record_eb_manifest(eb_key(99, 0x03), vec![]);
         assert!(s.get_eb_manifest(&eb_key(1, 0x01)).is_none());

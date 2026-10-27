@@ -40,7 +40,8 @@ stateDiagram-v2
 - **Max message size**: 65,535 bytes
 - **Ingress limit**: 65,536 bytes
 - **Max votes per offer**: 1,024
-- **Timeout**: busy 60s
+- **Timeout**: untimed long poll
+- **Client request pipeline**: 100 outstanding requests, replenished before event delivery. This matches the reference prototype, whose server drops notifications when request credits run out. The serial helper remains available for one-shot protocol clients.
 
 ## Messages
 

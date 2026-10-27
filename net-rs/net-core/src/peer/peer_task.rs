@@ -17,7 +17,7 @@ use crate::protocols::blockfetch::{self, BlockFetch};
 use crate::protocols::chainsync::{self, ChainSync, ChainSyncEvent};
 use crate::protocols::keepalive::{self, KeepAlive};
 use crate::protocols::leios_fetch::{self, LeiosFetch};
-use crate::protocols::leios_notify::{self, LeiosNotify, LeiosNotifyEvent};
+use crate::protocols::leios_notify::{self, LeiosNotifyEvent};
 use crate::protocols::peersharing::{self, PeerSharing};
 use crate::protocols::txsubmission::{self, PendingTx, TxSubmission};
 use crate::protocols::{Role, Runner};
@@ -557,7 +557,7 @@ fn eb_fields(point: &Point) -> (u64, String) {
     }
 }
 
-/// Spawn the LeiosNotify sub-task. Continuous request_next loop.
+/// Spawn the LeiosNotify sub-task with bounded request pipelining.
 pub(crate) fn spawn_leios_notify(
     ln_send: CodecSend,
     ln_recv: CodecRecv,
@@ -565,9 +565,9 @@ pub(crate) fn spawn_leios_notify(
     event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut runner = Runner::<LeiosNotify>::new(Role::Client, ln_send, ln_recv);
+        let mut client = leios_notify::PipelinedClient::new(ln_send, ln_recv);
         loop {
-            match leios_notify::request_next(&mut runner).await {
+            match client.next().await {
                 Ok(LeiosNotifyEvent::BlockAnnouncement { header }) => {
                     tracing::info!(%peer_id, header_bytes = header.raw.len(), "leios_notify: EB announcement (header)");
                     let _ = event_sender
@@ -1294,7 +1294,7 @@ mod tests {
         let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
             mux_pair_for_protocol(&ln_proto);
 
-        // Fake server: respond to two request_next calls, then expect MsgDone.
+        // Fake server: respond to two requests, then stay alive until aborted.
         let server_handle = tokio::spawn(async move {
             let mut runner =
                 ProtocolRunner::<LeiosNotify>::new(Role::Server, server_send, server_recv);
@@ -1327,8 +1327,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Client will be aborted, so the next recv will fail — that's fine.
-            let _ = runner.recv().await;
+            // More requests may already be queued by the pipelined client.
+            // Keep the server channel alive while the caller consumes replies.
+            std::future::pending::<()>().await;
         });
 
         let (event_sender, mut event_receiver) = mpsc::channel(64);
