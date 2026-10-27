@@ -27,8 +27,9 @@ findings. It never edits code, pushes commits, approves, or requests changes.
    `gpt-6.1-sol`, with high reasoning effort. The API project must have access to
    the selected model. Model changes do not require editing the workflow.
 4. On a small open PR, post `@codex review` as a user with repository write
-   access. Expect an eyes reaction, a `codex-review` commit status, and a review
-   from `github-actions[bot]`. Check that the inline findings use high/medium.
+   access. Expect a `codex-review` commit status and a review from
+   `github-actions[bot]`. An eyes reaction is best effort; missing reaction
+   permission does not stop the review. Check that inline findings use high/medium.
 
 The repository's Actions policy must permit the pinned `openai/codex-action`
 and `actions/checkout` actions. Organization policy must also permit the workflow's
