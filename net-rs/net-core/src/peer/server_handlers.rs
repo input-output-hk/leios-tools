@@ -4,7 +4,7 @@
 //! reading from an `Arc<ChainStore>` for chain state and sending
 //! events to the coordinator via an `mpsc` channel.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -36,7 +36,7 @@ use crate::protocols::blockfetch::{BlockFetch, Message as BfMsg};
 use crate::protocols::chainsync::{ChainSync, Message as CsMsg};
 use crate::protocols::keepalive::{KeepAlive, Message as KaMsg};
 use crate::protocols::leios_fetch::{LeiosFetch, Message as LfMsg};
-use crate::protocols::leios_notify::{LeiosNotify, Message as LnMsg};
+use crate::protocols::leios_notify::{self, Message as LnMsg};
 use crate::protocols::peersharing::{Message as PsMsg, PeerAddress, PeerSharing};
 use crate::protocols::txsubmission::{self, Message as TsMsg, TxSubmission};
 use crate::protocols::{Role, Runner};
@@ -960,83 +960,84 @@ pub async fn serve_leios_notify(
     peer: PeerId,
     controls: Option<&OutboundControls>,
 ) {
-    let mut runner = Runner::<LeiosNotify>::new(Role::Server, ln_send, ln_recv);
-    // `None` until the first MsgLeiosNotificationRequestNext arrives, at
-    // which point we snap forward to `store.notification_count()` —
-    // skipping every notification that landed in the queue *before* the
-    // upstream peer-selection governor promoted this connection to hot
-    // and started polling us.
-    //
-    // Why: a peer can sit cold/warm for the full ~15-min churn cycle
-    // while OTHER connections to the same node are hot and pulling EBs
-    // into the shared LeiosStore.  Those EBs push notification entries
-    // that our serve_leios_notify task can't deliver — nobody is asking.
-    // Without this snap, the first LNRequestNext after eventual hot
-    // promotion would drain the entire backlog in a single burst, often
-    // 10+ MsgLeiosBlockOffer messages in <100ms.  Observed behaviour:
-    // the dev relay either rate-limits this burst into a tight hot
-    // window or treats us as misbehaving and disconnects within ~1s of
-    // promotion (the "quick-drop" cluster we measured on 2026-06-17).
-    //
-    // Snapping forward also matches the wire semantics a downstream
-    // peer would expect: LeiosNotify is for offers fresh enough to be
-    // useful; anything older than ~15 min is already past the EB
-    // freshness window and the peer learns about it via the RB cert on
-    // chainsync instead.
-    let mut read_index: Option<usize> = None;
-    let mut subscription = store.subscribe();
-    let mut first_recv = true;
-
-    loop {
-        let msg = match runner.recv().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::warn!(
-                    peer = peer.0,
-                    err = %e,
-                    "leios_notify: serve_leios_notify recv error, exiting"
-                );
-                break;
-            }
-        };
-        if first_recv {
-            tracing::info!(
-                peer = peer.0,
-                "leios_notify: downstream opened protocol with us"
-            );
-            first_recv = false;
+    // The ordinary Runner is sequential. This responder reads ahead so a
+    // pipelined Quit can cancel requests whose notifications are still pending.
+    // Match the Haskell client's maximum number of outstanding requests.
+    const MAX_PENDING_REQUESTS: usize = 1000;
+    let mut ln_recv = ln_recv;
+    match ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await {
+        Ok(LnMsg::MsgLeiosNotificationRequestNext) => {}
+        Ok(LnMsg::MsgQuit) => {
+            let _ = ln_send.send(&LnMsg::MsgDone).await;
+            return;
         }
+        other => {
+            tracing::warn!(
+                peer = peer.0,
+                ?other,
+                "leios_notify: expected request or quit"
+            );
+            return;
+        }
+    }
+    tracing::info!(
+        peer = peer.0,
+        "leios_notify: downstream opened protocol with us"
+    );
 
-        match msg {
-            LnMsg::MsgLeiosNotificationRequestNext => {
-                let cursor = read_index.get_or_insert_with(|| {
-                    let snapped = store.notification_count();
-                    if snapped > 0 {
-                        tracing::info!(
-                            peer = peer.0,
-                            snapped_past = snapped,
-                            "leios_notify: first request — snapping cursor to queue tail, \
-                             skipping backlog accumulated while cold/warm"
-                        );
+    // Snap on the first request, preserving the policy of skipping backlog
+    // accumulated while this connection was cold/warm.
+    let mut read_index = store.notification_count();
+    let mut subscription = store.subscribe();
+    let mut offered_blocks = BTreeSet::new();
+    let mut pending_requests = 1;
+    loop {
+        let notification = next_outbound_notification(
+            &store,
+            &mut read_index,
+            peer,
+            &mut subscription,
+            controls,
+            &mut offered_blocks,
+        );
+        tokio::pin!(notification);
+        loop {
+            tokio::select! {
+                // Drain queued requests/Quit before delivering a ready reply.
+                biased;
+                incoming = ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT) => {
+                    match incoming {
+                        Ok(LnMsg::MsgLeiosNotificationRequestNext) => {
+                            if pending_requests == MAX_PENDING_REQUESTS {
+                                tracing::warn!(peer = peer.0, "leios_notify: too many pending requests");
+                                return;
+                            }
+                            pending_requests += 1;
+                        }
+                        Ok(LnMsg::MsgQuit) => {
+                            for _ in 0..pending_requests {
+                                if ln_send.send(&LnMsg::MsgCanceled).await.is_err() {
+                                    return;
+                                }
+                            }
+                            let _ = ln_send.send(&LnMsg::MsgDone).await;
+                            return;
+                        }
+                        other => {
+                            tracing::warn!(peer = peer.0, ?other, "leios_notify: expected request or quit");
+                            return;
+                        }
                     }
-                    snapped
-                });
-                if let Some(response) =
-                    next_outbound_notification(&store, cursor, peer, &mut subscription, controls)
-                        .await
-                {
-                    if runner.send(&response).await.is_err() {
-                        break;
+                }
+                response = &mut notification, if pending_requests > 0 => {
+                    let Some(response) = response else { return };
+                    if ln_send.send(&response).await.is_err() {
+                        return;
                     }
-                } else {
-                    return;
+                    pending_requests -= 1;
+                    break;
                 }
             }
-            LnMsg::MsgQuit => {
-                let _ = runner.send(&LnMsg::MsgDone).await;
-                break;
-            }
-            _ => break,
         }
     }
 }
@@ -1065,6 +1066,7 @@ async fn next_outbound_notification(
     peer: PeerId,
     subscription: &mut tokio::sync::watch::Receiver<u64>,
     controls: Option<&OutboundControls>,
+    offered_blocks: &mut BTreeSet<(u64, [u8; 32])>,
 ) -> Option<LnMsg> {
     use crate::store::leios_store::LeiosNotification;
     // Answer the peer within this window even when nothing is deliverable.
@@ -1074,6 +1076,13 @@ async fn next_outbound_notification(
     const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(50);
     let keepalive_deadline = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
     loop {
+        let cutoff = store.retention_cutoff();
+        while offered_blocks
+            .first()
+            .is_some_and(|(slot, _)| *slot < cutoff)
+        {
+            offered_blocks.pop_first();
+        }
         let pending = store.notifications_after(read_index);
         for entry in &pending {
             *read_index += 1;
@@ -1096,6 +1105,29 @@ async fn next_outbound_notification(
                     peer = peer.0,
                     "leios_notify: behaviour opened echo-to-source gate"
                 );
+            }
+
+            // Retries remain useful to newly connected peers, but an existing
+            // peer rejects a second body offer for the same slot/hash. Keep
+            // this history per connection, independently of the tx offer.
+            if let LeiosNotification::BlockOffer { point, .. } = &entry.notification {
+                let Point::Specific { slot, hash } = point else {
+                    continue;
+                };
+                if *slot < cutoff || offered_blocks.contains(&(*slot, *hash)) {
+                    continue;
+                }
+                // Bound memory even if the retention clock stalls or a slot
+                // contains arbitrarily many offers. Never evict a live key
+                // just to make room: that would let a duplicate through.
+                if offered_blocks.len() == crate::store::leios_store::MAX_NOTIFICATIONS {
+                    tracing::warn!(
+                        peer = peer.0,
+                        "leios_notify: offer history capacity exceeded"
+                    );
+                    return None;
+                }
+                offered_blocks.insert((*slot, *hash));
             }
 
             // Build the wire message, applying the `leios.offer_eb_size` rewrite
@@ -1725,6 +1757,228 @@ mod tests {
         mux_b.abort();
     }
 
+    fn spawn_notify_server(
+        store: Arc<LeiosStore>,
+        peer: PeerId,
+    ) -> (
+        CodecSend,
+        CodecRecv,
+        tokio::task::JoinHandle<()>,
+        crate::mux::RunningMux,
+        crate::mux::RunningMux,
+    ) {
+        let proto = crate::peer::peer_task::server_protocol_configs(true)
+            .into_iter()
+            .find(|config| config.id == leios_notify::PROTOCOL_ID)
+            .expect("LeiosNotify must be registered in the production peer config");
+        let ((send, recv), (server_send, server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&proto);
+        let server = tokio::spawn(serve_leios_notify(
+            server_send,
+            server_recv,
+            store,
+            peer,
+            None,
+        ));
+        (send, recv, server, mux_a, mux_b)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_server_cancels_pipelined_requests_on_quit() {
+        for requests in [0, 3, 1000] {
+            let (store, _rx) = LeiosStore::new(100);
+            let (send, mut recv, server, mux_a, mux_b) = spawn_notify_server(store, PeerId(7));
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                // Match a pipelined client: Quit follows the requests without
+                // waiting for notifications that might never arrive.
+                for _ in 0..requests {
+                    send.send(&LnMsg::MsgLeiosNotificationRequestNext)
+                        .await
+                        .unwrap();
+                }
+                send.send(&LnMsg::MsgQuit).await.unwrap();
+                for _ in 0..requests {
+                    assert!(matches!(
+                        recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
+                        LnMsg::MsgCanceled
+                    ));
+                }
+                assert!(matches!(
+                    recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
+                    LnMsg::MsgDone
+                ));
+                server.await.unwrap();
+            })
+            .await
+            .expect("Quit must cancel pending requests without waiting for keepalives");
+            mux_a.abort();
+            mux_b.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_server_quit_accounts_for_delivered_and_ready_replies() {
+        let (store, _rx) = LeiosStore::new(100);
+        let (send, mut recv, server, mux_a, mux_b) = spawn_notify_server(store.clone(), PeerId(7));
+        send.send(&LnMsg::MsgLeiosNotificationRequestNext)
+            .await
+            .unwrap();
+        let (first, _) = tokio::join!(recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT), async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            store.inject_block(make_point(21), vec![0xa0], None);
+        });
+        assert!(matches!(first.unwrap(), LnMsg::MsgLeiosBlockOffer { .. }));
+
+        // A notification races with Quit. Each remaining request must get
+        // exactly one reply, whether data or cancellation, before Done.
+        for _ in 0..2 {
+            send.send(&LnMsg::MsgLeiosNotificationRequestNext)
+                .await
+                .unwrap();
+        }
+        store.inject_block(make_point(22), vec![0xa0], None);
+        send.send(&LnMsg::MsgQuit).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut offers = 0;
+            for _ in 0..2 {
+                match recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap() {
+                    LnMsg::MsgCanceled => {}
+                    LnMsg::MsgLeiosBlockOffer { point, .. } => {
+                        assert_eq!(point, make_point(22));
+                        offers += 1;
+                    }
+                    other => panic!("unexpected pending reply: {other:?}"),
+                }
+            }
+            assert!(offers <= 1);
+            assert!(matches!(
+                recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
+                LnMsg::MsgDone
+            ));
+            server.await.unwrap();
+        })
+        .await
+        .expect("Done must follow exactly the unanswered requests");
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_server_retries_only_reach_connections_without_the_offer() {
+        let (store, _rx) = LeiosStore::new(100);
+        let (old_send, mut old_recv, old_server, old_a, old_b) =
+            spawn_notify_server(store.clone(), PeerId(7));
+        old_send
+            .send(&LnMsg::MsgLeiosNotificationRequestNext)
+            .await
+            .unwrap();
+        let point = make_point(21);
+        let (first, _) = tokio::join!(old_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT), async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            store.inject_block(point.clone(), vec![0xa0], None);
+        });
+        assert!(matches!(first.unwrap(), LnMsg::MsgLeiosBlockOffer { point: p, .. } if p == point));
+
+        // Use the same PeerId on a new connection: dedup is scoped to the
+        // conversation, not global history that would suppress reconnects.
+        let (new_send, mut new_recv, new_server, new_a, new_b) =
+            spawn_notify_server(store.clone(), PeerId(7));
+        new_send
+            .send(&LnMsg::MsgLeiosNotificationRequestNext)
+            .await
+            .unwrap();
+        old_send
+            .send(&LnMsg::MsgLeiosNotificationRequestNext)
+            .await
+            .unwrap();
+        // Let the new connection snap past the original offer before retrying.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        store.reoffer_unfetched(24);
+        store.inject_block(make_point(22), vec![0xa0], Some(PeerId(8)));
+        let (old, new) = tokio::join!(
+            old_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT),
+            new_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+        );
+        assert!(
+            matches!(old.unwrap(), LnMsg::MsgLeiosBlockOffer { point: p, .. } if p == make_point(22)),
+            "the existing connection must skip the retry and receive the next fresh offer"
+        );
+        assert!(
+            matches!(new.unwrap(), LnMsg::MsgLeiosBlockOffer { point: p, .. } if p == point),
+            "the new connection must still receive its first offer"
+        );
+
+        // Another retry is also suppressed, without suppressing the distinct
+        // transaction offer for the same block.
+        old_send
+            .send(&LnMsg::MsgLeiosNotificationRequestNext)
+            .await
+            .unwrap();
+        store.reoffer_unfetched(27);
+        store.inject_block_txs_full(point.clone(), vec![], None);
+        assert!(
+            matches!(old_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
+            LnMsg::MsgLeiosBlockTxsOffer { point: p } if p == point)
+        );
+
+        for (send, mut recv, server) in [
+            (old_send, old_recv, old_server),
+            (new_send, new_recv, new_server),
+        ] {
+            send.send(&LnMsg::MsgQuit).await.unwrap();
+            assert!(matches!(
+                recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
+                LnMsg::MsgDone
+            ));
+            server.await.unwrap();
+        }
+        old_a.abort();
+        old_b.abort();
+        new_a.abort();
+        new_b.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_server_rejects_excessive_pipeline() {
+        let (store, _rx) = LeiosStore::new(100);
+        let (send, _recv, server, mux_a, mux_b) = spawn_notify_server(store, PeerId(7));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            for _ in 0..1001 {
+                send.send(&LnMsg::MsgLeiosNotificationRequestNext)
+                    .await
+                    .unwrap();
+            }
+            server.await.unwrap();
+        })
+        .await
+        .expect("the responder must reject requests beyond the pipeline bound");
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_offer_history_expires_with_the_store() {
+        let (store, _rx) = LeiosStore::new_with_retention(100, None, 5, 0);
+        let mut sub = store.subscribe();
+        let mut cursor = 0;
+        let mut offered = BTreeSet::new();
+        store.inject_block(make_point(21), vec![0xa0], None);
+        assert!(matches!(
+            next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
+            Some(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(21)
+        ));
+        assert_eq!(offered.len(), 1);
+
+        store.tick_slot(30);
+        store.reoffer_unfetched(30);
+        store.inject_block(make_point(30), vec![0xa0], None);
+        assert!(matches!(
+            next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
+            Some(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(30)
+        ));
+        assert_eq!(offered, BTreeSet::from([(30, [30; 32])]));
+    }
+
     #[tokio::test]
     async fn leios_notify_server_sends_notifications() {
         let ln_proto = ProtocolConfig {
@@ -1818,9 +2072,17 @@ mod tests {
         // Nothing is ever deliverable to peer 0, yet the keepalive must
         // arrive within ~50s despite the constant churn.
         let mut idx = 0usize;
+        let mut offered_blocks = BTreeSet::new();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(55),
-            next_outbound_notification(&store, &mut idx, PeerId(0), &mut sub, None),
+            next_outbound_notification(
+                &store,
+                &mut idx,
+                PeerId(0),
+                &mut sub,
+                None,
+                &mut offered_blocks,
+            ),
         )
         .await;
         churn.abort();

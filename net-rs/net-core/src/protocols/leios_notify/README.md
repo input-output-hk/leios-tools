@@ -83,3 +83,15 @@ Tests use byte vectors derived from the Haskell encoder and captured payloads co
 - `done(runner) -> Result<(), ProtocolError>` — send `MsgQuit` and wait for `MsgDone`.
 
 The helpers are non-pipelined; they do not send a concurrent `MsgQuit` while a request is outstanding.
+
+## Server
+
+`serve_leios_notify` accepts up to 1,000 outstanding notification requests.
+It reads incoming requests while waiting for data. On `MsgQuit`, it replies
+with one `MsgCanceled` per unanswered request, then `MsgDone`.
+
+Block-body offers are deduplicated by slot and hash per connection. Store
+retries can therefore reach a new connection without repeating an offer on an
+existing one; transaction offers for the same block remain independent. Offer
+history expires with the store's retention window. At 10,000 retained offers,
+the responder terminates instead of forgetting live entries and risking duplicates.
