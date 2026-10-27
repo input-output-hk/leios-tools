@@ -1,6 +1,6 @@
 //! CBOR encoding for LeiosNotify messages.
 //!
-//! Wire format (Leios prototype rc-2026w41):
+//! Wire format:
 //!   msgLeiosNotificationRequestNext = [3]
 //!   msgLeiosBlockAnnouncement       = [4, announcement]
 //!   msgLeiosBlockOffer              = [5, point, eb_size]   eb_size = word32
@@ -356,12 +356,12 @@ mod tests {
         assert!(matches!(decoded, Message::MsgDone));
     }
 
-    // -- Historical payload vectors with w41 message tags --
+    // -- Block-offer and vote payload vectors --
 
-    /// Historical captured offer payload, re-tagged for w41:
-    /// `[5, [slot, eb_hash], eb_size]`. This is not a fresh w41 capture.
+    /// Block-offer vector: `[5, [slot, eb_hash], eb_size]`.
+    /// Uses a captured payload with an explicit message tag.
     #[test]
-    fn decode_retagged_historical_block_offer() {
+    fn decode_block_offer_vector() {
         let bytes = hex(
             "8305821a0005dfc75820630ee36ae6a20e024a30cb582b3fcd1fd3a1aa0df16c1c7be53fea9ac3f1f70b1941d3",
         );
@@ -376,14 +376,13 @@ mod tests {
             }
             other => panic!("expected MsgLeiosBlockOffer, got {other:?}"),
         }
-        // Our encoder reproduces the re-tagged vector exactly.
+        // Our encoder reproduces the vector exactly.
         assert_eq!(minicbor::to_vec(&decoded).unwrap(), bytes);
     }
 
-    /// Historical w27 vote payload with the w41 message tag.
-    /// The payload was captured; the outer tag is adjusted, not captured.
+    /// Vote vector with a captured payload and an explicit message tag.
     #[test]
-    fn decode_retagged_historical_votes() {
+    fn decode_votes_vector() {
         let bytes = hex(concat!(
             "82",                                                               // array(2)
             "07",   // tag = 7 (MsgLeiosVotes)
@@ -524,10 +523,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Exact CBOR from the w41 Haskell encoder, not a Rust round trip.
+    // Exact CBOR vectors derived from the Haskell encoder.
     // ouroboros-consensus c54515e35498e921cbd651a2c19c3360a41d35b8
     #[test]
-    fn w41_request_next_wire_vector() {
+    fn request_next_wire_vector() {
         let bytes = [0x81, 0x03];
         let msg: Message = minicbor::decode(&bytes).unwrap();
         assert!(matches!(msg, Message::MsgLeiosNotificationRequestNext));
@@ -535,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn w41_notification_wire_vectors() {
+    fn notification_wire_vectors() {
         // Haskell encodeLeiosNotify at c54515e35498e921cbd651a2c19c3360a41d35b8.
         // Literal protocol tags: independent of this Rust encoder.
         let vectors = [

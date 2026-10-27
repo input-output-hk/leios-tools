@@ -498,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn w41_shutdown_agency_and_transitions() {
+    fn shutdown_agency_and_transitions() {
         assert_eq!(LeiosNotify::agency(&State::StQuit), Agency::Server);
         assert_eq!(LeiosNotify::timeout(&State::StQuit), Some(TIMEOUT_QUIT));
         assert_eq!(
@@ -509,7 +509,7 @@ mod tests {
             LeiosNotify::transition(&State::StQuit, &Message::MsgDone).unwrap(),
             State::StDone
         );
-        // This is the old [0] RequestNext that w41 relays rejected in StIdle.
+        // MsgDone is only valid in StQuit.
         assert!(LeiosNotify::transition(&State::StIdle, &Message::MsgDone).is_err());
         assert!(LeiosNotify::transition(&State::StIdle, &Message::MsgCanceled).is_err());
         assert!(

@@ -1,5 +1,5 @@
-//! CBOR encoding for LeiosFetch messages (Leios prototype
-//! rc-2026w41).
+//! CBOR encoding for LeiosFetch messages (CIP-0164 prototype,
+//! cardano-blueprint `leios-prototype`).
 //!
 //! Wire format:
 //!   msgLeiosBlockRequest    = [1, point]              point = [slot, hash32]
@@ -683,10 +683,10 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // Exact CBOR from the w41 Haskell encoder, not a Rust round trip.
+    // Exact CBOR vectors derived from the Haskell encoder.
     // ouroboros-consensus c54515e35498e921cbd651a2c19c3360a41d35b8
     #[test]
-    fn w41_fetch_request_wire_vector() {
+    fn fetch_request_wire_vector() {
         let mut bytes = vec![0x82, 0x01, 0x82, 0x18, 0x2a, 0x58, 0x20];
         bytes.extend_from_slice(&[0xab; 32]);
         let msg: Message = minicbor::decode(&bytes).unwrap();
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn w41_fetch_reply_and_transaction_wire_vectors() {
+    fn fetch_reply_and_transaction_wire_vectors() {
         // Haskell encodeLeiosFetch at c54515e35498e921cbd651a2c19c3360a41d35b8.
         let point = Point::Specific {
             slot: 42,

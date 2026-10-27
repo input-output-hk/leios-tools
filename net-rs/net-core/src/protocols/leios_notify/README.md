@@ -1,8 +1,7 @@
 # LeiosNotify (protocol 18)
 
 Client polling for Leios announcements, endorser-block offers, transaction
-offers, and votes. This implementation uses the **rc-2026w41** wire format.
-It is incompatible with earlier prototype message tags.
+offers, and votes.
 
 The codec follows `encodeLeiosNotify` / `decodeLeiosNotify` in
 [ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestNotify.hs).
@@ -33,5 +32,5 @@ the Quit/Done exchange and returns `ProtocolError::Terminated`.
 `done` sends Quit and waits for Done. The helpers are non-pipelined; they do not
 send a concurrent Quit while a request is outstanding.
 
-Tests use exact vectors derived from the Haskell encoder and explicitly labelled
-historical payloads with updated tags. These are not fresh live-network captures.
+Tests use byte vectors derived from the Haskell encoder and captured payloads
+combined with explicit message tags.

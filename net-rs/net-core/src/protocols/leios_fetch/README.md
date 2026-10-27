@@ -1,31 +1,70 @@
-# LeiosFetch (protocol 19)
+# LeiosFetch (Protocol ID 19) — CIP-0164
 
-Request/response protocol for endorser blocks and their transactions. This
-implementation uses the **rc-2026w41** wire format and requires matching peers.
-Offers arrive separately through [LeiosNotify](../leios_notify/).
+Client-driven request/response for Leios data retrieval. Supports fetching individual endorser blocks (EBs) and selective transaction fetching via bitmap addressing. Complements [LeiosNotify](../leios_notify/) which provides the offers.
 
-The codec follows `encodeLeiosFetch` / `decodeLeiosFetch` in
-[ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestFetch.hs).
+The codec follows `encodeLeiosFetch` / `decodeLeiosFetch` in [ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestFetch.hs). Vote-fetch and block-range streaming messages are not implemented here.
 
-| Message | Wire value | Transition |
-| --- | --- | --- |
-| Done | `[0]` | Idle → Done |
-| BlockRequest | `[1, point]` | Idle → Block |
-| Block | `[2, block]` | Block → Idle |
-| BlockTxsRequest | `[3, point, bitmaps]` | Idle → BlockTxs |
-| BlockTxs | `[4, point, bitmaps, transactions]` | BlockTxs → Idle |
+## Files
 
-Wire values are Concise Binary Object Representation (CBOR) arrays. A `point`
-is `[slot, hash32]`; `bitmaps` maps 16-bit segment indices to 64-bit selection
-masks; `transactions` is a list of transaction bodies. Transition names omit
-the `St` prefix used by the Rust enum.
+| File | Description |
+|------|-------------|
+| `mod.rs` | State machine (`State`, `Message`), `Protocol` implementation |
+| `codec.rs` | CBOR encode/decode for LeiosFetch messages |
 
-The client has agency in Idle; the server has agency in Block and BlockTxs.
-Done has no agency. Responses have a 120-second timeout. Block and transaction
-bodies retain their raw CBOR bytes; the consumer interprets their contents.
-There are no vote-fetch or block-range messages in this implementation.
+**Legend:** CBOR = Concise Binary Object Representation.
 
-Decoding bounds block bodies to 16 MiB, individual transactions to 64 KiB,
-transaction lists to 65,536 entries, and bitmaps to 1,024 entries. The in-flight
-ingress buffer has a separate 24 MiB cap. Exact message-tag tests use vectors
-derived from the Haskell encoder, not fresh live-network captures.
+## State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> StIdle
+    StIdle --> StBlock : MsgLeiosBlockRequest
+    StIdle --> StBlockTxs : MsgLeiosBlockTxsRequest
+    StIdle --> StDone : MsgDone
+    StBlock --> StIdle : MsgLeiosBlock
+    StBlockTxs --> StIdle : MsgLeiosBlockTxs
+    StDone --> [*]
+```
+
+## Agency Table
+
+| State | Agency | Message | Next State |
+|-------|--------|---------|------------|
+| StIdle | **Client** | MsgLeiosBlockRequest(point) | StBlock |
+| StIdle | **Client** | MsgLeiosBlockTxsRequest(point, bitmap) | StBlockTxs |
+| StIdle | **Client** | MsgDone | StDone |
+| StBlock | **Server** | MsgLeiosBlock(block) | StIdle |
+| StBlockTxs | **Server** | MsgLeiosBlockTxs(point, bitmap, transactions) | StIdle |
+| StDone | Nobody | — | — |
+
+**Legend:** Agency = the side allowed to send the next message; `St` and `Msg` are the state and message prefixes used in the Rust enums. `point` identifies an endorser block by slot and hash; `bitmap` selects transactions. The transaction response echoes the requested point and bitmap.
+
+## Wire Format
+
+| Message | CBOR array |
+|---------|------------|
+| MsgDone | `[0]` |
+| MsgLeiosBlockRequest | `[1, point]` |
+| MsgLeiosBlock | `[2, block]` |
+| MsgLeiosBlockTxsRequest | `[3, point, bitmaps]` |
+| MsgLeiosBlockTxs | `[4, point, bitmaps, transactions]` |
+
+**Legend:** CBOR = Concise Binary Object Representation; `point` = `[slot, hash32]`, where `hash32` is a 32-byte hash; `block` = the endorser-block manifest map `{tx_hash => tx_size}` (transaction hash to transaction size); `bitmaps` = the transaction selection map described below; `transactions` = a list of transaction bodies. Block manifests and transaction bodies retain their raw CBOR bytes for the consumer to interpret.
+
+Exact message-tag tests use byte vectors derived from the Haskell encoder.
+
+## Limits
+
+These are the limits enforced by this Rust implementation:
+
+- **Max message size**: 65,535 bytes (idle), 25,165,824 bytes (data states, 24 MiB)
+- **Ingress limit**: 25,165,824 bytes (24 MiB)
+- **Max endorser-block manifest size**: 16,777,216 bytes (16 MiB)
+- **Max individual transaction size**: 65,536 bytes (64 KiB)
+- **Max bitmap entries**: 1,024
+- **Max transactions**: 65,536
+- **Timeout**: server states 120s (large transfers)
+
+## Bitmap TX Addressing
+
+`MsgLeiosBlockTxsRequest` carries a `BTreeMap<u16, u64>` bitmap for selective transaction fetching. Each entry maps a 16-bit segment index to a 64-bit bitmask, allowing the client to request specific transactions from an EB without downloading the entire set. This is critical for bandwidth efficiency when a node already has most transactions from prior dissemination.
