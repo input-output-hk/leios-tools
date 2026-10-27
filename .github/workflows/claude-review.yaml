@@ -18,10 +18,12 @@ name: "claude-review"
 # Needs secret ANTHROPIC_API_KEY: an IOHK-owned Claude Console key (not a
 # personal subscription token, which lapses with that person's plan).
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  issue_comment:
-    types: [created]
+  # WARNING: Disabled auto-review of PRs since Claude is not used currently.
+  #  pull_request:
+  #    types: [opened, synchronize, reopened, ready_for_review]
+  #  issue_comment:
+  #    types: [created]
+  workflow_dispatch:
 
 env:
   # A different model from the one that writes most of this code (Opus 4.8),
