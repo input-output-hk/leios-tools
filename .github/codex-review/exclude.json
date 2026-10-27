@@ -1,0 +1,4 @@
+[
+  ":(exclude,glob)**/Cargo.lock",
+  ":(exclude)data/simulation/pseudo-mainnet/"
+]

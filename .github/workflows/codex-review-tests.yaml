@@ -1,0 +1,22 @@
+name: codex-review-tests
+on:
+  pull_request:
+    paths:
+      - '.github/codex-review/**'
+      - '.github/workflows/codex-review*.yaml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/codex-review/**'
+      - '.github/workflows/codex-review*.yaml'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s .github/codex-review -p 'test_*.py'
