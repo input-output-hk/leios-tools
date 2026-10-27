@@ -114,6 +114,18 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn('ready=true', Path(os.environ['GITHUB_OUTPUT']).read_text())
         self.assertEqual(self.posts[-1][1], {'content': 'eyes'})
 
+    def test_reaction_failure_does_not_block_authorized_review(self):
+        def deny_reaction(route, payload=None, pages=False):
+            if route.endswith('/reactions'):
+                raise subprocess.CalledProcessError(1, ['gh', 'api'])
+            return self.api(route, payload, pages)
+        with patch.object(review, 'api', side_effect=deny_reaction):
+            self.gate()
+        outputs = Path(os.environ['GITHUB_OUTPUT']).read_text()
+        self.assertIn('ready=true', outputs)
+        self.assertIn('requested=true', outputs)
+        self.assertEqual(self.posts[-1][1]['state'], 'pending')
+
     def test_automatic_fork_and_draft_reviews_are_skipped(self):
         self.event['pull_request'] = {'number': 12}
         with patch.dict(os.environ, GITHUB_EVENT_NAME='pull_request_target'):

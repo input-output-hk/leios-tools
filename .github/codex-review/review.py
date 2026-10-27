@@ -73,7 +73,12 @@ def gate():
     output(ready="true", requested=str(requested).lower())
     status(head, "pending", "Codex review is queued")
     if requested:
-        api(endpoint(f"issues/comments/{int(event['comment']['id'])}/reactions"), {"content": "eyes"})
+        # Acknowledgment is cosmetic. PR comment reactions can be denied even
+        # when the token can read the PR and publish its commit status.
+        try:
+            api(endpoint(f"issues/comments/{int(event['comment']['id'])}/reactions"), {"content": "eyes"})
+        except subprocess.CalledProcessError:
+            print("::warning::Could not acknowledge the request; continuing the review")
 
 
 def git(*args, check=True):
