@@ -70,8 +70,11 @@ where
         // Wait until at least one protocol has data.
         wait_for_any_data(&mut protocols, &notify).await;
 
-        // Remove dead protocols (sender dropped, no pending data).
-        protocols.retain(|_, state| !state.rx.is_closed() || state.pending.is_some());
+        // A dropped sender may still have queued replies (for example Done).
+        // Remove it only after both the channel and staged output are drained.
+        protocols.retain(|_, state| {
+            !state.rx.is_closed() || !state.rx.is_empty() || state.pending.is_some()
+        });
         if protocols.is_empty() {
             return Ok(());
         }
@@ -149,8 +152,10 @@ async fn wait_for_any_data(protocols: &mut HashMap<ChannelKey, ProtocolEgress>, 
             }
         }
 
-        // Remove disconnected protocols with no pending data.
-        protocols.retain(|_, state| !state.rx.is_closed() || state.pending.is_some());
+        // Keep disconnected protocols until all queued/staged output is drained.
+        protocols.retain(|_, state| {
+            !state.rx.is_closed() || !state.rx.is_empty() || state.pending.is_some()
+        });
         if protocols.is_empty() {
             return;
         }

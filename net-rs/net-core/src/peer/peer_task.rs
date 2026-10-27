@@ -639,11 +639,10 @@ pub(crate) fn spawn_leios_notify(
                         .send((peer_id, PeerEvent::LeiosVotesReceived { votes }))
                         .await;
                 }
-                Err(crate::protocols::ProtocolError::Terminated) => {
-                    tracing::debug!(%peer_id, "leios_notify: shutdown complete");
-                    return;
-                }
                 Err(e) => {
+                    // This task never requests shutdown. Even Terminated means
+                    // unsolicited cancellation: report it so the coordinator
+                    // reconnects instead of leaving a peer with no Leios stream.
                     let _ = event_sender
                         .send((
                             peer_id,
@@ -1379,7 +1378,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn spawn_leios_notify_completes_cancellation_without_failure_event() {
+    async fn spawn_leios_notify_reports_unsolicited_cancellation() {
         let proto = server_protocol_configs(true)
             .into_iter()
             .find(|config| config.id == leios_notify::PROTOCOL_ID)
@@ -1415,8 +1414,16 @@ mod tests {
             client.await.unwrap();
             server.await.unwrap();
             assert!(
+                matches!(
+                    receiver.recv().await,
+                    Some((PeerId(1), PeerEvent::Failed { reason }))
+                        if reason.starts_with("leios_notify:")
+                ),
+                "unsolicited cancellation must reach the coordinator for reconnection"
+            );
+            assert!(
                 receiver.recv().await.is_none(),
-                "normal shutdown must not report PeerEvent::Failed"
+                "report failure exactly once"
             );
         })
         .await

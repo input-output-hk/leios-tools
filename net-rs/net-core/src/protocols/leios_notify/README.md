@@ -91,6 +91,10 @@ The production peer task uses `PipelinedClient::next()`. Its `shutdown()` sends
 already in flight are discarded during draining. A cancellation received by
 `next()` also starts this shutdown and returns `ProtocolError::Terminated` after
 completion. Calling `shutdown()` again neither repeats Quit nor resets its deadline.
+The production peer task does not initiate shutdown: unsolicited cancellation is
+reported to the coordinator as a peer failure after the handshake completes, so
+the connection is torn down and can reconnect instead of silently losing its
+notification stream.
 
 ## Server
 
