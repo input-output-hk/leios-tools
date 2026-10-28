@@ -1,0 +1,10 @@
+{
+  "node_revision": "65dd69d103e41a749d428ffd05de153ef7c2ab45",
+  "network_magic": 164,
+  "slot": 932714,
+  "eb_hash": "d28c538ace50e0f905b0caed73ad875df1325dfaee12d5b4f7dc0976d8feee0c",
+  "transaction_hash": "4224b3c1c049ce99bb826751151a47201818ec199ee0f0b77f548799afeb4762",
+  "transaction_bytes": 1025,
+  "source": "musashi w43 relay, LeiosNotify offer then LeiosFetch bitmap {0:0x8000000000000000}",
+  "captured_at": "2026-10-28T19:05:15Z"
+}

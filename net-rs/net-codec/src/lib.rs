@@ -22,13 +22,16 @@ mod header;
 mod leios_header;
 pub use leios_header::validate_leios_header;
 mod transaction;
-pub use transaction::{inline_leios_transaction, leios_inline_transaction};
+pub use transaction::{
+    inline_leios_transaction, leios_inline_transaction, leios_mempool_transaction,
+    mempool_leios_transaction,
+};
 
 pub use block::{BlockBody, LeiosBlockInfo};
 pub use eb::{decode_overflow_eb, encode_overflow_eb};
 pub use encode::{
-    encode_block_body, encode_header_inner, wrap_block, wrap_header, HeaderBody, OperationalCert,
-    DIJKSTRA_BLOCK_ERA, DIJKSTRA_HEADER_ERA,
+    DIJKSTRA_BLOCK_ERA, DIJKSTRA_HEADER_ERA, HeaderBody, OperationalCert, encode_block_body,
+    encode_header_inner, wrap_block, wrap_header,
 };
 pub use header::{HeaderInfo, WrappedHeader};
 

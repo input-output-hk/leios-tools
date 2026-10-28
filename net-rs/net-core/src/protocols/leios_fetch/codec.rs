@@ -5,16 +5,15 @@
 //!   msgLeiosBlockRequest    = [1, point]              point = [slot, hash32]
 //!   msgLeiosBlock           = [2, endorser_block]     endorser_block = { hash => word32 }
 //!   msgLeiosBlockTxsRequest = [3, point, bitmaps]     bitmaps = { word16 => word64 }
-//!   msgLeiosBlockTxs        = [4, point, bitmaps, tx_list]   tx_list = [ *tx ]
+//!   msgLeiosBlockTxs        = [4, tx_list]   tx_list = [ * #6.24(bytes .cbor block_transaction) ]
 //!   msgClientDone           = [0]
 //!
-//! `endorser_block` and each `tx` are carried as raw CBOR (opaque
-//! pass-through): the codec splices/captures their bytes verbatim, so
-//! the exact map/tx shape lives with the consumer, not here.
+//! The manifest is raw CBOR; transaction bytes are opaque inside tag 24.
+//! The transaction's trailing validity flag is part of its manifest identity.
 
 use std::collections::BTreeMap;
 
-use super::{Message, MAX_BITMAP_ENTRIES, MAX_BLOCK_SIZE, MAX_TRANSACTIONS, MAX_TRANSACTION_SIZE};
+use super::{MAX_BITMAP_ENTRIES, MAX_BLOCK_SIZE, MAX_TRANSACTION_SIZE, MAX_TRANSACTIONS, Message};
 use crate::types::Point;
 use minicbor::decode::Error as DecodeError;
 use minicbor::encode::Error as EncodeError;
@@ -45,15 +44,9 @@ impl minicbor::Encode<()> for Message {
                 minicbor::Encode::encode(point, e, &mut ())?;
                 encode_bitmap(e, bitmap)?;
             }
-            Message::MsgLeiosBlockTxs {
-                point,
-                bitmap,
-                transactions,
-            } => {
-                e.array(4)?;
+            Message::MsgLeiosBlockTxs { transactions } => {
+                e.array(2)?;
                 e.u32(4)?;
-                minicbor::Encode::encode(point, e, &mut ())?;
-                encode_bitmap(e, bitmap)?;
                 encode_tx_list(e, transactions)?;
             }
             Message::MsgDone => {
@@ -67,8 +60,17 @@ impl minicbor::Encode<()> for Message {
 
 impl<'a> minicbor::Decode<'a, ()> for Message {
     fn decode(d: &mut Decoder<'a>, _ctx: &mut ()) -> Result<Self, DecodeError> {
-        let _array_len = d.array()?;
+        let array_len = d.array()?;
         let tag = d.u32()?;
+        let expected_len = match tag {
+            0 => 1,
+            1 | 2 | 4 => 2,
+            3 => 3,
+            _ => return Err(DecodeError::message("unknown LeiosFetch message tag")),
+        };
+        if array_len != Some(expected_len) {
+            return Err(DecodeError::message("incorrect LeiosFetch message arity"));
+        }
 
         match tag {
             1 => {
@@ -87,14 +89,8 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
                 Ok(Message::MsgLeiosBlockTxsRequest { point, bitmap })
             }
             4 => {
-                let point = Point::decode(d, &mut ())?;
-                let bitmap = decode_bitmap(d)?;
                 let transactions = decode_tx_list(d)?;
-                Ok(Message::MsgLeiosBlockTxs {
-                    point,
-                    bitmap,
-                    transactions,
-                })
+                Ok(Message::MsgLeiosBlockTxs { transactions })
             }
             0 => Ok(Message::MsgDone),
             other => Err(DecodeError::message(format!(
@@ -123,13 +119,14 @@ fn encode_bitmap<W: minicbor::encode::Write>(
     Ok(())
 }
 
-/// Encode a tx list `[ tx, ... ]`, encoding each tx into CBOR bytes string.
+/// Encode the w42/w43 cbor-in-cbor transaction list without changing its bytes.
 fn encode_tx_list<W: minicbor::encode::Write>(
     e: &mut Encoder<W>,
     txs: &[TxBody],
 ) -> Result<(), EncodeError<W::Error>> {
     e.array(txs.len() as u64)?;
     for tx in txs {
+        e.tag(minicbor::data::Tag::new(24))?;
         e.bytes(tx.get_slice())?;
     }
     Ok(())
@@ -170,6 +167,11 @@ fn decode_raw_bounded(
 }
 
 fn decode_raw_tx_body(d: &mut Decoder<'_>) -> Result<TxBody, DecodeError> {
+    if d.tag()?.as_u64() != 24 {
+        return Err(DecodeError::message(
+            "expected tag 24 for Leios transaction",
+        ));
+    }
     let raw = d.bytes()?;
     check_max_size(raw, MAX_TRANSACTION_SIZE, "transaction body")?;
     Ok(TxBody::new_with_slice(raw))
@@ -256,8 +258,6 @@ fn decode_bitmap(d: &mut Decoder<'_>) -> Result<BTreeMap<u16, u64>, DecodeError>
 mod tests {
     use super::*;
     use crate::types::Point;
-    use minicbor::Decode;
-    use std::convert::Infallible;
 
     fn round_trip(msg: &Message) -> Result<Message, DecodeError> {
         let encoded = minicbor::to_vec(msg).unwrap();
@@ -368,216 +368,29 @@ mod tests {
         TxBody::new_with_vec(vec![n])
     }
 
-    fn block_txs_round_trip_impl(
-        original_transactions: Vec<TxBody>,
-        original_bitmap: BTreeMap<u16, u64>,
-        round_trip: &dyn Fn(&Message) -> Result<Message, DecodeError>,
-    ) -> Result<(), DecodeError> {
-        let msg = Message::MsgLeiosBlockTxs {
-            point: Point::Specific {
-                slot: 7,
-                hash: test_hash(),
-            },
-            bitmap: original_bitmap.clone(),
-            transactions: original_transactions.clone(),
+    #[test]
+    fn block_txs_preserve_opaque_bytes() {
+        let transactions = vec![
+            tx(1),
+            TxBody::new_with_slice(b"not CBOR"),
+            TxBody::new_with_slice(&[0x64, 0xd0, 0x9f, 0xd0, 0xd0]),
+        ];
+        let decoded = round_trip(&Message::MsgLeiosBlockTxs {
+            transactions: transactions.clone(),
+        })
+        .unwrap();
+        let Message::MsgLeiosBlockTxs {
+            transactions: actual,
+        } = decoded
+        else {
+            panic!("expected transactions");
         };
-        let decoded = round_trip(&msg)?;
-        match decoded {
-            Message::MsgLeiosBlockTxs {
-                point,
-                bitmap,
-                transactions,
-            } => {
-                assert_eq!(
-                    point,
-                    Point::Specific {
-                        slot: 7,
-                        hash: test_hash()
-                    }
-                );
-                assert_eq!(bitmap, original_bitmap);
-                if transactions != original_transactions {
-                    return Err(DecodeError::message(format!(
-                        "Round trip transactions mismatch: got {transactions:?}, expected {original_transactions:?}"
-                    )));
-                }
-            }
-            other => panic!("expected MsgLeiosBlockTxs, got {other:?}"),
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn block_txs_round_trip() {
-        let mut bitmap = BTreeMap::new();
-        bitmap.insert(0u16, 0x3u64);
-
-        block_txs_round_trip_impl(vec![tx(1), tx(2)], bitmap, &round_trip).unwrap();
-    }
-
-    /// (simplified flawed implementation, to demonstrate CBOR decoding bug)
-    fn non_cbor_encode_leios_block(
-        m: &Message,
-        e: &mut Encoder<Vec<u8>>,
-        _ctx: &mut (),
-    ) -> Result<(), EncodeError<Infallible>> {
-        if let Message::MsgLeiosBlockTxs {
-            point,
-            transactions,
-            ..
-        } = m
-        {
-            e.array(4)?;
-            e.u32(4)?;
-            minicbor::Encode::encode(point, e, &mut ())?;
-            non_cbor_encode_tx_list(e, transactions)?;
-            Ok(())
-        } else {
-            Err(EncodeError::message(
-                "only MsgLeiosBlockTxs is supported in this test",
-            ))
-        }
-    }
-
-    /// (simplified flawed implementation, to demonstrate CBOR decoding bug)
-    fn non_cbor_decode_leios_block(d: &mut Decoder, _ctx: &mut ()) -> Result<Message, DecodeError> {
-        let _array_len = d.array()?;
-        let tag = d.u32()?;
-
-        if tag == 4 {
-            let point = Point::decode(d, &mut ())?;
-            let transactions = non_cbor_decode_tx_list(d)?;
-            Ok(Message::MsgLeiosBlockTxs {
-                point,
-                bitmap: BTreeMap::new(),
-                transactions,
-            })
-        } else {
-            Err(DecodeError::message(format!(
-                "unknown or unsupported leios_fetch message tag: {tag}"
-            )))
-        }
-    }
-
-    /// Encode a tx list `[ tx, ... ]`, splicing each tx's raw CBOR verbatim
-    /// (txs are opaque pass-through — `tx.tx` may be any CBOR shape).
-    /// (simplified flawed implementation, to demonstrate CBOR decoding bug)
-    fn non_cbor_encode_tx_list<W: minicbor::encode::Write>(
-        e: &mut Encoder<W>,
-        txs: &[TxBody],
-    ) -> Result<(), EncodeError<W::Error>> {
-        e.array(txs.len() as u64)?;
-        for tx in txs {
-            encode_raw(e, tx.get_slice())?;
-        }
-        Ok(())
-    }
-
-    /// Decode a tx list, capturing each tx's raw CBOR (count- and
-    /// size-bounded).
-    /// (simplified flawed implementation, to demonstrate CBOR decoding bug)
-    fn non_cbor_decode_tx_list(d: &mut Decoder<'_>) -> Result<Vec<TxBody>, DecodeError> {
-        let len = d.array()?;
-        match len {
-            Some(n) => {
-                let n = n as usize;
-                let mut items = Vec::with_capacity(n);
-                for _ in 0..n {
-                    items.push(TxBody::new_with_vec(decode_raw_bounded(
-                        d,
-                        MAX_TRANSACTION_SIZE,
-                        "transaction",
-                    )?));
-                }
-                Ok(items)
-            }
-            None => Err(DecodeError::message(
-                "indefinite-length tx list is not supported in this test",
-            ))?,
-        }
-    }
-
-    /// Use simplified flawed implementations to round-trip `message`.
-    fn non_cbor_round_trip(message: &Message) -> Result<Message, DecodeError> {
-        let mut e = Encoder::new(Vec::new());
-        let _encoded = non_cbor_encode_leios_block(message, &mut e, &mut ());
-        let writer = e.into_writer();
-        let mut d = Decoder::new(&writer);
-        non_cbor_decode_leios_block(&mut d, &mut ())
-    }
-
-    /// This test emulates a bug that quickly degrades network performance. The bug is
-    /// caused by inconsistent data representation inside `TxBody`: half the code
-    /// treats it as CBOR-encoded, while the other half treats it as raw bytes.
-    ///
-    /// There were two traditional ways of CBOR decoding:
-    /// (a) as some incorrect TxBody, which is decoded from CBOR --- but there is no way to check,
-    ///     this results in bad performance.
-    /// (b) as non-complete CBOR, this also degrades performance (TxBody is not received, despite
-    ///     it is delivered).
-    ///
-    /// However, the bug also manifested as decoding errors, which produced random warnings.
-    /// This code reproduces these manifestations (to make sure that the bug is found).
-
-    #[test]
-    fn non_cbor_block_txs_round_trip() {
-        let value1 = TxBody::new_with_slice(
-            "Lorem Ipsum es simplemente el texto de relleno de las imprentas y archivos de texto."
-                .as_bytes(),
-        );
-
-        // We need some non-ASCII characters to trigger the bug.
-        let value2 = TxBody::new_with_slice(
-            "Съешь ещё этих мягких французских булок, да выпей же чаю".as_bytes(),
-        );
-
-        // Sub-test 1. Correct CBOR, different transactions.
-        let txs = vec![value1.clone(), value2.clone()];
-
-        // ... Must be correct in corrected func.
-        block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &round_trip).unwrap();
-
-        // ... Inconsistent CBOR encoding: different txs.
-        let result = block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &non_cbor_round_trip);
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .starts_with("decode error: Round trip transactions mismatch"));
-
-        // Sub-test 2. Incorrect CBOR
-        let value1a = TxBody::new_with_slice("Lorem Ipsum".as_bytes());
-        let txs = vec![value1a.clone(), value2.clone()];
-
-        // ... Must be correct in corrected func.
-        block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &round_trip).unwrap();
-
-        // ... CBOR format cannot be correctly decoded.
-        let result = block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &non_cbor_round_trip);
-        assert_eq!(result.unwrap_err().position(), Some(78));
-
-        // Sub-test 3. 'utf-8': incorrect utf-8 sequence.
-        let value1b = TxBody::new_with_slice([0x64, 0xD0, 0x9F, 0xD0, 0xD0].as_slice());
-        let txs = vec![value1b.clone(), value2.clone()];
-
-        // ... Must be correct in corrected func.
-        block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &round_trip).unwrap();
-
-        // ... and leads to unrelated decoding errors.
-        let result = block_txs_round_trip_impl(txs.clone(), BTreeMap::new(), &non_cbor_round_trip);
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "invalid utf-8 at position 39"
-        );
+        assert_eq!(actual, transactions);
     }
 
     #[test]
     fn block_txs_empty_round_trip() {
         let msg = Message::MsgLeiosBlockTxs {
-            point: Point::Specific {
-                slot: 0,
-                hash: [0; 32],
-            },
-            bitmap: BTreeMap::new(),
             transactions: vec![],
         };
         let decoded = round_trip(&msg).unwrap();
@@ -606,8 +419,7 @@ mod tests {
     fn decode_indefinite_outer_array() {
         // MsgDone [0] as indefinite: 0x9f 0x00 0xff
         let cbor = &[0x9f, 0x00, 0xff];
-        let decoded: Message = minicbor::decode(cbor).unwrap();
-        assert!(matches!(decoded, Message::MsgDone));
+        assert!(minicbor::decode::<Message>(cbor).is_err());
     }
 
     #[test]
@@ -648,25 +460,15 @@ mod tests {
 
     #[test]
     fn transaction_list_exceeds_max_fails() {
-        let mut buf = Vec::new();
-        let mut e = minicbor::Encoder::new(&mut buf);
-        e.array(4).unwrap();
-        e.u32(4).unwrap();
-        // point
-        e.array(2).unwrap();
-        e.u64(0).unwrap();
-        e.bytes(&[0u8; 32]).unwrap();
-        // empty bitmap
-        e.map(0).unwrap();
-        // oversized tx list
-        let n = MAX_TRANSACTIONS + 1;
-        e.array(n as u64).unwrap();
-        for _ in 0..n {
-            e.u8(1).unwrap();
-        }
-
-        let result: Result<Message, _> = minicbor::decode(&buf);
-        assert!(result.is_err());
+        let mut e = Encoder::new(Vec::new());
+        e.array(2)
+            .unwrap()
+            .u32(4)
+            .unwrap()
+            .array((MAX_TRANSACTIONS + 1) as u64)
+            .unwrap();
+        let result = minicbor::decode::<Message>(&e.into_writer());
+        assert!(result.unwrap_err().to_string().contains("maximum"));
     }
 
     #[test]
@@ -696,7 +498,7 @@ mod tests {
 
     #[test]
     fn fetch_reply_and_transaction_wire_vectors() {
-        // Haskell encodeLeiosFetch at c54515e35498e921cbd651a2c19c3360a41d35b8.
+        // Haskell encodeLeiosFetch at a337d69f4946d5a1b20ecaaeae635dd47822e3d2.
         let point = Point::Specific {
             slot: 42,
             hash: [0xab; 32],
@@ -704,9 +506,7 @@ mod tests {
         let mut request = vec![0x83, 0x03, 0x82, 0x18, 0x2a, 0x58, 0x20];
         request.extend_from_slice(&[0xab; 32]);
         request.extend_from_slice(&[0xbf, 0xff]); // Haskell encodes an indefinite map
-        let mut response = vec![0x84, 0x04, 0x82, 0x18, 0x2a, 0x58, 0x20];
-        response.extend_from_slice(&[0xab; 32]);
-        response.extend_from_slice(&[0xbf, 0xff, 0x80]); // empty bitmap and tx list
+        let response = vec![0x82, 0x04, 0x80];
         let vectors = [
             (Message::MsgDone, vec![0x81, 0x00]),
             (
@@ -722,8 +522,6 @@ mod tests {
             ),
             (
                 Message::MsgLeiosBlockTxs {
-                    point,
-                    bitmap: BTreeMap::new(),
                     transactions: vec![],
                 },
                 response,
@@ -738,5 +536,72 @@ mod tests {
             assert_eq!(minicbor::to_vec(&expected).unwrap(), bytes);
             assert_eq!(minicbor::to_vec(&decoded).unwrap(), bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod w43_vectors {
+    use super::*;
+
+    #[test]
+    fn captured_w43_transaction_request() {
+        let raw = include_bytes!("../../../test_data/leios-fetch-w43-request.cbor");
+        let message: Message = minicbor::decode(raw).unwrap();
+        let Message::MsgLeiosBlockTxsRequest { bitmap, .. } = &message else {
+            panic!("expected transaction request");
+        };
+        assert_eq!(bitmap, &BTreeMap::from([(0, 1_u64 << 63)]));
+        assert_eq!(minicbor::to_vec(message).unwrap(), raw);
+    }
+
+    #[test]
+    fn rejects_legacy_response_and_wrong_transaction_tag() {
+        for raw in [
+            &[0x84, 0x04, 0x80, 0xa0, 0x80][..],
+            &[0x82, 0x04, 0x81, 0xd8, 0x17, 0x40],
+            &[0x82, 0x04, 0x81, 0x40],
+        ] {
+            assert!(minicbor::decode::<Message>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn bounds_transaction_bytes_and_indefinite_list_count() {
+        let message = Message::MsgLeiosBlockTxs {
+            transactions: vec![TxBody::new_with_vec(vec![0; MAX_TRANSACTION_SIZE + 1])],
+        };
+        let encoded = minicbor::to_vec(message).unwrap();
+        assert!(
+            minicbor::decode::<Message>(&encoded)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum")
+        );
+        let mut raw = vec![0x82, 0x04, 0x9f];
+        for _ in 0..=MAX_TRANSACTIONS {
+            raw.extend_from_slice(&[0xd8, 0x18, 0x40]);
+        }
+        raw.push(0xff);
+        assert!(
+            minicbor::decode::<Message>(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("maximum")
+        );
+    }
+
+    #[test]
+    fn captured_w43_transaction_response() {
+        let raw = include_bytes!("../../../test_data/leios-fetch-w43-response.cbor");
+        let message: Message = minicbor::decode(raw).unwrap();
+        let Message::MsgLeiosBlockTxs { transactions, .. } = &message else {
+            panic!("expected transaction response");
+        };
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            transactions[0].get_slice(),
+            include_bytes!("../../../../net-codec/test_data/leios-transaction-w43.cbor")
+        );
+        assert_eq!(minicbor::to_vec(message).unwrap(), raw);
     }
 }

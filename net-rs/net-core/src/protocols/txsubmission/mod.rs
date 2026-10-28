@@ -6,11 +6,11 @@
 
 pub mod codec;
 
+use shared_consensus::PeerId;
 use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use shared_consensus::PeerId;
 use tokio::sync::mpsc;
 
 use crate::protocols::{Agency, Protocol, ProtocolError, Runner};
@@ -73,11 +73,7 @@ pub const MAX_ERA: u16 = 7;
 /// era we put on the wire so the advertised id-era and the delivered body-era
 /// stay consistent for a given tx.
 fn wire_era(era: u16) -> u16 {
-    if era > MAX_ERA {
-        ORIGIN_ERA
-    } else {
-        era
-    }
+    if era > MAX_ERA { ORIGIN_ERA } else { era }
 }
 
 // --- Types ---
@@ -124,6 +120,17 @@ impl PendingTx {
     /// `PendingTx::era`). Txs with no wire era of their own (e.g. Leios EB bodies
     /// fetched by bitmap) pass `ORIGIN_ERA`.
     pub fn new_with_body(body: TxBody, era: u16) -> Self {
+        // Internal keys and EB manifests cover block_transaction bytes,
+        // including validity. Mempool submissions omit that producer-owned flag.
+        // Already encoded block transactions and opaque adversarial payloads
+        // retain their exact received bytes.
+        let body = if era == ORIGIN_ERA {
+            net_codec::mempool_leios_transaction(body.get_slice())
+                .map(TxBody::new_with_vec)
+                .unwrap_or(body)
+        } else {
+            body
+        };
         PendingTx {
             tx: TxInfo::new_with_body(body),
             era,
@@ -270,7 +277,10 @@ fn ack_and_prune(
         let Some(acked) = announced.pop_front() else {
             break;
         };
-        if let Some(pos) = pending_bodies.iter().position(|p| p.tx.tx_id == acked.tx.tx_id) {
+        if let Some(pos) = pending_bodies
+            .iter()
+            .position(|p| p.tx.tx_id == acked.tx.tx_id)
+        {
             pending_bodies.remove(pos);
         }
     }
@@ -304,6 +314,27 @@ fn announce_txs(
 ) -> Vec<TxIdAndSize> {
     let mut reply = Vec::with_capacity(new_txs.len());
     for tx in new_txs {
+        let wire_tx;
+        let tx = if tx.era == ORIGIN_ERA {
+            let body = match net_codec::leios_mempool_transaction(tx.tx.body.get_slice()) {
+                Ok(bytes) => TxBody::new_with_vec(bytes),
+                Err(error) => {
+                    tracing::warn!(%error, "transaction cannot be represented for Dijkstra submission");
+                    continue;
+                }
+            };
+            wire_tx = PendingTx {
+                tx: Arc::new(TxInfo {
+                    tx_id: tx.tx.tx_id.clone(),
+                    size: body.len() as u32,
+                    body,
+                }),
+                era: tx.era,
+            };
+            &wire_tx
+        } else {
+            tx
+        };
         match praos_tx_id(tx) {
             Some(tx_id) => {
                 reply.push(TxIdAndSize {
@@ -472,7 +503,7 @@ mod tests {
     use crate::bearer::mem::MemBearer;
     use crate::mux::scheduler::{RoundRobin, TrafficClass};
     use crate::mux::{
-        CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, MODE_INITIATOR, MODE_RESPONDER,
+        CodecRecv, CodecSend, MODE_INITIATOR, MODE_RESPONDER, Mux, MuxConfig, ProtocolConfig,
     };
     use crate::protocols::Role;
 
@@ -579,16 +610,18 @@ mod tests {
         assert!(TxSubmission::transition(&State::StIdle, &Message::MsgInit).is_err());
 
         // Server messages not valid in client states
-        assert!(TxSubmission::transition(
-            &State::StTxIdsBlocking,
-            &Message::MsgRequestTxs {
-                tx_ids: vec![EraTxId {
-                    era: ORIGIN_ERA,
-                    tx_id: TxId::new_with_array([0u8; 32])
-                }]
-            }
-        )
-        .is_err());
+        assert!(
+            TxSubmission::transition(
+                &State::StTxIdsBlocking,
+                &Message::MsgRequestTxs {
+                    tx_ids: vec![EraTxId {
+                        era: ORIGIN_ERA,
+                        tx_id: TxId::new_with_array([0u8; 32])
+                    }]
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -658,17 +691,16 @@ mod tests {
     }
 
     fn make_test_tx(id_byte: u8, size: usize) -> PendingTx {
-        // A parseable tx array `[body, {}, true, null]` so the body-only wire
-        // id (`praos_tx_id`) is well-defined; body bytes vary by `id_byte` so
-        // distinct test txs get distinct wire ids. Reserve a few bytes for the
-        // CBOR framing so the total stays ~= `size`.
-        let body_len = size.saturating_sub(6).max(1);
+        // Internal Leios form: [body map, witnesses, auxiliary data, validity].
+        let body_len = size.saturating_sub(8).max(1);
         let mut e = minicbor::Encoder::new(Vec::new());
         e.array(4)
+            .and_then(|e| e.map(1))
+            .and_then(|e| e.u8(0))
             .and_then(|e| e.bytes(&vec![id_byte; body_len]))
             .and_then(|e| e.map(0))
-            .and_then(|e| e.bool(true))
             .and_then(|e| e.null())
+            .and_then(|e| e.bool(true))
             .expect("encoding test tx into a Vec is infallible");
         PendingTx {
             tx: Arc::new(TxInfo {
@@ -678,6 +710,37 @@ mod tests {
             }),
             era: ORIGIN_ERA,
         }
+    }
+
+    #[test]
+    fn captured_w43_submission_preserves_internal_identity_and_wire_size() {
+        let block = include_bytes!("../../../../net-codec/test_data/leios-transaction-w43.cbor");
+        let mempool = net_codec::leios_mempool_transaction(block).unwrap();
+        let received = PendingTx::new_with_body(TxBody::new_with_slice(&mempool), ORIGIN_ERA);
+        let fetched = PendingTx::new_with_body(TxBody::new_with_slice(block), ORIGIN_ERA);
+        assert_eq!(received.tx.body.get_slice(), block);
+        assert_eq!(received.tx.tx_id, fetched.tx.tx_id);
+        let mut announced = VecDeque::new();
+        let mut pending = VecDeque::new();
+        let reply = announce_txs(&[received], &mut announced, &mut pending);
+        assert_eq!(reply.len(), 1);
+        assert_eq!(
+            reply[0].tx_id,
+            TxId::new_with_array(net_codec::wire_tx_id(block).unwrap())
+        );
+        assert_eq!(reply[0].size as usize, mempool.len());
+        assert_eq!(pending[0].tx.body.get_slice(), mempool);
+        let mut failed = block.to_vec();
+        *failed.last_mut().unwrap() = 0xf4;
+        let failed = PendingTx::new_with_body(TxBody::new_with_vec(failed), ORIGIN_ERA);
+        assert!(announce_txs(&[failed], &mut announced, &mut pending).is_empty());
+        assert_eq!(
+            pending.len(),
+            1,
+            "failed-script body must not enter submission queue"
+        );
+        let other_era = PendingTx::new_with_body(TxBody::new_with_slice(&mempool), 6);
+        assert_eq!(other_era.tx.body.get_slice(), mempool);
     }
 
     #[test]
@@ -751,7 +814,10 @@ mod tests {
             1,
             "acked-but-unrequested bodies must be pruned, not stranded"
         );
-        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(3, 64).tx.tx_id);
+        assert_eq!(
+            pending.front().unwrap().tx.tx_id,
+            make_test_tx(3, 64).tx.tx_id
+        );
     }
 
     #[test]
@@ -770,7 +836,10 @@ mod tests {
         ack_and_prune(&mut announced, &mut pending, 1);
         assert_eq!(announced.len(), 1);
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending.front().unwrap().tx.tx_id, make_test_tx(2, 64).tx.tx_id);
+        assert_eq!(
+            pending.front().unwrap().tx.tx_id,
+            make_test_tx(2, 64).tx.tx_id
+        );
     }
 
     #[tokio::test]
@@ -825,6 +894,13 @@ mod tests {
             match msg {
                 Message::MsgReplyTxs { txs } => {
                     assert_eq!(txs.len(), 2);
+                    for (tx, expected_size) in txs.iter().zip([1500, 2000]) {
+                        assert_eq!(tx.body.len(), expected_size);
+                        assert_eq!(
+                            minicbor::Decoder::new(tx.body.get_slice()).array().unwrap(),
+                            Some(3)
+                        );
+                    }
                 }
                 other => panic!("expected MsgReplyTxs, got {other:?}"),
             }
