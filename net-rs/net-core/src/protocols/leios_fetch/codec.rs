@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{MAX_BITMAP_ENTRIES, MAX_BLOCK_SIZE, MAX_TRANSACTION_SIZE, MAX_TRANSACTIONS, Message};
+use super::{Message, MAX_BITMAP_ENTRIES, MAX_BLOCK_SIZE, MAX_TRANSACTIONS, MAX_TRANSACTION_SIZE};
 use crate::types::Point;
 use minicbor::decode::Error as DecodeError;
 use minicbor::encode::Error as EncodeError;
@@ -571,23 +571,19 @@ mod w43_vectors {
             transactions: vec![TxBody::new_with_vec(vec![0; MAX_TRANSACTION_SIZE + 1])],
         };
         let encoded = minicbor::to_vec(message).unwrap();
-        assert!(
-            minicbor::decode::<Message>(&encoded)
-                .unwrap_err()
-                .to_string()
-                .contains("maximum")
-        );
+        assert!(minicbor::decode::<Message>(&encoded)
+            .unwrap_err()
+            .to_string()
+            .contains("maximum"));
         let mut raw = vec![0x82, 0x04, 0x9f];
         for _ in 0..=MAX_TRANSACTIONS {
             raw.extend_from_slice(&[0xd8, 0x18, 0x40]);
         }
         raw.push(0xff);
-        assert!(
-            minicbor::decode::<Message>(&raw)
-                .unwrap_err()
-                .to_string()
-                .contains("maximum")
-        );
+        assert!(minicbor::decode::<Message>(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("maximum"));
     }
 
     #[test]

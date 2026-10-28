@@ -1,5 +1,5 @@
 //! Transaction identity at the ranking-block / Leios boundary.
-use minicbor::{Decoder, data::Type, decode::Error};
+use minicbor::{data::Type, decode::Error, Decoder};
 use std::borrow::Cow;
 
 /// Convert an era-8 inline transaction into the Leios representation, preserving
