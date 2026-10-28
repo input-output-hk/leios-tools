@@ -347,7 +347,7 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
     ));
 
     // Conditionally spawn Leios server sub-tasks.
-    let leios_server_handles = if leios_enabled {
+    let mut leios_server_handles = if leios_enabled {
         let (ln_srv_send, ln_srv_recv) = resp_channels
             .next()
             .expect("leios_notify responder channel");
@@ -426,6 +426,9 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
     //   MsgKeepAlive after the relay activated the protocol), that's
     //   the relay's side of the keepalive going silent.  Per spec we
     //   must drop the connection.
+    // A clean Quit ends only LeiosNotify. Stop polling its completed handle;
+    // errors (including exhausted history) must tear down the shared bearer.
+    let mut watch_leios_notify = leios_server_handles.is_some();
     let teardown_reason: String;
     loop {
         tokio::select! {
@@ -441,6 +444,24 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
                         "command dispatch failed".to_string()
                     };
                     break;
+                }
+            }
+            result = async {
+                match &mut leios_server_handles {
+                    Some((notify, _)) => notify.await,
+                    None => std::future::pending().await,
+                }
+            }, if watch_leios_notify => {
+                match result {
+                    Ok(Ok(())) => watch_leios_notify = false,
+                    Ok(Err(error)) => {
+                        teardown_reason = format!("leios_notify responder: {error}");
+                        break;
+                    }
+                    Err(error) => {
+                        teardown_reason = format!("leios_notify responder task failed: {error}");
+                        break;
+                    }
                 }
             }
             result = &mut cs_client => {
@@ -521,4 +542,279 @@ async fn run_duplex_protocols(conn: DuplexConnection, params: DuplexProtocolPara
         lf_handle.abort();
     }
     conn.running.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bearer::mem::MemBearer;
+    use crate::mux::scheduler::PriorityWfq;
+    use crate::mux::{CodecRecv, CodecSend, Mux, RunningMux, MODE_INITIATOR, MODE_RESPONDER};
+    use crate::protocols::keepalive::{self, Message as KaMsg};
+    use crate::protocols::leios_notify::{self, Message as LnMsg};
+    use crate::store::leios_store::MAX_NOTIFICATIONS;
+
+    struct NotifyPeer {
+        notify: (CodecSend, CodecRecv),
+        keepalive: (CodecSend, CodecRecv),
+        events: mpsc::Receiver<(PeerId, PeerEvent)>,
+        peer: tokio::task::JoinHandle<()>,
+        remote_mux: RunningMux,
+        // Keep every registered direction alive, even when this test does not
+        // drive it. Dropping all protocol channels would mask missing teardown.
+        _channels: Vec<(CodecSend, CodecRecv)>,
+        _commands: mpsc::Sender<PeerCommand>,
+        _guard: super::super::AbortGuard,
+    }
+
+    impl NotifyPeer {
+        fn open(store: Arc<LeiosStore>) -> Self {
+            let config = MuxConfig {
+                sdu_timeout: Duration::from_secs(120),
+                ..MuxConfig::default()
+            };
+            let mut local = Mux::new(config.clone(), PriorityWfq::default(), MODE_INITIATOR);
+            let mut remote = Mux::new(config, PriorityWfq::default(), MODE_RESPONDER);
+            let mut initiator_channels = Vec::new();
+            let mut responder_channels = Vec::new();
+            let mut channels = Vec::new();
+            let mut guard = super::super::AbortGuard::new();
+            let (chain, _) = ChainStore::new(10);
+            for protocol in client_protocol_configs(true) {
+                let (send, recv) = local.register_with_mode(&protocol, MODE_INITIATOR);
+                initiator_channels.push((CodecSend::new(send), CodecRecv::new(recv)));
+                let (send, recv) = remote.register_with_mode(&protocol, MODE_RESPONDER);
+                let (send, recv) = (CodecSend::new(send), CodecRecv::new(recv));
+                // Keep the peer's monitored tasks healthy throughout the test.
+                let task = match protocol.id {
+                    crate::protocols::chainsync::PROTOCOL_ID => {
+                        tokio::spawn(server_handlers::serve_chainsync(
+                            send,
+                            recv,
+                            chain.clone(),
+                            PeerId(1),
+                            None,
+                            super::super::new_downstream_flag(),
+                        ))
+                    }
+                    keepalive::PROTOCOL_ID => tokio::spawn(server_handlers::serve_keepalive(
+                        send,
+                        recv,
+                        PeerId(1),
+                        super::super::new_downstream_flag(),
+                    )),
+                    _ => {
+                        channels.push((send, recv));
+                        continue;
+                    }
+                };
+                guard.push(task.abort_handle());
+            }
+            let mut notify = None;
+            let mut keepalive = None;
+            for protocol in server_protocol_configs(true) {
+                let (send, recv) = local.register_with_mode(&protocol, MODE_RESPONDER);
+                responder_channels.push((CodecSend::new(send), CodecRecv::new(recv)));
+                let (send, recv) = remote.register_with_mode(&protocol, MODE_INITIATOR);
+                let pair = (CodecSend::new(send), CodecRecv::new(recv));
+                match protocol.id {
+                    leios_notify::PROTOCOL_ID => notify = Some(pair),
+                    keepalive::PROTOCOL_ID => keepalive = Some(pair),
+                    _ => channels.push(pair),
+                }
+            }
+            let (local_bearer, remote_bearer) = MemBearer::pair();
+            let connection = DuplexConnection {
+                running: local.run(local_bearer),
+                initiator_channels,
+                responder_channels,
+                resolved_addr: "127.0.0.1:3001".parse().unwrap(),
+                peer_sharing: 1,
+            };
+            let remote_mux = remote.run(remote_bearer);
+            let (event_sender, events) = mpsc::channel(1024);
+            let (commands, command_receiver) = mpsc::channel(16);
+            let peer = tokio::spawn(run_duplex_protocols(
+                connection,
+                DuplexProtocolParams {
+                    peer_id: PeerId(7),
+                    keepalive_interval: Duration::from_secs(10),
+                    leios_enabled: true,
+                    sync_method: SyncMethodConfig::Genesis,
+                    chain_store: chain,
+                    peer_provider: Arc::new(|_| Vec::new()),
+                    leios_store: Some(store),
+                    event_sender,
+                    command_receiver,
+                    outbound_controls: None,
+                    downstream: super::super::new_downstream_flag(),
+                    tx_dedup: Arc::new(Mutex::new(server_handlers::TxDedup::new(16))),
+                },
+            ));
+            Self {
+                notify: notify.unwrap(),
+                keepalive: keepalive.unwrap(),
+                events,
+                peer,
+                remote_mux,
+                _channels: channels,
+                _commands: commands,
+                _guard: guard,
+            }
+        }
+
+        async fn ping(&mut self, cookie: u16) {
+            self.keepalive
+                .0
+                .send(&KaMsg::MsgKeepAlive { cookie })
+                .await
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    self.keepalive.1.recv::<KaMsg>(keepalive::SIZE_LIMIT)
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                KaMsg::MsgKeepAliveResponse { cookie },
+            );
+        }
+
+        async fn request(&self) {
+            self.notify
+                .0
+                .send(&LnMsg::MsgLeiosNotificationRequestNext)
+                .await
+                .unwrap();
+        }
+    }
+
+    impl Drop for NotifyPeer {
+        fn drop(&mut self) {
+            self.peer.abort();
+            self.remote_mux.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_history_exhaustion_tears_down_duplex_peer() {
+        let (store, _) = LeiosStore::new(1);
+        let mut remote = NotifyPeer::open(store.clone());
+        remote.ping(1).await;
+        remote.request().await;
+        // Wait for the initial idle response to prove the responder snapped
+        // its cursor before populating history. Other protocols remain active.
+        let first = tokio::time::timeout(
+            Duration::from_secs(60),
+            remote.notify.1.recv::<LnMsg>(leios_notify::SIZE_LIMIT),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(first, LnMsg::MsgLeiosVotes { votes } if votes.is_empty()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for id in 0..MAX_NOTIFICATIONS {
+                let mut hash = [0; 32];
+                hash[..8].copy_from_slice(&(id as u64).to_be_bytes());
+                let point = Point::Specific { slot: 42, hash };
+                store.inject_block(point, vec![0xa0], None);
+                remote.request().await;
+                assert!(matches!(
+                    remote
+                        .notify
+                        .1
+                        .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                        .await
+                        .unwrap(),
+                    LnMsg::MsgLeiosBlockOffer { .. }
+                ));
+            }
+            remote.ping(2).await;
+            remote.request().await;
+            // A new block overflows the per-connection history even though
+            // the store's own capacity is only one and the slot has not moved.
+            store.inject_block(
+                Point::Specific {
+                    slot: 42,
+                    hash: [255; 32],
+                },
+                vec![0xa0],
+                None,
+            );
+            loop {
+                let (peer, event) = remote
+                    .events
+                    .recv()
+                    .await
+                    .expect("peer must report failure");
+                if let PeerEvent::Failed { reason } = event {
+                    assert_eq!(peer, PeerId(7));
+                    assert_eq!(
+                        reason,
+                        "leios_notify responder: connection history capacity exceeded"
+                    );
+                    break;
+                }
+            }
+            (&mut remote.peer).await.unwrap();
+            // The remote must observe the shared bearer closing, not hang on
+            // its unanswered request while KeepAlive sustains the connection.
+            assert!(remote
+                .notify
+                .1
+                .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                .await
+                .is_err());
+        })
+        .await
+        .expect("history exhaustion must report failure and close the connection");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leios_notify_quit_keeps_duplex_connection_alive() {
+        for requests in [0, 3] {
+            let (store, _) = LeiosStore::new(1);
+            let mut remote = NotifyPeer::open(store);
+            remote.ping(1).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                for _ in 0..requests {
+                    remote.request().await;
+                }
+                remote.notify.0.send(&LnMsg::MsgQuit).await.unwrap();
+                for _ in 0..requests {
+                    assert!(matches!(
+                        remote
+                            .notify
+                            .1
+                            .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                            .await
+                            .unwrap(),
+                        LnMsg::MsgCanceled
+                    ));
+                }
+                assert!(matches!(
+                    remote
+                        .notify
+                        .1
+                        .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                        .await
+                        .unwrap(),
+                    LnMsg::MsgDone
+                ));
+            })
+            .await
+            .expect("clean shutdown must drain all outstanding requests");
+            // Give the owner time to consume the completed JoinHandle, then
+            // check it neither tears down nor polls that handle a second time.
+            for cookie in 2..5 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                remote.ping(cookie).await;
+                assert!(!remote.peer.is_finished());
+            }
+            while let Ok((_, event)) = remote.events.try_recv() {
+                assert!(!matches!(event, PeerEvent::Failed { .. }), "{event:?}");
+            }
+        }
+    }
 }

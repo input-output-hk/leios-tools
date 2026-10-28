@@ -2,11 +2,11 @@
 //! cardano-blueprint `leios-prototype`).
 //!
 //! Wire format:
-//!   msgLeiosBlockRequest    = [0, point]              point = [slot, hash32]
-//!   msgLeiosBlock           = [1, endorser_block]     endorser_block = { hash => word32 }
-//!   msgLeiosBlockTxsRequest = [2, point, bitmaps]     bitmaps = { word16 => word64 }
-//!   msgLeiosBlockTxs        = [3, point, bitmaps, tx_list]   tx_list = [ *tx ]
-//!   msgClientDone           = [9]
+//!   msgLeiosBlockRequest    = [1, point]              point = [slot, hash32]
+//!   msgLeiosBlock           = [2, endorser_block]     endorser_block = { hash => word32 }
+//!   msgLeiosBlockTxsRequest = [3, point, bitmaps]     bitmaps = { word16 => word64 }
+//!   msgLeiosBlockTxs        = [4, point, bitmaps, tx_list]   tx_list = [ *tx ]
+//!   msgClientDone           = [0]
 //!
 //! `endorser_block` and each `tx` are carried as raw CBOR (opaque
 //! pass-through): the codec splices/captures their bytes verbatim, so
@@ -30,18 +30,18 @@ impl minicbor::Encode<()> for Message {
         match self {
             Message::MsgLeiosBlockRequest { point } => {
                 e.array(2)?;
-                e.u32(0)?;
+                e.u32(1)?;
                 minicbor::Encode::encode(point, e, &mut ())?;
             }
             Message::MsgLeiosBlock { block } => {
                 e.array(2)?;
-                e.u32(1)?;
+                e.u32(2)?;
                 // `block` is the raw CBOR `endorser_block` map — splice verbatim.
                 encode_raw(e, block)?;
             }
             Message::MsgLeiosBlockTxsRequest { point, bitmap } => {
                 e.array(3)?;
-                e.u32(2)?;
+                e.u32(3)?;
                 minicbor::Encode::encode(point, e, &mut ())?;
                 encode_bitmap(e, bitmap)?;
             }
@@ -51,14 +51,14 @@ impl minicbor::Encode<()> for Message {
                 transactions,
             } => {
                 e.array(4)?;
-                e.u32(3)?;
+                e.u32(4)?;
                 minicbor::Encode::encode(point, e, &mut ())?;
                 encode_bitmap(e, bitmap)?;
                 encode_tx_list(e, transactions)?;
             }
             Message::MsgDone => {
                 e.array(1)?;
-                e.u32(9)?;
+                e.u32(0)?;
             }
         }
         Ok(())
@@ -71,22 +71,22 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
         let tag = d.u32()?;
 
         match tag {
-            0 => {
+            1 => {
                 let point = Point::decode(d, &mut ())?;
                 Ok(Message::MsgLeiosBlockRequest { point })
             }
-            1 => {
+            2 => {
                 // endorser_block is a CBOR map { tx_hash => tx_size };
                 // captured as raw bytes for opaque pass-through.
                 let block = decode_raw_bounded(d, MAX_BLOCK_SIZE, "endorser block")?;
                 Ok(Message::MsgLeiosBlock { block })
             }
-            2 => {
+            3 => {
                 let point = Point::decode(d, &mut ())?;
                 let bitmap = decode_bitmap(d)?;
                 Ok(Message::MsgLeiosBlockTxsRequest { point, bitmap })
             }
-            3 => {
+            4 => {
                 let point = Point::decode(d, &mut ())?;
                 let bitmap = decode_bitmap(d)?;
                 let transactions = decode_tx_list(d)?;
@@ -96,7 +96,7 @@ impl<'a> minicbor::Decode<'a, ()> for Message {
                     transactions,
                 })
             }
-            9 => Ok(Message::MsgDone),
+            0 => Ok(Message::MsgDone),
             other => Err(DecodeError::message(format!(
                 "unknown leios_fetch message tag: {other}"
             ))),
@@ -428,7 +428,7 @@ mod tests {
         } = m
         {
             e.array(4)?;
-            e.u32(3)?;
+            e.u32(4)?;
             minicbor::Encode::encode(point, e, &mut ())?;
             non_cbor_encode_tx_list(e, transactions)?;
             Ok(())
@@ -444,7 +444,7 @@ mod tests {
         let _array_len = d.array()?;
         let tag = d.u32()?;
 
-        if tag == 3 {
+        if tag == 4 {
             let point = Point::decode(d, &mut ())?;
             let transactions = non_cbor_decode_tx_list(d)?;
             Ok(Message::MsgLeiosBlockTxs {
@@ -604,19 +604,19 @@ mod tests {
 
     #[test]
     fn decode_indefinite_outer_array() {
-        // MsgDone [9] as indefinite: 0x9f 0x09 0xff
-        let cbor = &[0x9f, 0x09, 0xff];
+        // MsgDone [0] as indefinite: 0x9f 0x00 0xff
+        let cbor = &[0x9f, 0x00, 0xff];
         let decoded: Message = minicbor::decode(cbor).unwrap();
         assert!(matches!(decoded, Message::MsgDone));
     }
 
     #[test]
     fn wrong_hash_length_fails() {
-        // MsgLeiosBlockRequest [0, [0, bytes(16)]] — point with hash too short
+        // MsgLeiosBlockRequest [1, [0, bytes(16)]] — point with hash too short
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(2).unwrap();
-        e.u32(0).unwrap();
+        e.u32(1).unwrap();
         e.array(2).unwrap();
         e.u64(0).unwrap();
         e.bytes(&[0u8; 16]).unwrap(); // 16 bytes, not 32
@@ -630,7 +630,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(3).unwrap();
-        e.u32(2).unwrap();
+        e.u32(3).unwrap();
         // encode point sub-array
         e.array(2).unwrap();
         e.u64(0).unwrap();
@@ -651,7 +651,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut e = minicbor::Encoder::new(&mut buf);
         e.array(4).unwrap();
-        e.u32(3).unwrap();
+        e.u32(4).unwrap();
         // point
         e.array(2).unwrap();
         e.u64(0).unwrap();
@@ -681,5 +681,62 @@ mod tests {
         let truncated = &encoded[..3];
         let result: Result<Message, _> = minicbor::decode(truncated);
         assert!(result.is_err());
+    }
+
+    // Exact CBOR vectors derived from the Haskell encoder.
+    // ouroboros-consensus c54515e35498e921cbd651a2c19c3360a41d35b8
+    #[test]
+    fn fetch_request_wire_vector() {
+        let mut bytes = vec![0x82, 0x01, 0x82, 0x18, 0x2a, 0x58, 0x20];
+        bytes.extend_from_slice(&[0xab; 32]);
+        let msg: Message = minicbor::decode(&bytes).unwrap();
+        assert!(matches!(msg, Message::MsgLeiosBlockRequest { .. }));
+        assert_eq!(minicbor::to_vec(&msg).unwrap(), bytes);
+    }
+
+    #[test]
+    fn fetch_reply_and_transaction_wire_vectors() {
+        // Haskell encodeLeiosFetch at c54515e35498e921cbd651a2c19c3360a41d35b8.
+        let point = Point::Specific {
+            slot: 42,
+            hash: [0xab; 32],
+        };
+        let mut request = vec![0x83, 0x03, 0x82, 0x18, 0x2a, 0x58, 0x20];
+        request.extend_from_slice(&[0xab; 32]);
+        request.extend_from_slice(&[0xbf, 0xff]); // Haskell encodes an indefinite map
+        let mut response = vec![0x84, 0x04, 0x82, 0x18, 0x2a, 0x58, 0x20];
+        response.extend_from_slice(&[0xab; 32]);
+        response.extend_from_slice(&[0xbf, 0xff, 0x80]); // empty bitmap and tx list
+        let vectors = [
+            (Message::MsgDone, vec![0x81, 0x00]),
+            (
+                Message::MsgLeiosBlock { block: vec![0xa0] },
+                vec![0x82, 0x02, 0xa0],
+            ),
+            (
+                Message::MsgLeiosBlockTxsRequest {
+                    point: point.clone(),
+                    bitmap: BTreeMap::new(),
+                },
+                request,
+            ),
+            (
+                Message::MsgLeiosBlockTxs {
+                    point,
+                    bitmap: BTreeMap::new(),
+                    transactions: vec![],
+                },
+                response,
+            ),
+        ];
+        for (expected, bytes) in vectors {
+            let decoded: Message = minicbor::decode(&bytes).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(minicbor::to_vec(&expected).unwrap(), bytes);
+            assert_eq!(minicbor::to_vec(&decoded).unwrap(), bytes);
+        }
     }
 }

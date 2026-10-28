@@ -1,8 +1,8 @@
 //! LeiosFetch mini-protocol (protocol ID 19).
 //!
 //! Request-response protocol for fetching Leios data. Client-driven and
-//! pipelineable. Supports fetching individual EBs, selective transactions
-//! via bitmap addressing, votes, and certified EB ranges.
+//! pipelineable on the wire; the helpers issue one request at a time.
+//! Supports individual EBs and selective transactions via bitmap addressing.
 
 pub mod bitmap;
 pub mod codec;
@@ -67,26 +67,26 @@ pub enum State {
 /// LeiosFetch protocol messages.
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Client requests an EB. [0, point]
+    /// Client requests an EB. [1, point]
     MsgLeiosBlockRequest { point: Point },
-    /// Server delivers an EB.  `[1, endorser_block]` where
+    /// Server delivers an EB.  `[2, endorser_block]` where
     /// `endorser_block = { tx_hash => tx_size }` — `block` holds the raw
     /// CBOR map bytes (opaque pass-through; the consumer parses the
     /// manifest).
     MsgLeiosBlock { block: Vec<u8> },
-    /// Client requests selective transactions via bitmap. [2, point, bitmaps]
+    /// Client requests selective transactions via bitmap. [3, point, bitmaps]
     MsgLeiosBlockTxsRequest {
         point: Point,
         bitmap: BTreeMap<u16, u64>,
     },
-    /// Server delivers transactions. `[3, point, bitmaps, tx_list]` —
+    /// Server delivers transactions. `[4, point, bitmaps, tx_list]` —
     /// the server echoes the request's point and bitmap.
     MsgLeiosBlockTxs {
         point: Point,
         bitmap: BTreeMap<u16, u64>,
         transactions: Vec<TxBody>,
     },
-    /// Client terminates. [9]
+    /// Client terminates. [0]
     MsgDone,
 }
 
@@ -150,7 +150,9 @@ pub async fn fetch_block(
     point: Point,
 ) -> Result<Vec<u8>, ProtocolError> {
     runner
-        .send(&Message::MsgLeiosBlockRequest { point: point.clone() })
+        .send(&Message::MsgLeiosBlockRequest {
+            point: point.clone(),
+        })
         .await?;
     let msg = runner.recv().await?;
     match msg {
