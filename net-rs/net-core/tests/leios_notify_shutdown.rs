@@ -47,6 +47,7 @@ async fn check_quit(requests: usize) {
     tokio::time::timeout(Duration::from_secs(1), responder)
         .await
         .unwrap()
+        .unwrap()
         .unwrap();
     let first = wire::read_segment(&mut reader, 12288).await.unwrap();
     let second = wire::read_segment(&mut reader, 12288).await.unwrap();

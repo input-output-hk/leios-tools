@@ -702,7 +702,7 @@ mod tests {
                 LeiosNotifyEvent::BlockOffer { .. }
             ));
             client.shutdown().await.unwrap();
-            server.await.unwrap();
+            server.await.unwrap().unwrap();
         })
         .await
         .expect("the pipelined client and responder must agree on outstanding replies");

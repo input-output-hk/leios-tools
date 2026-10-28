@@ -933,6 +933,22 @@ fn notification_to_ln_msg(n: &crate::store::leios_store::LeiosNotification) -> L
     }
 }
 
+/// A LeiosNotify responder failure requires connection teardown. A completed
+/// Quit/Done exchange instead returns `Ok(())` and leaves other protocols alive.
+#[derive(Debug, thiserror::Error)]
+pub enum LeiosNotifyError {
+    #[error("connection history capacity exceeded")]
+    HistoryCapacityExceeded,
+    #[error("too many pending requests")]
+    TooManyPendingRequests,
+    #[error("expected notification request or quit")]
+    UnexpectedMessage,
+    #[error("notification store closed")]
+    StoreClosed,
+    #[error(transparent)]
+    Mux(#[from] crate::mux::MuxError),
+}
+
 /// Serve LeiosNotify for one connection.
 ///
 /// Sends notifications about available Leios data as the store is populated.
@@ -959,17 +975,17 @@ pub async fn serve_leios_notify(
     store: Arc<LeiosStore>,
     peer: PeerId,
     controls: Option<&OutboundControls>,
-) {
+) -> Result<(), LeiosNotifyError> {
     // The ordinary Runner is sequential. This responder reads ahead so a
     // pipelined Quit can cancel requests whose notifications are still pending.
     // Match the Haskell client's maximum number of outstanding requests.
     const MAX_PENDING_REQUESTS: usize = 1000;
     let mut ln_recv = ln_recv;
-    match ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await {
-        Ok(LnMsg::MsgLeiosNotificationRequestNext) => {}
-        Ok(LnMsg::MsgQuit) => {
-            let _ = ln_send.send(&LnMsg::MsgDone).await;
-            return;
+    match ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await? {
+        LnMsg::MsgLeiosNotificationRequestNext => {}
+        LnMsg::MsgQuit => {
+            ln_send.send(&LnMsg::MsgDone).await?;
+            return Ok(());
         }
         other => {
             tracing::warn!(
@@ -977,7 +993,7 @@ pub async fn serve_leios_notify(
                 ?other,
                 "leios_notify: expected request or quit"
             );
-            return;
+            return Err(LeiosNotifyError::UnexpectedMessage);
         }
     }
     tracing::info!(
@@ -1006,34 +1022,28 @@ pub async fn serve_leios_notify(
                 // Drain queued requests/Quit before delivering a ready reply.
                 biased;
                 incoming = ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT) => {
-                    match incoming {
-                        Ok(LnMsg::MsgLeiosNotificationRequestNext) => {
+                    match incoming? {
+                        LnMsg::MsgLeiosNotificationRequestNext => {
                             if pending_requests == MAX_PENDING_REQUESTS {
-                                tracing::warn!(peer = peer.0, "leios_notify: too many pending requests");
-                                return;
+                                return Err(LeiosNotifyError::TooManyPendingRequests);
                             }
                             pending_requests += 1;
                         }
-                        Ok(LnMsg::MsgQuit) => {
+                        LnMsg::MsgQuit => {
                             for _ in 0..pending_requests {
-                                if ln_send.send(&LnMsg::MsgCanceled).await.is_err() {
-                                    return;
-                                }
+                                ln_send.send(&LnMsg::MsgCanceled).await?;
                             }
-                            let _ = ln_send.send(&LnMsg::MsgDone).await;
-                            return;
+                            ln_send.send(&LnMsg::MsgDone).await?;
+                            return Ok(());
                         }
                         other => {
                             tracing::warn!(peer = peer.0, ?other, "leios_notify: expected request or quit");
-                            return;
+                            return Err(LeiosNotifyError::UnexpectedMessage);
                         }
                     }
                 }
                 response = &mut notification, if pending_requests > 0 => {
-                    let Some(response) = response else { return };
-                    if ln_send.send(&response).await.is_err() {
-                        return;
-                    }
+                    ln_send.send(&response?).await?;
                     pending_requests -= 1;
                     break;
                 }
@@ -1058,8 +1068,8 @@ impl std::fmt::Debug for SourceIds<'_> {
 /// (`allow_echo_to_source`) and/or mutate the outbound message
 /// (`transform_outbound`). Advances `read_index` past every consumed or
 /// skipped entry so the same notification isn't reconsidered next call,
-/// and awaits new injects when the queue is empty. Returns `None` on
-/// watch-channel close — the server task should exit.
+/// and awaits new injects when the queue is empty. Returns an error on history
+/// exhaustion or watch-channel close so the owner can tear down the connection.
 async fn next_outbound_notification(
     store: &Arc<LeiosStore>,
     read_index: &mut usize,
@@ -1067,7 +1077,7 @@ async fn next_outbound_notification(
     subscription: &mut tokio::sync::watch::Receiver<u64>,
     controls: Option<&OutboundControls>,
     offered_blocks: &mut BTreeSet<(u64, [u8; 32])>,
-) -> Option<LnMsg> {
+) -> Result<LnMsg, LeiosNotifyError> {
     use crate::store::leios_store::LeiosNotification;
     // Answer the peer within this window even when nothing is deliverable.
     // The deadline is absolute across the loop: `subscription.changed()`
@@ -1121,11 +1131,7 @@ async fn next_outbound_notification(
                 // contains arbitrarily many offers. Never evict a live key
                 // just to make room: that would let a duplicate through.
                 if offered_blocks.len() == crate::store::leios_store::MAX_NOTIFICATIONS {
-                    tracing::warn!(
-                        peer = peer.0,
-                        "leios_notify: offer history capacity exceeded"
-                    );
-                    return None;
+                    return Err(LeiosNotifyError::HistoryCapacityExceeded);
                 }
                 offered_blocks.insert((*slot, *hash));
             }
@@ -1185,7 +1191,7 @@ async fn next_outbound_notification(
                 }
                 _ => {}
             }
-            return Some(msg);
+            return Ok(msg);
         }
         // Drained without a deliverable entry. Wait for new injects, but
         // answer the peer's outstanding request with an empty MsgLeiosVotes
@@ -1195,7 +1201,7 @@ async fn next_outbound_notification(
         tokio::select! {
             result = subscription.changed() => {
                 if result.is_err() {
-                    return None;
+                    return Err(LeiosNotifyError::StoreClosed);
                 }
             }
             _ = tokio::time::sleep_until(keepalive_deadline) => {
@@ -1203,7 +1209,7 @@ async fn next_outbound_notification(
                     peer = peer.0,
                     "leios_notify: sending empty-votes keepalive"
                 );
-                return Some(LnMsg::MsgLeiosVotes { votes: Vec::new() });
+                return Ok(LnMsg::MsgLeiosVotes { votes: Vec::new() });
             }
         }
     }
@@ -1828,7 +1834,7 @@ mod tests {
     ) -> (
         CodecSend,
         CodecRecv,
-        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<Result<(), LeiosNotifyError>>,
         crate::mux::RunningMux,
         crate::mux::RunningMux,
     ) {
@@ -1872,7 +1878,7 @@ mod tests {
                     recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
                     LnMsg::MsgDone
                 ));
-                server.await.unwrap();
+                server.await.unwrap().unwrap();
             })
             .await
             .expect("Quit must cancel pending requests without waiting for keepalives");
@@ -1920,7 +1926,7 @@ mod tests {
                 recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
                 LnMsg::MsgDone
             ));
-            server.await.unwrap();
+            server.await.unwrap().unwrap();
         })
         .await
         .expect("Done must follow exactly the unanswered requests");
@@ -1995,7 +2001,7 @@ mod tests {
                 recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap(),
                 LnMsg::MsgDone
             ));
-            server.await.unwrap();
+            server.await.unwrap().unwrap();
         }
         old_a.abort();
         old_b.abort();
@@ -2013,7 +2019,10 @@ mod tests {
                     .await
                     .unwrap();
             }
-            server.await.unwrap();
+            assert!(matches!(
+                server.await.unwrap(),
+                Err(LeiosNotifyError::TooManyPendingRequests)
+            ));
         })
         .await
         .expect("the responder must reject requests beyond the pipeline bound");
@@ -2030,7 +2039,7 @@ mod tests {
         store.inject_block(make_point(21), vec![0xa0], None);
         assert!(matches!(
             next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
-            Some(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(21)
+            Ok(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(21)
         ));
         assert_eq!(offered.len(), 1);
 
@@ -2039,7 +2048,7 @@ mod tests {
         store.inject_block(make_point(30), vec![0xa0], None);
         assert!(matches!(
             next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
-            Some(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(30)
+            Ok(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(30)
         ));
         assert_eq!(offered, BTreeSet::from([(30, [30; 32])]));
     }
@@ -2152,7 +2161,7 @@ mod tests {
         .await;
         churn.abort();
         match res {
-            Ok(Some(LnMsg::MsgLeiosVotes { votes })) => {
+            Ok(Ok(LnMsg::MsgLeiosVotes { votes })) => {
                 assert!(votes.is_empty(), "keepalive must be empty votes");
             }
             other => panic!("expected empty-votes keepalive within 50s, got {other:?}"),
