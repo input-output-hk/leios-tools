@@ -318,9 +318,27 @@ impl LeiosStore {
     /// Retain and enqueue the original announcement. Identical headers from
     /// multiple peers coalesce; distinct headers (including equivocations)
     /// remain distinct. Only parsed EB commitments can satisfy offer gating.
+    /// Peer headers must pass full wire-structure validation before retention
+    /// or relay; their metadata is recomputed from the validated bytes.
     /// Peer-sourced headers do not advance the retention clock; only local
     /// announcements may supply a trusted slot here.
-    pub fn announce_block(&self, header: WrappedHeader, source: Option<PeerId>) {
+    pub fn announce_block(&self, mut header: WrappedHeader, source: Option<PeerId>) {
+        // Best-effort field extraction is not a wire-validity check. Validate
+        // before either queue/cache mutation, and derive metadata from the
+        // validated bytes (the public `parsed` field may be absent or stale).
+        // Local producers remain responsible for their own headers, including
+        // deliberately malformed headers used by adversarial outbound tools.
+        if let Some(peer) = source {
+            match net_codec::validate_leios_header(&header.raw) {
+                Ok(parsed) => header.parsed = Some(parsed),
+                Err(error) => {
+                    tracing::debug!(
+                        peer = peer.0, %error, "discarding malformed peer announcement"
+                    );
+                    return;
+                }
+            }
+        }
         let mut inner = self
             .inner
             .lock()
@@ -1014,6 +1032,44 @@ mod tests {
 
     fn tx_id_from_arr(arr: [u8; 32]) -> TxId {
         TxId::new_with_array(arr)
+    }
+
+    #[test]
+    fn peer_announcement_metadata_is_derived_from_validated_wire_bytes() {
+        let point = Point::Specific {
+            slot: 21,
+            hash: [42; 32],
+        };
+        let header = crate::test_utils::leios_header(&point, 1);
+        for stale_metadata in [
+            None,
+            crate::test_utils::leios_header(
+                &Point::Specific {
+                    slot: 9999,
+                    hash: [43; 32],
+                },
+                2,
+            )
+            .parsed,
+        ] {
+            let (store, _) = LeiosStore::new(10);
+            let mut input = header.clone();
+            input.parsed = stale_metadata;
+            store.announce_block(input, Some(PeerId(7)));
+            let cached = store.announcement(21, [42; 32]).unwrap();
+            assert_eq!(cached.parsed, header.parsed);
+            assert_eq!(cached.raw, header.raw);
+            assert!(store.announcement(9999, [43; 32]).is_none());
+        }
+        // Plausible caller-supplied metadata must not bless malformed bytes.
+        let (store, _) = LeiosStore::new(10);
+        let mut malformed = header;
+        malformed.raw = vec![0xf6];
+        let version = store.version();
+        store.announce_block(malformed, Some(PeerId(7)));
+        assert_eq!(store.version(), version);
+        assert!(store.announcement(21, [42; 32]).is_none());
+        assert!(store.notifications_after(&mut 0).is_empty());
     }
 
     #[test]

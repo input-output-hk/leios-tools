@@ -1,6 +1,6 @@
 # Issue #116 — review and handoff
 
-The announcement-ordering fix and both PR #118 review findings were addressed.
+The announcement-ordering fix and three PR #118 review findings were addressed.
 Validation completed on 2026-10-28.
 
 | Completed work | Result |
@@ -8,14 +8,16 @@ Validation completed on 2026-10-28.
 | Announcement ordering | Added per-connection send tracking and header replay before dependent body and transaction offers. |
 | Deferred offers | Preserved unsent offers through missing headers and temporary eviction, allowing delivery to resume without blocking unrelated notifications. |
 | Retention | Bounded retained state and prevented unverified peer slots from advancing expiry. |
-| Regression coverage | Verified reconnects, retries, source filtering, duplicate suppression, transaction offers, adversarial controls, cancellation and shutdown. Both review regressions failed before their fixes and passed afterward. |
+| Peer-header validation | Added complete wire-structure checks before relay or caching. Malformed mandatory fields cannot unlock offers; later valid headers still progress. Verified against a captured week-41 Haskell header. |
+| Regression coverage | Verified reconnects, retries, source filtering, duplicate suppression, transaction offers, adversarial controls, cancellation and shutdown. The original two review regressions and the new malformed-header relay regressions failed before their fixes and passed afterward. |
 | Proto-devnet harness | Enabled explicit all-blocks production and corrected the certificate-window calculation. |
 
 | Check | Result |
 | --- | --- |
-| Networking workspace tests | 467 passed; 1 documentation test ignored. |
-| Downstream workspace tests, including net-node | 567 passed; 1 test ignored. |
-| Workspace builds and downstream release builds | Passed. |
+| Latest networking workspace tests | 476 passed; 1 documentation test ignored. |
+| Earlier downstream workspace tests | 567 passed; 1 test ignored. |
+| Latest downstream net-node tests | 228 passed; 1 test ignored. |
+| Latest networking and net-node builds | Passed for all targets. Earlier downstream release builds also passed. |
 | Clippy | Passed with existing warnings. |
 | Formatting | Failed on pre-existing formatting differences; no new differences in the edited Rust files. |
 | Harness checks | 4 Python tests passed; shell syntax and generated configuration checks passed. |
@@ -24,7 +26,8 @@ Mixed Rust/Haskell smoke tests used the maintained **proto-devnet** harness
 (`make smoke`), three Haskell nodes using `rc-2026w41`, and Rust `net-node`.
 Every attempt used a fresh devnet, a fresh 1,200-transaction magazine and the
 full 1,800-second measurement window. The first three runs preceded the final
-review fixes; the fourth included them.
+two review fixes; the fourth included them. All four predate the header-validation
+follow-up. No new mixed-node smoke run was performed for that follow-up.
 
 | Run | Overall result | Ordering errors | Ranking blocks adopted | Endorser-block certificates | Transactions settled |
 | --- | --- | --- | --- | --- | --- |

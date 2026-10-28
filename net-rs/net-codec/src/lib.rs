@@ -19,6 +19,8 @@ mod block;
 mod eb;
 mod encode;
 mod header;
+mod leios_header;
+pub use leios_header::validate_leios_header;
 mod transaction;
 pub use transaction::{inline_leios_transaction, leios_inline_transaction};
 

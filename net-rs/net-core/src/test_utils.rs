@@ -30,10 +30,10 @@ pub(crate) fn leios_header(point: &Point, size: u32) -> WrappedHeader {
     inner.array(2).unwrap(); // announced_eb
     inner.bytes(&hash).unwrap();
     inner.u32(size).unwrap();
-    inner.bytes(&[8; 64]).unwrap(); // dummy header signature
+    inner.bytes(&[8; 448]).unwrap(); // structurally valid dummy KES signature
     let mut outer = minicbor::Encoder::new(Vec::new());
     outer.array(2).unwrap();
-    outer.u8(8).unwrap(); // Dijkstra era tag
+    outer.u32(net_codec::DIJKSTRA_HEADER_ERA).unwrap();
     outer.tag(minicbor::data::Tag::new(24)).unwrap();
     outer.bytes(&inner.into_writer()).unwrap();
     let header = WrappedHeader::new(outer.into_writer());

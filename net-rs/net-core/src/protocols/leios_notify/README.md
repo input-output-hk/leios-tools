@@ -112,8 +112,14 @@ announced endorser-block hash, independently of the notification cursor. This
 lets a retried offer supply an announcement missed during disconnection or
 filtered by no-echo. Dependency replay may send the header back to its source
 when an otherwise eligible offer requires it; body/transaction source filtering
-still applies. Received headers enter this cache through the coordinator, but
-unverified peer slots do not advance the store's retention clock.
+still applies. Received headers enter this cache through the coordinator. Before a peer header
+can enter either the relay queue or replay cache, the store validates its complete
+week-41 Dijkstra wire structure: era wrapper, record shapes, mandatory fields,
+key/proof/signature lengths and absence of trailing bytes. Invalid headers are
+dropped without releasing deferred offers; a later valid announcement can still
+release them. This is structural validation, not signature or consensus validation;
+unverified peer slots do not advance the store's retention clock. Local producers
+remain responsible for their headers, preserving deliberate adversarial injection.
 Identical headers coalesce to prevent relay loops; distinct equivocation headers
 remain distinct.
 

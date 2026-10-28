@@ -170,10 +170,10 @@ fn announced_block(slot: u64) -> (Point, WrappedHeader, Vec<u8>) {
     inner.array(2).unwrap(); // announced_eb
     inner.bytes(&hash).unwrap();
     inner.u32(size).unwrap();
-    inner.bytes(&[8; 64]).unwrap(); // dummy header signature
+    inner.bytes(&[8; 448]).unwrap(); // structurally valid dummy KES signature
     let mut outer = minicbor::Encoder::new(Vec::new());
     outer.array(2).unwrap();
-    outer.u8(8).unwrap(); // Dijkstra era tag
+    outer.u32(net_codec::DIJKSTRA_HEADER_ERA).unwrap();
     outer.tag(minicbor::data::Tag::new(24)).unwrap();
     outer.bytes(&inner.into_writer()).unwrap();
     let header = WrappedHeader::new(outer.into_writer());
@@ -509,4 +509,49 @@ async fn deferred_transactions_survive_eviction_and_refetch() {
     store.inject_votes(vec![duplicate.clone()], None);
     assert_marker(connection.next().await, &duplicate);
     connection.close().await;
+}
+
+/// Replace one mandatory field while preserving the surrounding CBOR record.
+fn malformed_announcement(header: &WrappedHeader, field: usize) -> WrappedHeader {
+    let mut outer = minicbor::Decoder::new(&header.raw);
+    outer.array().unwrap();
+    let era = outer.u32().unwrap();
+    outer.tag().unwrap();
+    let inner = outer.bytes().unwrap();
+    let mut d = minicbor::Decoder::new(inner);
+    d.array().unwrap();
+    d.array().unwrap();
+    for _ in 0..field {
+        d.skip().unwrap();
+    }
+    let start = d.position();
+    d.skip().unwrap();
+    let mut changed = inner[..start].to_vec();
+    changed.push(0xf6); // null in place of a required structure
+    changed.extend_from_slice(&inner[d.position()..]);
+    let malformed = WrappedHeader::new(net_codec::wrap_header(&changed, era));
+    assert_eq!(
+        malformed.parsed, header.parsed,
+        "best-effort extraction misses this defect"
+    );
+    malformed
+}
+
+#[tokio::test(start_paused = true)]
+async fn malformed_announcements_do_not_unlock_offers_or_block_valid_notifications() {
+    for field in [5, 8] {
+        let (store, _) = LeiosStore::new(10);
+        let mut connection = Connection::open(store.clone(), PeerId(9)).await;
+        let (point, header, body) = announced_block(21);
+        store.inject_block(point.clone(), body, Some(PeerId(8)));
+        store.announce_block(malformed_announcement(&header, field), Some(PeerId(7)));
+        let sentinel = marker(99);
+        store.inject_votes(vec![sentinel.clone()], None);
+        assert!(matches!(connection.next().await,
+            Message::MsgLeiosVotes { votes } if votes == vec![sentinel]));
+        store.announce_block(header.clone(), Some(PeerId(7)));
+        assert_announcement(connection.next().await, &header);
+        assert_body(connection.next().await, &point, 1);
+        connection.close().await;
+    }
 }

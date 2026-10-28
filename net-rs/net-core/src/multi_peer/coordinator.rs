@@ -1995,6 +1995,87 @@ mod tests {
     use crate::types::WrappedHeader;
     use shared_consensus::mempool::{TxBody, TxId};
 
+    /// Replace one mandatory field while preserving the surrounding CBOR record.
+    fn malformed_announcement(header: &WrappedHeader, field: usize) -> WrappedHeader {
+        let mut outer = minicbor::Decoder::new(&header.raw);
+        outer.array().unwrap();
+        let era = outer.u32().unwrap();
+        outer.tag().unwrap();
+        let inner = outer.bytes().unwrap();
+        let mut d = minicbor::Decoder::new(inner);
+        d.array().unwrap();
+        d.array().unwrap();
+        for _ in 0..field {
+            d.skip().unwrap();
+        }
+        let start = d.position();
+        d.skip().unwrap();
+        let mut changed = inner[..start].to_vec();
+        changed.push(0xf6); // null in place of a required structure
+        changed.extend_from_slice(&inner[d.position()..]);
+        let malformed = WrappedHeader::new(net_codec::wrap_header(&changed, era));
+        assert_eq!(
+            malformed.parsed, header.parsed,
+            "best-effort extraction misses this defect"
+        );
+        malformed
+    }
+
+    #[tokio::test]
+    async fn malformed_peer_announcements_never_enter_relay_storage() {
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (chain, _) = ChainStore::new(10);
+        let (store, _) = LeiosStore::new(10);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_tx,
+            peer_rx,
+            event_tx,
+            cmd_rx,
+            chain,
+            Some(store.clone()),
+        );
+        let header = crate::test_utils::leios_header(
+            &Point::Specific {
+                slot: 21,
+                hash: [42; 32],
+            },
+            1,
+        );
+        for field in [4, 5, 8, 9] {
+            // VRF key/proof, certificate, version
+            let malformed = malformed_announcement(&header, field);
+            coordinator
+                .handle_peer_event(
+                    PeerId(7),
+                    PeerEvent::LeiosBlockAnnounced { header: malformed },
+                )
+                .await;
+            // The application still observes the event; it is not relayed.
+            event_rx.recv().await.unwrap();
+            assert!(
+                store.notifications_after(&mut 0).is_empty(),
+                "field {field} reached relay queue"
+            );
+            assert!(
+                store.announcement(21, [42; 32]).is_none(),
+                "field {field} reached replay cache"
+            );
+        }
+        coordinator
+            .handle_peer_event(
+                PeerId(7),
+                PeerEvent::LeiosBlockAnnounced {
+                    header: header.clone(),
+                },
+            )
+            .await;
+        assert_eq!(store.announcement(21, [42; 32]).unwrap().raw, header.raw);
+        assert_eq!(store.notifications_after(&mut 0).len(), 1);
+    }
+
     #[tokio::test]
     async fn leios_announcements_are_retained_for_relay_without_looping_duplicates() {
         let (peer_tx, peer_rx) = mpsc::channel(16);
