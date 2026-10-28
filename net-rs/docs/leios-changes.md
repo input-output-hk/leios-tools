@@ -1,5 +1,16 @@
 # Leios Network Protocol Changes
 
+> Implementation compatibility (2026-10-28): this branch targets
+> [rc-2026w43](https://github.com/input-output-hk/ouroboros-leios/releases/tag/rc-2026w43),
+> which retains the w42 LeiosFetch format. Transaction responses are
+> `[4, [tag24(bytes(block_transaction)), ...]]`; point and bitmap remain in
+> the request only. The manifest hashes the exact four-field block transaction,
+> including its trailing validity boolean. TxSubmission retains its distinct
+> mempool representation and ledger body identifier. See the
+> [captured protocol vectors](../net-core/test_data/README.md).
+> The discussion below also includes historical design proposals.
+
+
 Notes from [CIP-0164](https://cips.cardano.org/cip/CIP-0164) on what Leios adds to the
 Praos networking stack, and structural implications for net-rs.
 
