@@ -159,6 +159,9 @@ impl ChainTree {
     }
 
     pub fn is_blacklisted(&self, mut hash: [u8; 32]) -> bool {
+        if self.blacklist.is_empty() {
+            return false;
+        }
         loop {
             if self.blacklist.contains(&hash) {
                 return true;
