@@ -13,10 +13,14 @@ use net_core::mux::{
     CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, RunningMux, MODE_INITIATOR,
     MODE_RESPONDER,
 };
-use net_core::peer::{server_handlers::serve_leios_notify, PeerId};
+use net_core::peer::{
+    server_handlers::{serve_leios_notify, OutboundControls},
+    PeerId,
+};
 use net_core::protocols::leios_notify::{self, Message};
 use net_core::store::leios_store::LeiosStore;
 use net_core::types::{Point, Vote, WrappedHeader};
+use shared_consensus::behaviour::tree::{ControlSignal, EquivocationVariants};
 
 struct Connection {
     send: CodecSend,
@@ -28,6 +32,14 @@ struct Connection {
 
 impl Connection {
     async fn open(store: Arc<LeiosStore>, peer: PeerId) -> Self {
+        Self::open_with_controls(store, peer, None).await
+    }
+
+    async fn open_with_controls(
+        store: Arc<LeiosStore>,
+        peer: PeerId,
+        controls: Option<OutboundControls>,
+    ) -> Self {
         let protocol = ProtocolConfig {
             id: leios_notify::PROTOCOL_ID,
             traffic_class: TrafficClass::Default(1),
@@ -47,13 +59,17 @@ impl Connection {
         let (server_send, server_recv) = server.register(&protocol);
         let client_mux = client.run(client_bearer);
         let server_mux = server.run(server_bearer);
-        let server = tokio::spawn(serve_leios_notify(
-            CodecSend::new(server_send),
-            CodecRecv::new(server_recv),
-            store,
-            peer,
-            None,
-        ));
+        let server = tokio::spawn(async move {
+            serve_leios_notify(
+                CodecSend::new(server_send),
+                CodecRecv::new(server_recv),
+                store,
+                peer,
+                controls.as_ref(),
+            )
+            .await
+            .unwrap();
+        });
         let mut connection = Self {
             send: CodecSend::new(client_send),
             recv: CodecRecv::new(client_recv),
@@ -325,4 +341,127 @@ async fn late_header_releases_deferred_body_without_blocking_votes() {
 #[tokio::test(start_paused = true)]
 async fn late_header_releases_deferred_transactions_without_a_body_offer() {
     check_late_header_releases_offer(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_header_does_not_block_another_block_and_evicted_body_is_not_offered() {
+    let (store, _) = LeiosStore::new(1);
+    let mut connection = Connection::open(store.clone(), PeerId(7)).await;
+    let (missing, late_header, body) = announced_block(21);
+    let (ready, header, other_body) = announced_block(22);
+    store.inject_block(missing.clone(), body, Some(PeerId(8)));
+    store.announce_block(header.clone(), None);
+    store.inject_block(ready.clone(), other_body, None);
+    assert_announcement(connection.next().await, &header);
+    assert_body(connection.next().await, &ready, 1);
+    // The original body was evicted by capacity. Its late header can travel,
+    // but the responder must not advertise body availability that has gone.
+    store.announce_block(late_header.clone(), None);
+    assert_announcement(connection.next().await, &late_header);
+    let barrier = marker(91);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier);
+    connection.close().await;
+}
+
+fn controlled() -> (OutboundControls, tokio::sync::watch::Sender<ControlSignal>) {
+    let (tx, control) = tokio::sync::watch::channel(ControlSignal::default());
+    (
+        OutboundControls {
+            control,
+            variants: Arc::new(std::sync::Mutex::new(EquivocationVariants::default())),
+        },
+        tx,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn withholding_control_releases_only_local_offers_without_faking_sent_announcements() {
+    let (store, _) = LeiosStore::new(10);
+    let (controls, tx) = controlled();
+    let mut connection =
+        Connection::open_with_controls(store.clone(), PeerId(7), Some(controls)).await;
+    let (local, local_header, body) = announced_block(21);
+    let (relayed, relayed_header, remote_body) = announced_block(22);
+    store.inject_block(local.clone(), body, None);
+    store.inject_block(relayed.clone(), remote_body, Some(PeerId(8)));
+    let barrier = marker(92);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier);
+    // A control-only wakeup must release the deferred local offer.
+    let (reply, _) = tokio::join!(connection.next(), async {
+        tokio::task::yield_now().await;
+        tx.send_modify(|c| c.leios.withhold_announce = true);
+    });
+    assert_body(reply, &local, 1);
+    let barrier = marker(93);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier); // remote offer still gated
+    tx.send_modify(|c| c.leios.withhold_announce = false);
+    store.inject_block_txs_full(local.clone(), vec![], None);
+    let barrier = marker(94);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier); // body did not imply announcement
+    store.announce_block(local_header.clone(), None);
+    assert_announcement(connection.next().await, &local_header);
+    assert!(
+        matches!(connection.next().await, Message::MsgLeiosBlockTxsOffer { point } if point == local)
+    );
+    store.announce_block(relayed_header.clone(), Some(PeerId(8)));
+    assert_announcement(connection.next().await, &relayed_header);
+    assert_body(connection.next().await, &relayed, 1);
+    connection.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_offer_rechecks_echo_and_size_controls_at_delivery() {
+    let (store, _) = LeiosStore::new(10);
+    let (controls, tx) = controlled();
+    tx.send_modify(|c| c.leios.echo_to_source = true);
+    let mut connection =
+        Connection::open_with_controls(store.clone(), PeerId(7), Some(controls)).await;
+    let (point, header, body) = announced_block(21);
+    store.inject_block(point.clone(), body, Some(PeerId(7)));
+    let barrier = marker(96);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier); // body is now deferred
+    store.announce_block(header.clone(), Some(PeerId(7)));
+    assert_announcement(connection.next().await, &header);
+    tx.send_modify(|c| c.leios.echo_to_source = false);
+    let barrier = marker(97);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier); // queued body rechecks no-echo
+    tx.send_modify(|c| {
+        c.leios.echo_to_source = true;
+        c.leios.offer_eb_size = shared_consensus::behaviour::tree::control::EbSizePolicy::Linear {
+            scale_num: 0,
+            scale_den: 1,
+            offset: 0,
+        };
+    });
+    assert_body(connection.next().await, &point, 0);
+    connection.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_headers_coalesce_but_distinct_equivocation_headers_survive() {
+    let (store, _) = LeiosStore::new(10);
+    let mut connection = Connection::open(store.clone(), PeerId(7)).await;
+    let (point, header, body) = announced_block(21);
+    let mut other = header.clone();
+    let issuer_offset = other.raw.windows(32).position(|b| b == [1; 32]).unwrap();
+    other.raw[issuer_offset] = 9;
+    let other = WrappedHeader::new(other.raw);
+    assert_ne!(other.point(), header.point());
+    store.announce_block(header.clone(), None);
+    store.inject_block(point.clone(), body, None);
+    assert_announcement(connection.next().await, &header);
+    assert_body(connection.next().await, &point, 1);
+    store.announce_block(header, Some(PeerId(8)));
+    store.announce_block(other.clone(), None);
+    assert_announcement(connection.next().await, &other);
+    let barrier = marker(95);
+    store.inject_votes(vec![barrier.clone()], None);
+    assert_marker(connection.next().await, &barrier);
+    connection.close().await;
 }

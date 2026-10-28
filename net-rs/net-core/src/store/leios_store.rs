@@ -43,9 +43,8 @@ pub enum LeiosNotification {
     /// RB `header` whose `announced_eb = (hash, size)` field commits to an EB,
     /// diffused ahead of (and independent from) the EB-body `BlockOffer`.
     /// Distinct from `BlockOffer`: this advertises that an EB *exists* (by the
-    /// header's commitment), not that its body is available to fetch. Not
-    /// deduplicated — the producer decides how many to enqueue (one honestly,
-    /// two for an OCIN equivocation), so `offer_point` returns `None` for it.
+    /// header's commitment), not that its body is available to fetch. Exact
+    /// repeats coalesce; distinct equivocation headers remain distinct.
     BlockAnnouncement { header: WrappedHeader },
     /// Votes delivered inline (no offer/fetch round-trip).
     /// `retention_slot` is the tip slot when the votes were injected;
@@ -94,6 +93,11 @@ struct OwnOffer {
 struct LeiosStoreInner {
     /// Endorser blocks keyed by (slot, hash).
     blocks: HashMap<BlockKey, Vec<u8>>,
+    /// Original ranking-block headers indexed by the EB they announce.
+    /// Kept independently of the notification cursor for reconnect/retry replay.
+    announcements: BTreeMap<BlockKey, Vec<WrappedHeader>>,
+    announcement_count: usize,
+    announcement_bytes: usize,
     /// Retransmit state for locally produced EB offers, keyed like `blocks`.
     /// Only our own EBs are tracked — re-offering a peer's EB back into the
     /// network is not ours to do.
@@ -146,6 +150,7 @@ impl LeiosStoreInner {
     /// the eviction sweep once the store has drained.
     fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+            && self.announcements.is_empty()
             && self.block_txs.is_empty()
             && self.eb_tx_hashes.is_empty()
             && self.votes.is_empty()
@@ -162,6 +167,8 @@ impl LeiosStoreInner {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LeiosStoreStats {
     pub blocks: usize,
+    pub announcements: usize,
+    pub announcement_bytes: usize,
     pub block_txs: usize,
     pub eb_tx_hashes: usize,
     pub votes: usize,
@@ -187,6 +194,9 @@ pub const DEFAULT_RETENTION_SLOTS: u64 = 100;
 /// same role `capacity` plays for `blocks`. Sized well above normal
 /// operation (cluster runs peak around ~120 notifications/node).
 pub const MAX_NOTIFICATIONS: usize = 10_000;
+
+/// Bound replay headers by both count and bytes, including when slots stall.
+const MAX_ANNOUNCEMENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Thread-safe content-addressed store for Leios data.
 ///
@@ -234,6 +244,9 @@ impl LeiosStore {
         let store = Arc::new(Self {
             inner: Mutex::new(LeiosStoreInner {
                 blocks: HashMap::new(),
+                announcements: BTreeMap::new(),
+                announcement_count: 0,
+                announcement_bytes: 0,
                 own_offers: BTreeMap::new(),
                 block_txs: HashMap::new(),
                 eb_tx_hashes: HashMap::new(),
@@ -302,28 +315,78 @@ impl LeiosStore {
         self.bump_version(&mut inner);
     }
 
-    /// Enqueue a CIP-0164 EB **announcement** (`MsgLeiosBlockAnnouncement`) for
-    /// diffusion. `header` is the RB header whose `announced_eb` commits to an
-    /// EB — the fast discovery pulse, distinct from and ahead of the EB-body
-    /// `BlockOffer` that `inject_block` generates.
-    ///
-    /// `source` is the peer that delivered the header (`None` for locally
-    /// produced RBs); the no-echo gate in `serve_leios_notify` uses it to avoid
-    /// re-announcing back to the origin. Announcements are **not** deduplicated,
-    /// so calling this twice for one election (with distinct headers) diffuses
-    /// both — the mechanism an OCIN-equivocation adversary relies on.
+    /// Retain and enqueue the original announcement. Identical headers from
+    /// multiple peers coalesce; distinct headers (including equivocations)
+    /// remain distinct. Only parsed EB commitments can satisfy offer gating.
     pub fn announce_block(&self, header: WrappedHeader, source: Option<PeerId>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(Point::Specific { slot, .. }) = header.point() {
-            inner.max_slot = inner.max_slot.max(slot);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut was_new = true;
+        if let Some(parsed) = &header.parsed {
+            inner.max_slot = inner.max_slot.max(parsed.slot);
+            if let Some((hash, _)) = parsed.announced_eb {
+                let key = BlockKey {
+                    slot: parsed.slot,
+                    hash,
+                };
+                let headers = inner.announcements.entry(key).or_default();
+                was_new = !headers.iter().any(|h| h.raw == header.raw);
+                if was_new {
+                    headers.push(header.clone());
+                    inner.announcement_count += 1;
+                    inner.announcement_bytes += header.raw.len();
+                }
+            }
         }
-        Self::push_notification(
-            &mut inner,
-            source,
-            LeiosNotification::BlockAnnouncement { header },
-            true,
-        );
+        // Merge sources even for a duplicate, so proactive relay does not echo.
+        let queued = inner.notifications.iter_mut().rev().find(|entry| {
+            matches!(&entry.notification, LeiosNotification::BlockAnnouncement { header: h }
+                if h.raw == header.raw)
+        });
+        if let Some(entry) = queued {
+            if let Some(peer) = source {
+                if !entry.sources.contains(&peer) {
+                    entry.sources.push(peer);
+                }
+            }
+        } else if was_new {
+            Self::push_notification(
+                &mut inner,
+                source,
+                LeiosNotification::BlockAnnouncement { header },
+                true,
+            );
+        }
         self.bump_version(&mut inner);
+    }
+
+    /// Replay an original header for this EB, without consuming notifications.
+    pub(crate) fn announcement(&self, slot: u64, hash: [u8; 32]) -> Option<WrappedHeader> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .announcements
+            .get(&BlockKey { slot, hash })?
+            .first()
+            .cloned()
+    }
+
+    /// Availability check without `get_block`'s fetched/retry side effect.
+    pub(crate) fn has_offer(&self, slot: u64, hash: [u8; 32], txs: bool) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = BlockKey { slot, hash };
+        if txs {
+            inner.block_txs.contains_key(&key)
+        } else {
+            inner.blocks.contains_key(&key)
+        }
     }
 
     /// Merge transaction bodies for an endorser block, indexed by their
@@ -624,6 +687,8 @@ impl LeiosStore {
             + std::mem::size_of::<VecDeque<NotificationEntry>>();
         LeiosStoreStats {
             blocks: inner.blocks.len(),
+            announcements: inner.announcement_count,
+            announcement_bytes: inner.announcement_bytes,
             block_txs: inner.block_txs.len(),
             eb_tx_hashes: inner.eb_tx_hashes.len(),
             votes: inner.votes.len(),
@@ -796,6 +861,23 @@ impl LeiosStore {
             }
         }
 
+        // Headers have their own bounds: a header can arrive before its body
+        // or remain useful after the original notification has been pruned.
+        while inner
+            .announcements
+            .first_key_value()
+            .is_some_and(|(key, _)| {
+                key.slot < cutoff
+                    || inner.announcement_count > MAX_NOTIFICATIONS
+                    || inner.announcement_bytes > MAX_ANNOUNCEMENT_BYTES
+            })
+        {
+            if let Some((_, headers)) = inner.announcements.pop_first() {
+                inner.announcement_count -= headers.len();
+                inner.announcement_bytes -= headers.iter().map(|h| h.raw.len()).sum::<usize>();
+            }
+        }
+
         // Capacity backstop on `notifications` (independent of slot
         // window). Front-only popping keeps absolute indexing intact:
         // every pop increments `notifications_pruned_count`, and a
@@ -837,6 +919,8 @@ impl LeiosStore {
                 max_slot = inner.max_slot,
                 cutoff,
                 blocks = inner.blocks.len(),
+                announcements = inner.announcement_count,
+                announcement_bytes = inner.announcement_bytes,
                 block_txs = inner.block_txs.len(),
                 eb_tx_hashes = inner.eb_tx_hashes.len(),
                 votes = inner.votes.len(),
@@ -924,6 +1008,75 @@ mod tests {
 
     fn tx_id_from_arr(arr: [u8; 32]) -> TxId {
         TxId::new_with_array(arr)
+    }
+
+    #[test]
+    fn announcement_replay_survives_notification_pruning_and_expires() {
+        let (store, _) = LeiosStore::new_with_retention(10, None, 5, 0);
+        let point = Point::Specific {
+            slot: 21,
+            hash: [42; 32],
+        };
+        let header = crate::test_utils::leios_header(&point, 1);
+        store.announce_block(header.clone(), Some(PeerId(7)));
+        // Fill the log without advancing the retention clock past the header.
+        for id in 0..MAX_NOTIFICATIONS {
+            store.inject_votes(
+                vec![Vote {
+                    announcing_rb_hash: [0; 32],
+                    voter_id: id as u16,
+                    vote_signature: vec![],
+                }],
+                None,
+            );
+        }
+        assert!(store
+            .notifications_after(&mut 0)
+            .iter()
+            .all(|e| !matches!(e.notification, LeiosNotification::BlockAnnouncement { .. })));
+        assert_eq!(store.announcement(21, [42; 32]).unwrap().raw, header.raw);
+        // Repeated reception must not restart relay after its log entry ages out.
+        let count = store.notification_count();
+        store.announce_block(header, Some(PeerId(8)));
+        assert_eq!(store.notification_count(), count);
+        store.tick_slot(27);
+        assert!(store.announcement(21, [42; 32]).is_none());
+        assert_eq!(store.stats().announcements, 0);
+        assert_eq!(store.stats().announcement_bytes, 0);
+    }
+
+    #[test]
+    fn replay_cache_bounds_count_and_bytes_even_with_a_stalled_clock() {
+        let (store, _) = LeiosStore::new(10);
+        // An in-process producer can supply large headers too; bound cached
+        // bytes independently of the network decoder's individual size limit.
+        for id in 0..3u8 {
+            let mut header = crate::test_utils::leios_header(
+                &Point::Specific {
+                    slot: 21,
+                    hash: [id; 32],
+                },
+                1,
+            );
+            header.raw.resize(MAX_ANNOUNCEMENT_BYTES / 2, 0);
+            store.announce_block(header, None);
+        }
+        assert_eq!(store.stats().announcements, 2);
+        assert_eq!(store.stats().announcement_bytes, MAX_ANNOUNCEMENT_BYTES);
+        assert!(store.announcement(21, [0; 32]).is_none());
+        assert!(store.announcement(21, [2; 32]).is_some());
+        // Count protection also applies to many small, distinct commitments.
+        let (store, _) = LeiosStore::new(10);
+        for id in 0..=MAX_NOTIFICATIONS as u64 {
+            let mut hash = [0; 32];
+            hash[..8].copy_from_slice(&id.to_be_bytes());
+            store.announce_block(
+                crate::test_utils::leios_header(&Point::Specific { slot: 21, hash }, 1),
+                None,
+            );
+        }
+        assert_eq!(store.stats().announcements, MAX_NOTIFICATIONS);
+        assert!(store.announcement(21, [0; 32]).is_none());
     }
 
     #[test]
@@ -1839,9 +1992,11 @@ mod tests {
             inner
                 .notifications
                 .iter()
-                .filter(|e| matches!(&e.notification,
+                .filter(|e| {
+                    matches!(&e.notification,
                     LeiosNotification::BlockOffer { point: p, .. }
-                        if matches!(p, Point::Specific { slot, .. } if *slot == 10)))
+                        if matches!(p, Point::Specific { slot, .. } if *slot == 10))
+                })
                 .count()
         };
         assert_eq!(count_offers(&store), 1, "the original offer");

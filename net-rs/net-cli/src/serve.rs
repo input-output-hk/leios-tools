@@ -4,6 +4,8 @@
 //! Uses the multi-peer coordinator in responder-only mode. The block
 //! generator injects blocks via `NetworkCommand::InjectBlock`.
 
+use net_core::store::leios_store::LeiosStore;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rand::rngs::StdRng;
@@ -86,9 +88,54 @@ async fn block_generator(
     }
 }
 
+/// Parser-valid synthetic announcement, like the other fake server data.
+/// It supplies the commitment needed by LeiosNotify, not a consensus signature.
+fn synthetic_leios_header(
+    slot: u64,
+    hash: [u8; 32],
+    size: u32,
+) -> Result<WrappedHeader, minicbor::encode::Error<std::convert::Infallible>> {
+    let mut inner = minicbor::Encoder::new(Vec::new());
+    inner.array(2)?; // [header_body, signature]
+    inner.array(12)?;
+    inner.u64(1)?; // block number
+    inner.u64(slot)?;
+    inner.null()?; // previous header hash
+    inner.bytes(&[1; 32])?; // issuer verification key
+    inner.bytes(&[2; 32])?; // VRF verification key
+    inner.array(2)?;
+    inner.bytes(&[3; 64])?; // VRF output
+    inner.bytes(&[4; 80])?; // VRF proof
+    inner.u32(1)?; // ranking-block body size
+    inner.bytes(&[5; 32])?; // ranking-block body hash
+    inner.array(4)?; // operational certificate
+    inner.bytes(&[6; 32])?;
+    inner.u64(0)?;
+    inner.u64(0)?;
+    inner.bytes(&[7; 64])?;
+    inner.array(2)?; // protocol version
+    inner.u32(11)?;
+    inner.u32(0)?;
+    inner.bool(false)?; // certified_eb
+    inner.array(2)?; // announced_eb
+    inner.bytes(&hash)?;
+    inner.u32(size)?;
+    inner.bytes(&[8; 64])?; // dummy header signature
+    let mut outer = minicbor::Encoder::new(Vec::new());
+    outer.array(2)?;
+    outer.u8(8)?; // Dijkstra era tag
+    outer.tag(minicbor::data::Tag::new(24))?;
+    outer.bytes(&inner.into_writer())?;
+    Ok(WrappedHeader::new(outer.into_writer()))
+}
+
 /// Background task that generates Leios endorser blocks and votes on a Poisson schedule.
 /// Generates one EB per Praos block (roughly), plus votes for each EB.
-async fn leios_generator(commands: mpsc::Sender<NetworkCommand>, rate: f64) {
+async fn leios_generator(
+    commands: mpsc::Sender<NetworkCommand>,
+    store: Arc<LeiosStore>,
+    rate: f64,
+) {
     let mut rng = StdRng::from_entropy();
     let mut next_eb_slot: u64 = 1;
 
@@ -104,6 +151,13 @@ async fn leios_generator(commands: mpsc::Sender<NetworkCommand>, rate: f64) {
 
         // Inject a fake endorser block.
         let block_data = vec![0x82, slot as u8, 0x00]; // minimal CBOR
+        match synthetic_leios_header(slot, hash, block_data.len() as u32) {
+            Ok(header) => store.announce_block(header, None),
+            Err(error) => {
+                tracing::warn!(%error, "cannot encode synthetic Leios announcement");
+                continue;
+            }
+        }
         let _ = commands
             .send(NetworkCommand::InjectLeiosBlock {
                 point: net_core::types::Point::Specific { slot, hash },
@@ -173,10 +227,10 @@ pub async fn run(
     });
 
     // Start Leios generator if enabled.
-    if leios {
+    if let Some(store) = handle.leios_store.clone() {
         let commands = handle.commands.clone();
         tokio::spawn(async move {
-            leios_generator(commands, block_rate * 2.0).await;
+            leios_generator(commands, store, block_rate * 2.0).await;
         });
     }
 

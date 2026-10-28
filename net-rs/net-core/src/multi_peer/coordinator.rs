@@ -785,6 +785,9 @@ impl Coordinator {
 
             // Leios events — deduplicated with offer tracking for smart routing.
             PeerEvent::LeiosBlockAnnounced { header } => {
+                if let Some(store) = &self.leios_store {
+                    store.announce_block(header.clone(), Some(peer_id));
+                }
                 self.emit_event(NetworkEvent::LeiosBlockAnnounced { header });
             }
 
@@ -1991,6 +1994,52 @@ mod tests {
     use super::*;
     use crate::types::WrappedHeader;
     use shared_consensus::mempool::{TxBody, TxId};
+
+    #[tokio::test]
+    async fn leios_announcements_are_retained_for_relay_without_looping_duplicates() {
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (chain, _) = ChainStore::new(10);
+        let (store, _) = LeiosStore::new(10);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_tx,
+            peer_rx,
+            event_tx,
+            cmd_rx,
+            chain,
+            Some(store.clone()),
+        );
+        let header = crate::test_utils::leios_header(
+            &Point::Specific {
+                slot: 21,
+                hash: [42; 32],
+            },
+            1,
+        );
+        for peer in [PeerId(7), PeerId(8)] {
+            coordinator
+                .handle_peer_event(
+                    peer,
+                    PeerEvent::LeiosBlockAnnounced {
+                        header: header.clone(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(event_rx.recv().await.unwrap(), NetworkEvent::LeiosBlockAnnounced { header: h } if h.raw == header.raw)
+            );
+        }
+        assert_eq!(store.announcement(21, [42; 32]).unwrap().raw, header.raw);
+        let entries = store.notifications_after(&mut 0);
+        assert_eq!(
+            entries.len(),
+            1,
+            "identical relays must not generate a gossip loop"
+        );
+        assert_eq!(entries[0].sources, vec![PeerId(7), PeerId(8)]);
+    }
 
     /// Helper: set up a coordinator with a MemBearer-connected peer.
     /// Returns (CoordinatorHandle, server_handle, MemBearer pair).
