@@ -195,7 +195,7 @@ mod tests {
     use crate::bearer::mem::MemBearer;
     use crate::mux::scheduler::{RoundRobin, TrafficClass};
     use crate::mux::{
-        CodecRecv, CodecSend, MODE_INITIATOR, MODE_RESPONDER, Mux, MuxConfig, ProtocolConfig,
+        CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, MODE_INITIATOR, MODE_RESPONDER,
     };
     use crate::protocols::Role;
     use crate::types::Point;
@@ -274,36 +274,30 @@ mod tests {
     #[test]
     fn invalid_transitions() {
         // Server message in client state
-        assert!(
-            LeiosFetch::transition(
-                &State::StIdle,
-                &Message::MsgLeiosBlock { block: vec![0x80] }
-            )
-            .is_err()
-        );
+        assert!(LeiosFetch::transition(
+            &State::StIdle,
+            &Message::MsgLeiosBlock { block: vec![0x80] }
+        )
+        .is_err());
         // Client message in server state
-        assert!(
-            LeiosFetch::transition(
-                &State::StBlock,
-                &Message::MsgLeiosBlockRequest {
-                    point: Point::Specific {
-                        slot: 1,
-                        hash: [0; 32]
-                    },
-                }
-            )
-            .is_err()
-        );
+        assert!(LeiosFetch::transition(
+            &State::StBlock,
+            &Message::MsgLeiosBlockRequest {
+                point: Point::Specific {
+                    slot: 1,
+                    hash: [0; 32]
+                },
+            }
+        )
+        .is_err());
         // Wrong server state
-        assert!(
-            LeiosFetch::transition(
-                &State::StBlock,
-                &Message::MsgLeiosBlockTxs {
-                    transactions: vec![],
-                }
-            )
-            .is_err()
-        );
+        assert!(LeiosFetch::transition(
+            &State::StBlock,
+            &Message::MsgLeiosBlockTxs {
+                transactions: vec![],
+            }
+        )
+        .is_err());
         // Done in server state
         assert!(LeiosFetch::transition(&State::StBlock, &Message::MsgDone).is_err());
     }

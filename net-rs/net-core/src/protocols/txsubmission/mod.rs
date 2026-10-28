@@ -6,8 +6,8 @@
 
 pub mod codec;
 
-use shared_consensus::PeerId;
 use shared_consensus::mempool::{TxBody, TxId, TxInfo};
+use shared_consensus::PeerId;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,7 +73,11 @@ pub const MAX_ERA: u16 = 7;
 /// era we put on the wire so the advertised id-era and the delivered body-era
 /// stay consistent for a given tx.
 fn wire_era(era: u16) -> u16 {
-    if era > MAX_ERA { ORIGIN_ERA } else { era }
+    if era > MAX_ERA {
+        ORIGIN_ERA
+    } else {
+        era
+    }
 }
 
 // --- Types ---
@@ -503,7 +507,7 @@ mod tests {
     use crate::bearer::mem::MemBearer;
     use crate::mux::scheduler::{RoundRobin, TrafficClass};
     use crate::mux::{
-        CodecRecv, CodecSend, MODE_INITIATOR, MODE_RESPONDER, Mux, MuxConfig, ProtocolConfig,
+        CodecRecv, CodecSend, Mux, MuxConfig, ProtocolConfig, MODE_INITIATOR, MODE_RESPONDER,
     };
     use crate::protocols::Role;
 
@@ -610,18 +614,16 @@ mod tests {
         assert!(TxSubmission::transition(&State::StIdle, &Message::MsgInit).is_err());
 
         // Server messages not valid in client states
-        assert!(
-            TxSubmission::transition(
-                &State::StTxIdsBlocking,
-                &Message::MsgRequestTxs {
-                    tx_ids: vec![EraTxId {
-                        era: ORIGIN_ERA,
-                        tx_id: TxId::new_with_array([0u8; 32])
-                    }]
-                }
-            )
-            .is_err()
-        );
+        assert!(TxSubmission::transition(
+            &State::StTxIdsBlocking,
+            &Message::MsgRequestTxs {
+                tx_ids: vec![EraTxId {
+                    era: ORIGIN_ERA,
+                    tx_id: TxId::new_with_array([0u8; 32])
+                }]
+            }
+        )
+        .is_err());
     }
 
     #[test]
