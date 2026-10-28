@@ -270,7 +270,6 @@ struct Coordinator {
     /// Per-peer downstream-promotion flags, shared with `CoordinatorHandle` so
 
     /// the application can count peers that are actually pulling our chain.
-
     downstream_flags: Arc<Mutex<HashMap<PeerId, crate::peer::DownstreamFlag>>>,
     /// Completed inbound duplex connections from the accept loop. The third
     /// tuple element is the RAII guard holding the per-IP slot reservation;
@@ -598,7 +597,11 @@ impl Coordinator {
                 self.emit_event(NetworkEvent::PeerConnected { peer_id, address });
             }
 
-            PeerEvent::IntersectionFound { point, initial, block_no } => {
+            PeerEvent::IntersectionFound {
+                point,
+                initial,
+                block_no,
+            } => {
                 // The join point decides whether our serving store roots at
                 // genesis. `sync_method` alone can't tell: "sync to the tip" at a
                 // FRESH network resolves to Origin (we join AT genesis), while on a
@@ -612,6 +615,10 @@ impl Coordinator {
                 if initial {
                     self.chain_store
                         .set_anchored_above_genesis(point != Point::Origin);
+                    if let Some(height) = block_no {
+                        self.chain_store
+                            .set_intersection_anchor(point.clone(), height);
+                    }
                 }
                 let new_len = if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.fragment.set_intersection(point.clone());
@@ -624,7 +631,12 @@ impl Coordinator {
                 }
                 // Forward to consensus so it can store the intersection as
                 // the peer chain's anchor (guaranteed common ancestor).
-                self.emit_event(NetworkEvent::IntersectionFound { peer_id, point, initial, block_no });
+                self.emit_event(NetworkEvent::IntersectionFound {
+                    peer_id,
+                    point,
+                    initial,
+                    block_no,
+                });
             }
 
             PeerEvent::HeaderAnnounced { header, tip } => {
@@ -873,8 +885,12 @@ impl Coordinator {
                 // Leios block is requested only when offered, so if we could not retrieved
                 // the offered leios block, then something is wrong.
                 // TODO: maybe make this remove_peer transient? So later reconnect is possible.
-                self.remove_peer(peer_id, format!("Leios block {point} fetch failed")).await;
-                self.emit_event(NetworkEvent::LeiosBlockFetchFailed { source: peer_id, point: point });
+                self.remove_peer(peer_id, format!("Leios block {point} fetch failed"))
+                    .await;
+                self.emit_event(NetworkEvent::LeiosBlockFetchFailed {
+                    source: peer_id,
+                    point: point,
+                });
             }
 
             PeerEvent::LeiosBlockTxsFetched {
@@ -3782,7 +3798,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(recorded, "coordinator should have recorded the manifest within 1s");
+        assert!(
+            recorded,
+            "coordinator should have recorded the manifest within 1s"
+        );
         assert!(
             leios_store
                 .get_block_txs(4, &eb_hash, &bitmap, PeerId(10))
@@ -4061,7 +4080,9 @@ mod tests {
         ));
         // Store has nothing — no manifest, no inject.
         let bitmap = crate::protocols::leios_fetch::bitmap::from_indices(&[0]);
-        assert!(leios_store.get_block_txs(14, &eb_hash, &bitmap, PeerId(1770)).is_none());
+        assert!(leios_store
+            .get_block_txs(14, &eb_hash, &bitmap, PeerId(1770))
+            .is_none());
     }
 
     /// When a peer's command channel fills (peer task not draining), the

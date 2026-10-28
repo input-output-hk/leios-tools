@@ -447,12 +447,12 @@ impl LeiosStore {
     /// with successes scattered through the run rather than stopping at a
     /// cliff — the signature of a race, not an exhausted fetch budget.
     ///
-    /// So retransmit, on the same principle as any unacknowledged send: re-push
-    /// the offer every `RETRY_INTERVAL_SLOTS` until a peer actually fetches the
-    /// body, at most `MAX_RETRIES` times. Serving the body counts as the
-    /// acknowledgement (`get_block`). Bounded on both axes, and entries age out
-    /// with the retention window, so a peer that never fetches costs a few
-    /// extra notifications rather than unbounded traffic.
+    /// Re-push the offer every `RETRY_INTERVAL_SLOTS` until a peer fetches the
+    /// body, at most `MAX_RETRIES` times. The notification responder suppresses
+    /// repeats on each connection, so retries can reach newly connected peers
+    /// without violating the receiver's no-duplicate-offers rule. Serving the
+    /// body counts as acknowledgement (`get_block`). Entries age out with the
+    /// retention window.
     ///
     /// Only our OWN EBs are retransmitted; relaying someone else's is not ours
     /// to do.
@@ -663,6 +663,16 @@ impl LeiosStore {
     pub fn notification_count(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.notifications_pruned_count + inner.notifications.len()
+    }
+
+    /// Oldest slot eligible for an outbound offer. Connection-local offer
+    /// histories use the same cutoff as the store and never re-offer older data.
+    pub(crate) fn retention_cutoff(&self) -> u64 {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.max_slot.saturating_sub(inner.retention_slots)
     }
 
     /// Advance the retention clock to `current_slot`.  Triggers slot-window

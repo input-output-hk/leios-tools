@@ -22,6 +22,7 @@ on:
       - "sim-rs/**"
       - "data/**"
       - ".github/workflows/build.yaml"
+  workflow_dispatch:
 
 # Least privilege: this workflow only checks out and compiles code (build
 # scripts and proc-macros from the dependency tree run during `cargo build`),

@@ -17,7 +17,7 @@ use crate::protocols::blockfetch::{self, BlockFetch};
 use crate::protocols::chainsync::{self, ChainSync, ChainSyncEvent};
 use crate::protocols::keepalive::{self, KeepAlive};
 use crate::protocols::leios_fetch::{self, LeiosFetch};
-use crate::protocols::leios_notify::{self, LeiosNotify, LeiosNotifyEvent};
+use crate::protocols::leios_notify::{self, LeiosNotifyEvent};
 use crate::protocols::peersharing::{self, PeerSharing};
 use crate::protocols::txsubmission::{self, PendingTx, TxSubmission};
 use crate::protocols::{Role, Runner};
@@ -557,7 +557,7 @@ fn eb_fields(point: &Point) -> (u64, String) {
     }
 }
 
-/// Spawn the LeiosNotify sub-task. Continuous request_next loop.
+/// Spawn the LeiosNotify sub-task with bounded request pipelining.
 pub(crate) fn spawn_leios_notify(
     ln_send: CodecSend,
     ln_recv: CodecRecv,
@@ -565,9 +565,9 @@ pub(crate) fn spawn_leios_notify(
     event_sender: mpsc::Sender<(PeerId, PeerEvent)>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut runner = Runner::<LeiosNotify>::new(Role::Client, ln_send, ln_recv);
+        let mut client = leios_notify::PipelinedClient::new(ln_send, ln_recv);
         loop {
-            match leios_notify::request_next(&mut runner).await {
+            match client.next().await {
                 Ok(LeiosNotifyEvent::BlockAnnouncement { header }) => {
                     tracing::info!(%peer_id, header_bytes = header.raw.len(), "leios_notify: EB announcement (header)");
                     let _ = event_sender
@@ -640,6 +640,9 @@ pub(crate) fn spawn_leios_notify(
                         .await;
                 }
                 Err(e) => {
+                    // This task never requests shutdown. Even Terminated means
+                    // unsolicited cancellation: report it so the coordinator
+                    // reconnects instead of leaving a peer with no Leios stream.
                     let _ = event_sender
                         .send((
                             peer_id,
@@ -1294,7 +1297,7 @@ mod tests {
         let ((client_send, client_recv), (server_send, server_recv), mux_a, mux_b) =
             mux_pair_for_protocol(&ln_proto);
 
-        // Fake server: respond to two request_next calls, then expect MsgDone.
+        // Fake server: respond to two requests, then stay alive until aborted.
         let server_handle = tokio::spawn(async move {
             let mut runner =
                 ProtocolRunner::<LeiosNotify>::new(Role::Server, server_send, server_recv);
@@ -1327,8 +1330,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Client will be aborted, so the next recv will fail — that's fine.
-            let _ = runner.recv().await;
+            // More requests may already be queued by the pipelined client.
+            // Keep the server channel alive while the caller consumes replies.
+            std::future::pending::<()>().await;
         });
 
         let (event_sender, mut event_receiver) = mpsc::channel(64);
@@ -1369,6 +1373,61 @@ mod tests {
         // Clean up.
         ln_handle.abort();
         server_handle.abort();
+        mux_a.abort();
+        mux_b.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn spawn_leios_notify_reports_unsolicited_cancellation() {
+        let proto = server_protocol_configs(true)
+            .into_iter()
+            .find(|config| config.id == leios_notify::PROTOCOL_ID)
+            .unwrap();
+        let ((client_send, client_recv), (server_send, mut server_recv), mux_a, mux_b) =
+            mux_pair_for_protocol(&proto);
+        let server = tokio::spawn(async move {
+            for _ in 0..leios_notify::PIPELINE_DEPTH {
+                assert!(matches!(
+                    server_recv
+                        .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                        .await
+                        .unwrap(),
+                    LnMsg::MsgLeiosNotificationRequestNext
+                ));
+            }
+            server_send.send(&LnMsg::MsgCanceled).await.unwrap();
+            assert!(matches!(
+                server_recv
+                    .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+                    .await
+                    .unwrap(),
+                LnMsg::MsgQuit
+            ));
+            for _ in 1..leios_notify::PIPELINE_DEPTH {
+                server_send.send(&LnMsg::MsgCanceled).await.unwrap();
+            }
+            server_send.send(&LnMsg::MsgDone).await.unwrap();
+        });
+        let (events, mut receiver) = mpsc::channel(16);
+        let client = spawn_leios_notify(client_send, client_recv, PeerId(1), events);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            client.await.unwrap();
+            server.await.unwrap();
+            assert!(
+                matches!(
+                    receiver.recv().await,
+                    Some((PeerId(1), PeerEvent::Failed { reason }))
+                        if reason.starts_with("leios_notify:")
+                ),
+                "unsolicited cancellation must reach the coordinator for reconnection"
+            );
+            assert!(
+                receiver.recv().await.is_none(),
+                "report failure exactly once"
+            );
+        })
+        .await
+        .expect("the active peer client must finish the cancellation handshake");
         mux_a.abort();
         mux_b.abort();
     }

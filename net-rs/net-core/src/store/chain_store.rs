@@ -88,9 +88,27 @@ struct ChainStoreInner {
     /// genesis's successor — which the follower rejects with UnexpectedBlockNo,
     /// tearing the connection down. Set once at boot from the sync method.
     anchored_above_genesis: bool,
+    /// Known sync-at-tip intersection; no header or body is fabricated for it.
+    intersection_anchor: Option<Tip>,
 }
 
 impl ChainStoreInner {
+    fn servable_anchor(&self) -> Option<&Tip> {
+        let anchor = self.intersection_anchor.as_ref()?;
+        let Point::Specific { hash, .. } = &anchor.point else {
+            return None;
+        };
+        if let Some(first) = self.blocks.front() {
+            let header = first.header.parsed.as_ref()?;
+            if header.prev_hash != Some(*hash)
+                || anchor.block_no.checked_add(1) != Some(header.block_number)
+            {
+                return None;
+            }
+        }
+        Some(anchor)
+    }
+
     /// Retain `removed` blocks (dropped from the live chain) in the orphan
     /// cache for later BlockFetch, trimming oldest entries past the cap.
     fn retain_orphans(&mut self, removed: impl IntoIterator<Item = StoredBlock>) {
@@ -128,6 +146,7 @@ impl ChainStore {
                 last_rollback_target: None,
                 orphan_bodies: VecDeque::new(),
                 anchored_above_genesis: false,
+                intersection_anchor: None,
             }),
             notify: notify_sender,
         });
@@ -151,6 +170,28 @@ impl ChainStore {
         let _ = self.notify.send(count);
     }
 
+    /// Remember an exact upstream tip intersection before the next lottery
+    /// winner arrives. Downstream peers can intersect here and await its child
+    /// without receiving a false Genesis tip / ForkTooDeep. Only the first
+    /// anchor of an empty, explicitly tip-joined store is accepted.
+    pub fn set_intersection_anchor(&self, point: Point, block_no: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if point == Point::Origin
+            || !inner.anchored_above_genesis
+            || !inner.blocks.is_empty()
+            || inner.intersection_anchor.is_some()
+        {
+            return;
+        }
+        inner.intersection_anchor = Some(Tip { point, block_no });
+        inner.block_no = block_no;
+        drop(inner);
+        let _ = self.notify.send(block_no);
+    }
+
     /// Whether this store holds a servable chain yet. A node that joined above
     /// genesis (sync-at-tip) intersects at the network tip immediately but does
     /// not hold its first block until it has fetched + validated it — a window
@@ -163,7 +204,9 @@ impl ChainStore {
     /// legitimately at Origin from the start and is always seeded.
     pub fn is_seeded(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        !inner.anchored_above_genesis || !inner.blocks.is_empty()
+        !inner.anchored_above_genesis
+            || inner.servable_anchor().is_some()
+            || !inner.blocks.is_empty()
     }
 
     /// Append a block to the chain. Evicts the oldest block if over capacity.
@@ -236,6 +279,7 @@ impl ChainStore {
     pub fn rollback_to(&self, point: &Point) -> Point {
         let mut inner = self.inner.lock().unwrap();
         if *point == Point::Origin {
+            inner.intersection_anchor = None;
             let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
             inner.retain_orphans(removed);
             inner.block_no = 0;
@@ -243,6 +287,14 @@ impl ChainStore {
             drop(inner);
             let _ = self.notify.send(0);
             return Point::Origin;
+        }
+        if inner.servable_anchor().is_some_and(|a| a.point == *point) {
+            let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
+            inner.retain_orphans(removed);
+            inner.last_rollback_target = Some(point.clone());
+            drop(inner);
+            let _ = self.notify.send(0);
+            return point.clone();
         }
         // Find the position of the target point and truncate after it, retaining
         // the removed suffix (blocks we may have already announced) for BlockFetch.
@@ -290,10 +342,10 @@ impl ChainStore {
                 point: block.point.clone(),
                 block_no: inner.block_no,
             },
-            None => Tip {
+            None => inner.servable_anchor().cloned().unwrap_or(Tip {
                 point: Point::Origin,
                 block_no: 0,
-            },
+            }),
         }
     }
 
@@ -313,10 +365,10 @@ impl ChainStore {
                 point: block.point.clone(),
                 block_no: inner.block_no,
             },
-            None => Tip {
+            None => inner.servable_anchor().cloned().unwrap_or(Tip {
                 point: Point::Origin,
                 block_no: 0,
-            },
+            }),
         };
 
         // Whether our chain actually roots at genesis, i.e. our earliest stored
@@ -334,8 +386,9 @@ impl ChainStore {
         // still empty at boot — offering Origin then would hand a follower a
         // cursor we later mis-serve (see `anchored_above_genesis`).
         let len = inner.blocks.len() as u64;
-        let roots_at_genesis =
-            !inner.anchored_above_genesis && (len == 0 || inner.block_no + 1 == len);
+        let roots_at_genesis = !inner.anchored_above_genesis
+            && inner.intersection_anchor.is_none()
+            && (len == 0 || inner.block_no.checked_add(1) == Some(len));
         for candidate in points {
             if *candidate == Point::Origin {
                 if roots_at_genesis {
@@ -343,7 +396,11 @@ impl ChainStore {
                 }
                 continue; // anchored above genesis — Origin is not a valid intersection
             }
-            if inner.blocks.iter().any(|b| b.point == *candidate) {
+            if inner
+                .servable_anchor()
+                .is_some_and(|a| a.point == *candidate)
+                || inner.blocks.iter().any(|b| b.point == *candidate)
+            {
                 return Some((candidate.clone(), tip));
             }
         }
@@ -377,9 +434,13 @@ impl ChainStore {
         let inner = self.inner.lock().unwrap();
         // Index of the cursor point (None ⇒ Origin ⇒ before the first block);
         // the block to serve is the one immediately after it.
+        let at_anchor = inner
+            .servable_anchor()
+            .is_some_and(|a| read_point.as_ref() == Some(&a.point));
         let after = match read_point {
             None => 0,
             Some(p) if *p == Point::Origin => 0,
+            Some(_) if at_anchor => 0,
             Some(p) => match inner.blocks.iter().position(|b| b.point == *p) {
                 // Still present (possibly renumbered by eviction).
                 Some(i) => i + 1,
@@ -395,9 +456,13 @@ impl ChainStore {
         // Origin cursor from when our store was still empty at boot, so guard
         // the serve too (find_intersection stops OFFERING Origin) and await
         // instead — the follower re-intersects at a real point once we hold one
-        // it shares. (A genesis-rooted node that merely evicted its early blocks
-        // is NOT anchored and keeps serving from the front, as before.)
-        if after == 0 && inner.anchored_above_genesis {
+        // it shares. Recheck the actual stored history: a later peer can clear
+        // the initial join flag, and capacity eviction can remove block zero.
+        let roots_at_genesis = !inner.anchored_above_genesis
+            && inner.intersection_anchor.is_none()
+            && (inner.blocks.is_empty()
+                || inner.block_no.checked_add(1) == Some(inner.blocks.len() as u64));
+        if after == 0 && !roots_at_genesis && !at_anchor {
             return NextForCursor::AtTip;
         }
         match inner.blocks.get(after) {
@@ -417,7 +482,10 @@ impl ChainStore {
         match &inner.last_rollback_target {
             Some(p) if *p == Point::Origin => Point::Origin,
             Some(p) if inner.blocks.iter().any(|b| b.point == *p) => p.clone(),
-            _ => Point::Origin,
+            _ => inner
+                .servable_anchor()
+                .map(|a| a.point.clone())
+                .unwrap_or(Point::Origin),
         }
     }
 
@@ -598,6 +666,96 @@ mod tests {
     }
 
     #[test]
+    fn tip_anchor_is_servable_without_claiming_origin_or_fabricating_a_body() {
+        let (store, _rx) = ChainStore::new(10);
+        store.set_anchored_above_genesis(true);
+        let anchor = make_point(100);
+        store.set_intersection_anchor(anchor.clone(), 50);
+        assert!(store.is_seeded());
+        assert_eq!(store.tip().point, anchor);
+        assert_eq!(store.tip().block_no, 50);
+        assert!(store.find_intersection(&[Point::Origin]).is_none());
+        assert_eq!(
+            store
+                .find_intersection(std::slice::from_ref(&anchor))
+                .unwrap()
+                .0,
+            anchor
+        );
+        assert!(matches!(
+            store.next_after_cursor(&Some(anchor.clone())),
+            NextForCursor::AtTip
+        ));
+        assert_eq!(store.stored_count(), 0);
+        store.set_intersection_anchor(make_point(200), 100);
+        assert_eq!(
+            store.tip().point,
+            anchor,
+            "another peer cannot replace the anchor"
+        );
+        // Unverifiable/noncontiguous history must never be served after this cursor.
+        let (p, h, b) = make_block(102);
+        store.append_block(p, h, b, 52);
+        assert!(store
+            .find_intersection(std::slice::from_ref(&anchor))
+            .is_none());
+        assert!(matches!(
+            store.next_after_cursor(&Some(anchor)),
+            NextForCursor::Gone
+        ));
+    }
+
+    #[test]
+    fn anchor_serves_only_its_verified_immediate_child_and_survives_rollback() {
+        let (store, _rx) = ChainStore::new(1);
+        store.set_anchored_above_genesis(true);
+        let anchor = make_point(100);
+        store.set_intersection_anchor(anchor.clone(), 50);
+        let child = make_point(101);
+        let mut header = WrappedHeader::opaque(vec![]);
+        header.parsed = Some(net_codec::HeaderInfo {
+            era: 8,
+            block_number: 51,
+            slot: 101,
+            prev_hash: Some([100; 32]),
+            issuer_vkey: [0; 32],
+            body_size: 0,
+            block_body_hash: [0; 32],
+            announced_eb: None,
+            certified_eb: Some(false),
+        });
+        store.append_block(child.clone(), header.clone(), BlockBody::opaque(vec![]), 51);
+        assert!(
+            matches!(store.next_after_cursor(&Some(anchor.clone())), NextForCursor::Next(b) if b.point == child)
+        );
+        assert_eq!(store.rollback_to(&anchor), anchor);
+        assert!(matches!(
+            store.next_after_cursor(&Some(anchor.clone())),
+            NextForCursor::AtTip
+        ));
+        store.append_block(child, header.clone(), BlockBody::opaque(vec![]), 51);
+        let info = header.parsed.as_mut().unwrap();
+        info.block_number = 52;
+        info.prev_hash = Some([101; 32]);
+        store.append_block(make_point(102), header, BlockBody::opaque(vec![]), 52);
+        assert!(
+            store
+                .find_intersection(std::slice::from_ref(&anchor))
+                .is_none(),
+            "eviction must invalidate the old anchor"
+        );
+        assert!(matches!(
+            store.next_after_cursor(&Some(anchor)),
+            NextForCursor::Gone
+        ));
+        store.rollback_to(&Point::Origin);
+        assert!(
+            !store.is_seeded(),
+            "clearing history must also forget the anchor"
+        );
+    }
+
+    #[test]
     fn empty_chain_tip_is_origin() {
         let (store, _rx) = ChainStore::new(100);
         let tip = store.tip();
@@ -635,7 +793,10 @@ mod tests {
 
         // Reorg past block 2.
         store.rollback_to(&p1);
-        assert!(store.get_range(&p2, &p2).is_empty(), "live chain dropped it");
+        assert!(
+            store.get_range(&p2, &p2).is_empty(),
+            "live chain dropped it"
+        );
 
         // But the orphan cache still serves its body (single-block request).
         let served = store.get_orphans(&p2, &p2);
@@ -656,7 +817,11 @@ mod tests {
         store.append_block(p3, h3, b3, 3); // evicts p1
 
         assert!(store.get_range(&p1, &p1).is_empty(), "p1 evicted from live");
-        assert_eq!(store.get_orphans(&p1, &p1).len(), 1, "p1 retained for fetch");
+        assert_eq!(
+            store.get_orphans(&p1, &p1).len(),
+            1,
+            "p1 retained for fetch"
+        );
     }
 
     #[test]
@@ -838,11 +1003,11 @@ mod tests {
             Some(make_point(3))
         );
 
-        // Origin cursor serves from the front (now block 2 after eviction).
-        assert_eq!(
-            next_point(store.next_after_cursor(&None)),
-            Some(make_point(2))
-        );
+        // Evicted history cannot be served as if its front were block zero.
+        assert!(matches!(
+            store.next_after_cursor(&None),
+            NextForCursor::AtTip
+        ));
         // Cursor at the tip (block 4) → nothing after → AtTip.
         assert!(matches!(
             store.next_after_cursor(&Some(make_point(4))),
@@ -977,6 +1142,26 @@ mod tests {
             None,
             "anchored-above-genesis chain must not claim Origin"
         );
+    }
+
+    #[test]
+    fn origin_cursor_rechecks_history_after_other_peer_intersects() {
+        let (store, _rx) = ChainStore::new(100);
+        assert!(store.find_intersection(&[Point::Origin]).is_some());
+        store.set_anchored_above_genesis(true);
+        let (p, h, b) = make_block(3);
+        store.append_block(p.clone(), h, b, 2);
+        // A second peer intersects at Origin; this must not make a truncated
+        // store's first header legal to send as block zero.
+        store.set_anchored_above_genesis(false);
+        for cursor in [None, Some(Point::Origin)] {
+            assert!(matches!(
+                store.next_after_cursor(&cursor),
+                NextForCursor::AtTip
+            ));
+        }
+        assert!(store.find_intersection(&[Point::Origin]).is_none());
+        assert!(store.find_intersection(&[p]).is_some());
     }
 
     #[test]
