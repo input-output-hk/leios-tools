@@ -5,3 +5,6 @@ pub mod peer;
 pub mod protocols;
 pub mod store;
 pub mod types;
+
+#[cfg(test)]
+mod test_utils;

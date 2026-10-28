@@ -688,6 +688,16 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             let (event, _) = tokio::join!(client.next(), async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
+                store.announce_block(
+                    crate::test_utils::leios_header(
+                        &Point::Specific {
+                            slot: 21,
+                            hash: [21; 32],
+                        },
+                        1,
+                    ),
+                    None,
+                );
                 store.inject_block(
                     Point::Specific {
                         slot: 21,
@@ -699,6 +709,10 @@ mod tests {
             });
             assert!(matches!(
                 event.unwrap(),
+                LeiosNotifyEvent::BlockAnnouncement { .. }
+            ));
+            assert!(matches!(
+                client.next().await.unwrap(),
                 LeiosNotifyEvent::BlockOffer { .. }
             ));
             client.shutdown().await.unwrap();

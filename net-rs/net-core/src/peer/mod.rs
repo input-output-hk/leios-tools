@@ -7,6 +7,7 @@
 pub(crate) mod command_dispatch;
 pub mod connect;
 pub(crate) mod duplex_task;
+mod leios_notify_state;
 pub(crate) mod peer_task;
 pub mod server_handlers;
 pub mod types;

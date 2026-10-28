@@ -718,7 +718,7 @@ mod tests {
                 let mut hash = [0; 32];
                 hash[..8].copy_from_slice(&(id as u64).to_be_bytes());
                 let point = Point::Specific { slot: 42, hash };
-                store.inject_block(point, vec![0xa0], None);
+                store.announce_block(crate::test_utils::leios_header(&point, 1), None);
                 remote.request().await;
                 assert!(matches!(
                     remote
@@ -727,7 +727,7 @@ mod tests {
                         .recv::<LnMsg>(leios_notify::SIZE_LIMIT)
                         .await
                         .unwrap(),
-                    LnMsg::MsgLeiosBlockOffer { .. }
+                    LnMsg::MsgLeiosBlockAnnouncement { .. }
                 ));
             }
             remote.ping(2).await;

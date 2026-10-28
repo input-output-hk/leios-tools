@@ -102,8 +102,44 @@ notification stream.
 It reads incoming requests while waiting for data. On `MsgQuit`, it replies
 with one `MsgCanceled` per unanswered request, then `MsgDone`.
 
-Block-body offers are deduplicated by slot and hash per connection. Store
-retries can therefore reach a new connection without repeating an offer on an
-existing one; transaction offers for the same block remain independent. Offer
-history expires with the store's retention window. At 10,000 retained offers,
-the responder terminates instead of forgetting live entries and risking duplicates.
+The responder sends a matching announcement on this connection before each
+block's first body or transaction offer. It records delivery after a successful
+send to the ordered mux queue. An inbound announcement, a skipped entry, or a
+prepared response does not count as sent.
+
+The store retains original ranking-block headers indexed by the slot and
+announced endorser-block hash, independently of the notification cursor. This
+lets a retried offer supply an announcement missed during disconnection or
+filtered by no-echo. Dependency replay may send the header back to its source
+when an otherwise eligible offer requires it; body/transaction source filtering
+still applies. Received headers enter this cache through the coordinator. Before a peer header
+can enter either the relay queue or replay cache, the store validates its complete
+week-41 Dijkstra wire structure: era wrapper, record shapes, mandatory fields,
+key/proof/signature lengths and absence of trailing bytes. Invalid headers are
+dropped without releasing deferred offers; a later valid announcement can still
+release them. This is structural validation, not signature or consensus validation;
+unverified peer slots do not advance the store's retention clock. Local producers
+remain responsible for their headers, preserving deliberate adversarial injection.
+Identical headers coalesce to prevent relay loops; distinct equivocation headers
+remain distinct.
+
+Offers whose headers are unavailable are coalesced and deferred while unrelated
+notifications continue. Deferred offers are reconsidered on store or control
+changes and after each send; evicted data is not advertised. Unsent intent
+survives temporary eviction so re-fetched data can be offered, and expires at
+the normal retention cutoff. Body and transaction offers have independent
+per-connection sent histories, so retries reach new connections without repeating
+offers on existing ones.
+
+All connection history expires with the store's retention window, including on
+idle connections. Each connection retains at most 10,000 block records (with at
+most one pending body and one pending transaction offer each) and 10,000 header
+identities. At capacity it terminates instead of forgetting live sent history.
+The replay cache is separately bounded to 10,000 headers and 16 MiB of raw header
+bytes; cache eviction leaves dependent offers deferred until a header returns or
+the offer expires.
+
+Outbound controls still apply at delivery: `echo_to_source` opens the no-echo
+gate, and `offer_eb_size` rewrites the offered size. The explicit adversarial
+`withhold_announce` control permits unannounced **locally produced** offers only;
+it never counts a withheld announcement as sent or bypasses ordering for relays.

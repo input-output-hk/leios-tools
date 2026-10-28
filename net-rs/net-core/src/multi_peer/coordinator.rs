@@ -785,6 +785,9 @@ impl Coordinator {
 
             // Leios events — deduplicated with offer tracking for smart routing.
             PeerEvent::LeiosBlockAnnounced { header } => {
+                if let Some(store) = &self.leios_store {
+                    store.announce_block(header.clone(), Some(peer_id));
+                }
                 self.emit_event(NetworkEvent::LeiosBlockAnnounced { header });
             }
 
@@ -1991,6 +1994,205 @@ mod tests {
     use super::*;
     use crate::types::WrappedHeader;
     use shared_consensus::mempool::{TxBody, TxId};
+
+    /// Replace one mandatory field while preserving the surrounding CBOR record.
+    fn malformed_announcement(header: &WrappedHeader, field: usize) -> WrappedHeader {
+        let mut outer = minicbor::Decoder::new(&header.raw);
+        outer.array().unwrap();
+        let era = outer.u32().unwrap();
+        outer.tag().unwrap();
+        let inner = outer.bytes().unwrap();
+        let mut d = minicbor::Decoder::new(inner);
+        d.array().unwrap();
+        d.array().unwrap();
+        for _ in 0..field {
+            d.skip().unwrap();
+        }
+        let start = d.position();
+        d.skip().unwrap();
+        let mut changed = inner[..start].to_vec();
+        changed.push(0xf6); // null in place of a required structure
+        changed.extend_from_slice(&inner[d.position()..]);
+        let malformed = WrappedHeader::new(net_codec::wrap_header(&changed, era));
+        assert_eq!(
+            malformed.parsed, header.parsed,
+            "best-effort extraction misses this defect"
+        );
+        malformed
+    }
+
+    #[tokio::test]
+    async fn malformed_peer_announcements_never_enter_relay_storage() {
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (chain, _) = ChainStore::new(10);
+        let (store, _) = LeiosStore::new(10);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_tx,
+            peer_rx,
+            event_tx,
+            cmd_rx,
+            chain,
+            Some(store.clone()),
+        );
+        let header = crate::test_utils::leios_header(
+            &Point::Specific {
+                slot: 21,
+                hash: [42; 32],
+            },
+            1,
+        );
+        for field in [4, 5, 8, 9] {
+            // VRF key/proof, certificate, version
+            let malformed = malformed_announcement(&header, field);
+            coordinator
+                .handle_peer_event(
+                    PeerId(7),
+                    PeerEvent::LeiosBlockAnnounced { header: malformed },
+                )
+                .await;
+            // The application still observes the event; it is not relayed.
+            event_rx.recv().await.unwrap();
+            assert!(
+                store.notifications_after(&mut 0).is_empty(),
+                "field {field} reached relay queue"
+            );
+            assert!(
+                store.announcement(21, [42; 32]).is_none(),
+                "field {field} reached replay cache"
+            );
+        }
+        coordinator
+            .handle_peer_event(
+                PeerId(7),
+                PeerEvent::LeiosBlockAnnounced {
+                    header: header.clone(),
+                },
+            )
+            .await;
+        assert_eq!(store.announcement(21, [42; 32]).unwrap().raw, header.raw);
+        assert_eq!(store.notifications_after(&mut 0).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn leios_announcements_are_retained_for_relay_without_looping_duplicates() {
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (chain, _) = ChainStore::new(10);
+        let (store, _) = LeiosStore::new(10);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_tx,
+            peer_rx,
+            event_tx,
+            cmd_rx,
+            chain,
+            Some(store.clone()),
+        );
+        let header = crate::test_utils::leios_header(
+            &Point::Specific {
+                slot: 21,
+                hash: [42; 32],
+            },
+            1,
+        );
+        for peer in [PeerId(7), PeerId(8)] {
+            coordinator
+                .handle_peer_event(
+                    peer,
+                    PeerEvent::LeiosBlockAnnounced {
+                        header: header.clone(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(event_rx.recv().await.unwrap(), NetworkEvent::LeiosBlockAnnounced { header: h } if h.raw == header.raw)
+            );
+        }
+        assert_eq!(store.announcement(21, [42; 32]).unwrap().raw, header.raw);
+        let entries = store.notifications_after(&mut 0);
+        assert_eq!(
+            entries.len(),
+            1,
+            "identical relays must not generate a gossip loop"
+        );
+        assert_eq!(entries[0].sources, vec![PeerId(7), PeerId(8)]);
+    }
+
+    #[tokio::test]
+    async fn peer_announcement_cannot_advance_retention_clock() {
+        let (peer_tx, peer_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (chain, _) = ChainStore::new(10);
+        let (store, _) = LeiosStore::new_with_retention(10, None, 5, 0);
+        let mut coordinator = Coordinator::new(
+            CoordinatorConfig::default(),
+            peer_tx,
+            peer_rx,
+            event_tx,
+            cmd_rx,
+            chain,
+            Some(store.clone()),
+        );
+        store.tick_slot(100);
+        let point = Point::Specific {
+            slot: 100,
+            hash: [42; 32],
+        };
+        let header = crate::test_utils::leios_header(&point, 1);
+        store.announce_block(header.clone(), None);
+        store.inject_block(point.clone(), vec![0xa0], None);
+        store.inject_block_txs_full(point, vec![TxBody::new_with_vec(vec![1])], None);
+
+        let future = crate::test_utils::leios_header(
+            &Point::Specific {
+                slot: 1_000_000,
+                hash: [99; 32],
+            },
+            1,
+        );
+        coordinator
+            .handle_peer_event(
+                PeerId(7),
+                PeerEvent::LeiosBlockAnnounced {
+                    header: future.clone(),
+                },
+            )
+            .await;
+        assert!(matches!(event_rx.recv().await.unwrap(),
+            NetworkEvent::LeiosBlockAnnounced { header: h } if h.raw == future.raw));
+        assert_eq!(
+            store.stats().max_slot,
+            100,
+            "an unverified peer slot must not set retention"
+        );
+        assert_eq!(store.retention_cutoff(), 95);
+        assert!(store.has_offer(100, [42; 32], false));
+        assert!(store.has_offer(100, [42; 32], true));
+        assert_eq!(store.announcement(100, [42; 32]).unwrap().raw, header.raw);
+
+        // Normal data must remain admissible after the future announcement.
+        store.inject_block(
+            Point::Specific {
+                slot: 101,
+                hash: [43; 32],
+            },
+            vec![0xa0],
+            Some(PeerId(8)),
+        );
+        store.tick_slot(102);
+        assert_eq!(store.stats().max_slot, 102);
+        assert!(store.has_offer(101, [43; 32], false));
+        // Trusted time still expires old data at the ordinary boundary.
+        store.tick_slot(106);
+        assert!(!store.has_offer(100, [42; 32], false));
+        assert!(!store.has_offer(100, [42; 32], true));
+        assert!(store.has_offer(101, [43; 32], false));
+    }
 
     /// Helper: set up a coordinator with a MemBearer-connected peer.
     /// Returns (CoordinatorHandle, server_handle, MemBearer pair).
