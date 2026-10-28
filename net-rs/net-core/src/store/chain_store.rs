@@ -278,12 +278,12 @@ impl ChainStore {
     /// Returns the new tip point.
     pub fn rollback_to(&self, point: &Point) -> Point {
         let mut inner = self.inner.lock().unwrap();
-        if *point == Point::Origin {
+        if *point == Point::Origin || inner.blocks.front().map(|first| first.point.get_slot() > point.get_slot()).unwrap_or(false) {
             inner.intersection_anchor = None;
             let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
             inner.retain_orphans(removed);
             inner.block_no = 0;
-            inner.last_rollback_target = Some(Point::Origin);
+            inner.last_rollback_target = Some(point.clone());
             drop(inner);
             let _ = self.notify.send(0);
             return Point::Origin;
