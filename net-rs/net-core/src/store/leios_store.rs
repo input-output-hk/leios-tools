@@ -318,6 +318,8 @@ impl LeiosStore {
     /// Retain and enqueue the original announcement. Identical headers from
     /// multiple peers coalesce; distinct headers (including equivocations)
     /// remain distinct. Only parsed EB commitments can satisfy offer gating.
+    /// Peer-sourced headers do not advance the retention clock; only local
+    /// announcements may supply a trusted slot here.
     pub fn announce_block(&self, header: WrappedHeader, source: Option<PeerId>) {
         let mut inner = self
             .inner
@@ -325,7 +327,11 @@ impl LeiosStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut was_new = true;
         if let Some(parsed) = &header.parsed {
-            inner.max_slot = inner.max_slot.max(parsed.slot);
+            // Peer announcements have only been decoded, not validated. Their
+            // slots must not expire shared data or poison subsequent inserts.
+            if source.is_none() {
+                inner.max_slot = inner.max_slot.max(parsed.slot);
+            }
             if let Some((hash, _)) = parsed.announced_eb {
                 let key = BlockKey {
                     slot: parsed.slot,

@@ -465,3 +465,48 @@ async fn repeated_headers_coalesce_but_distinct_equivocation_headers_survive() {
     assert_marker(connection.next().await, &barrier);
     connection.close().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn deferred_transactions_survive_eviction_and_refetch() {
+    let (store, _) = LeiosStore::new(1);
+    let mut connection = Connection::open(store.clone(), PeerId(7)).await;
+    let (point, header, body) = announced_block(21);
+    let txs = vec![shared_consensus::mempool::TxBody::new_with_vec(vec![1])];
+    store.inject_block(point.clone(), body, Some(PeerId(8)));
+    store.inject_block_txs_full(point.clone(), txs.clone(), Some(PeerId(8)));
+    let pending = marker(101);
+    store.inject_votes(vec![pending.clone()], None);
+    assert_marker(connection.next().await, &pending);
+
+    // Capacity eviction removes both the body and transaction cache while
+    // retaining their log entries. A marker proves the responder saw the gap.
+    let (other, _, other_body) = announced_block(22);
+    store.inject_block(other, other_body, Some(PeerId(7)));
+    let evicted = marker(102);
+    store.inject_votes(vec![evicted.clone()], None);
+    assert_marker(connection.next().await, &evicted);
+
+    store.announce_block(header.clone(), Some(PeerId(8)));
+    assert_announcement(connection.next().await, &header);
+    let unavailable = marker(103);
+    store.inject_votes(vec![unavailable.clone()], None);
+    assert_marker(connection.next().await, &unavailable);
+
+    // Re-fetching only the transactions coalesces into the already-read log
+    // entry. Delivery must resume from the retained unsent intent.
+    store.inject_block_txs_full(point.clone(), txs.clone(), Some(PeerId(8)));
+    let restored = marker(104);
+    store.inject_votes(vec![restored.clone()], None);
+    let offer = connection.next().await;
+    assert!(
+        matches!(&offer, Message::MsgLeiosBlockTxsOffer { point: offered } if offered == &point),
+        "restored transactions must release the deferred offer; got {offer:?}"
+    );
+    assert_marker(connection.next().await, &restored);
+
+    store.inject_block_txs_full(point, txs, Some(PeerId(8)));
+    let duplicate = marker(105);
+    store.inject_votes(vec![duplicate.clone()], None);
+    assert_marker(connection.next().await, &duplicate);
+    connection.close().await;
+}

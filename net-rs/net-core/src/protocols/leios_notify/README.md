@@ -112,15 +112,18 @@ announced endorser-block hash, independently of the notification cursor. This
 lets a retried offer supply an announcement missed during disconnection or
 filtered by no-echo. Dependency replay may send the header back to its source
 when an otherwise eligible offer requires it; body/transaction source filtering
-still applies. Received headers enter this cache through the coordinator.
+still applies. Received headers enter this cache through the coordinator, but
+unverified peer slots do not advance the store's retention clock.
 Identical headers coalesce to prevent relay loops; distinct equivocation headers
 remain distinct.
 
 Offers whose headers are unavailable are coalesced and deferred while unrelated
 notifications continue. Deferred offers are reconsidered on store or control
-changes and after each send; evicted bodies are not advertised. Body and
-transaction offers have independent per-connection sent histories, so retries
-reach new connections without repeating offers on existing ones.
+changes and after each send; evicted data is not advertised. Unsent intent
+survives temporary eviction so re-fetched data can be offered, and expires at
+the normal retention cutoff. Body and transaction offers have independent
+per-connection sent histories, so retries reach new connections without repeating
+offers on existing ones.
 
 All connection history expires with the store's retention window, including on
 idle connections. Each connection retains at most 10,000 block records (with at

@@ -156,7 +156,9 @@ impl NotifyState {
             for (txs, pending) in [(false, &mut state.body), (true, &mut state.txs)] {
                 let Some(offer) = *pending else { continue };
                 if !store.has_offer(slot, hash, txs) {
-                    *pending = None;
+                    // Cache eviction can be temporary. Re-injection may merge
+                    // into a log entry this connection has already consumed,
+                    // so keep unsent intent until delivery or retention expiry.
                     continue;
                 }
                 if offer.from_peer && !control.echo_to_source {
