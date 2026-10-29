@@ -1,6 +1,10 @@
 # Codex pull request reviews
 
-The `codex-review` workflow replaces the disabled Claude workflow. It posts
+This implementation is inactive: Claude reviews have been restored and the
+`codex-review` workflow removed. The code and tests remain for a future rollback.
+See [Claude review setup](../claude-review.md) for the active configuration.
+
+The historical `codex-review` workflow It posts
 suggestions only: one GitHub review with concise inline **high** and **medium**
 findings. It never edits code, pushes commits, approves, or requests changes.
 `REVIEW.md` contains the repository-specific review criteria.
