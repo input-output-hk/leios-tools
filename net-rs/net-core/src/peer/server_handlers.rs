@@ -1201,11 +1201,8 @@ pub async fn serve_leios_fetch(
                     actual = transactions.len(),
                     "leios_fetch: retrieved transactions from store"
                 );
-                // Echo the request's point + bitmap alongside the txs.
                 if runner
                     .send(&LfMsg::MsgLeiosBlockTxs {
-                        point,
-                        bitmap,
                         transactions,
                     })
                     .await
