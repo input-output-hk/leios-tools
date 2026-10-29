@@ -251,6 +251,7 @@ jobs:
           # configuration and the settings below are loaded.
           claude_args: |
             --bare
+            --tools "Read,Grep,Glob"
             --settings '{"permissions":{"deny":["Read(//proc/**)","Read(**/.git/**)"]}}'
             --model ${{ env.MODEL }}
             --max-turns 60
