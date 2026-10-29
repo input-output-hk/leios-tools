@@ -22,8 +22,8 @@ They read source without executing builds, tests, or edits. `REVIEW.md` defines
 the criteria. The workflow pins the previous action version and checks out the
 resolved head commit and loads review criteria from the trusted workflow commit.
 `pull_request_target` keeps the workflow itself on the base branch, with an
-explicit same-repository gate for automatic runs. Bare mode disables automatic discovery of agent
-instructions, skills, hooks, and servers; the prompt explicitly names the trusted
+explicit same-repository gate for automatic runs. Explicit settings disable automatic agent
+instructions, skills, hooks, and project servers while retaining Read/Grep/Glob; the prompt explicitly names the trusted
 review criteria. Diffs above 2 MB fail before analysis; smaller diffs must be
 read in chunks when needed. PR content is review data. A failed review must not
 be interpreted as a clean correctness review.
