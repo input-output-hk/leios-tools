@@ -190,12 +190,11 @@ jobs:
             [ -s "$out/new-commits.patch" ] || mode=skip
           fi
           # Fail before analysis rather than silently reviewing part of a large PR.
-          for patch in "$out/pr.diff" "$out/new-commits.patch"; do
-            if [ -f "$patch" ] && [ "$(wc -c < "$patch")" -gt 2000000 ]; then
-              echo "::error::Review diff exceeds 2 MB; split the PR or review it manually"
-              exit 1
-            fi
-          done
+          if [ "$mode" = full ]; then patch="$out/pr.diff"; else patch="$out/new-commits.patch"; fi
+          if [ "$mode" != skip ] && [ "$(wc -c < "$patch")" -gt 2000000 ]; then
+            echo "::error::Review diff exceeds 2 MB; split the PR or review it manually"
+            exit 1
+          fi
           prev=$(retry gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate \
                    --jq '.[] | {path, line, body}')
           printf '%s\n' "$prev" > "$out/previous-comments.jsonl"
