@@ -26,7 +26,8 @@ explicit same-repository gate for automatic runs. Explicit settings disable auto
 instructions, skills, hooks, and project servers while retaining Read/Grep/Glob; the prompt explicitly names the trusted
 review criteria. Diffs above 2 MB fail before analysis; smaller diffs must be
 read in chunks when needed. PR content is review data. A failed review must not
-be interpreted as a clean correctness review.
+be interpreted as a clean correctness review. A successful run is not merge
+approval; findings are suggestions for the author to assess.
 
 Codex automatic reviews are disabled; its implementation and tests remain under
 `.github/codex-review/` for rollback. Normal project CI remains enabled.
