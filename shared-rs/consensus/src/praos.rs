@@ -2398,8 +2398,12 @@ impl PraosState {
                     // Minimal rollback: drop the tainted suffix with an empty
                     // replay — no blocks are re-applied, we just re-anchor at
                     // the clean ancestor (or Origin when `ancestor` is zero).
+                    let before = self.adopted_tip_hash;
                     self.execute_switch_internal(ancestor, Vec::new(), fx);
-                    return;
+                    if self.adopted_tip_hash == before {
+                        return; // rollback did not take effect; don't spin
+                    }
+                    continue;
                 }
                 SelectionDecision::OrphanCandidate {
                     peer_id,
