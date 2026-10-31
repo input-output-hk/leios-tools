@@ -186,6 +186,9 @@ impl ChainTree {
     /// Returns true if best tip was updated.
     fn update_best_tip(&mut self, point: Point, block_number: u64, hash: &[u8; 32]) -> bool {
         if self.is_blacklisted(*hash) {
+            if self.best_tip_hash().is_some_and(|tip| self.is_blacklisted(tip)) {
+                self.recompute_best_tip();
+            }
             return false;
         }
 
