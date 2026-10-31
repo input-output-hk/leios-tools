@@ -278,7 +278,13 @@ impl ChainStore {
     /// Returns the new tip point.
     pub fn rollback_to(&self, point: &Point) -> Point {
         let mut inner = self.inner.lock().unwrap();
-        if *point == Point::Origin || inner.blocks.front().map(|first| first.point.get_slot() > point.get_slot()).unwrap_or(false) {
+        let anchor_target = inner.servable_anchor().is_some_and(|a| a.point == *point);
+        let before_window = !anchor_target
+            && inner
+                .blocks
+                .front()
+                .is_some_and(|first| first.point.get_slot() > point.get_slot());
+        if *point == Point::Origin || before_window {
             inner.intersection_anchor = None;
             let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
             inner.retain_orphans(removed);
