@@ -192,6 +192,12 @@ pub fn hex_prefix(hash: &[u8]) -> String {
         .collect::<String>()
 }
 
+/// Hex-encode the first 8 bytes of an optional hash, or return `"none"`.
+pub fn hex_prefix_option<T: AsRef<[u8]> + ?Sized>(hash: Option<&T>) -> String {
+    hash.map(|hash| hex_prefix(hash.as_ref()))
+        .unwrap_or_else(|| "none".to_string())
+}
+
 pub fn short_hash(h: &[u8; 32]) -> String {
     format!("{:02x}{:02x}", h[30], h[31])
 }
@@ -255,6 +261,16 @@ mod tests {
             hash: [0xAB; 32],
         };
         assert_eq!(format!("{p}"), "42/abababababababab");
+    }
+
+    #[test]
+    fn optional_hash_display_uses_prefix_or_none() {
+        let hash = [0xAB; 32];
+        assert_eq!(hex_prefix_option(Some(&hash)), "abababababababab");
+        assert_eq!(hex_prefix_option(None::<&[u8; 32]>), "none");
+
+        let short_slice = &hash[..4];
+        assert_eq!(hex_prefix_option(Some(short_slice)), "abababab");
     }
 
     #[test]

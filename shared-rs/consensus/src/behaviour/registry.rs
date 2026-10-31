@@ -247,6 +247,13 @@ pub enum ActionSpec {
         #[serde(default = "default_tx_flood_rate")]
         rate: u32,
     },
+    /// blacklist-blocks — blacklist the ancestor `offset` blocks behind the
+    /// common chain tip supplied through `env.tip` (`0` = the tip itself).
+    #[serde(rename = "blacklist-blocks")]
+    BlacklistBlocks {
+        #[serde(default)]
+        offset: u64,
+    },
 }
 
 fn default_fake_eb_txs() -> u32 {

@@ -9,6 +9,8 @@
 //!
 //! - **Bounded capacity**: FIFO eviction when `blocks.len() > capacity`.
 //! - **No duplicate points**: `append_block()` checks for existing point.
+//! - **Monotonic live chain**: an appended block number must be greater than
+//!   the current tip, and a parsed header must link to a stored predecessor.
 //! - **Thread safety**: all access through `Mutex<ChainStoreInner>`.
 //! - **Change notification**: every mutation signals the watch channel.
 //! - **Rollback truncation**: `rollback_to()` keeps the target point and
@@ -16,8 +18,6 @@
 //!
 //! # Known gaps
 //!
-//! - **`block_no` is caller-provided**: not validated for monotonicity.
-//!   Not decremented on rollback (high-water-mark semantics).
 //! - **`get_range` fallback is intentionally imprecise**: when `from` is
 //!   not on the local chain (peer on a different fork), returns the prefix
 //!   `[0..=to]` so the peer can walk back via `prev_hash`. This can return
@@ -40,6 +40,7 @@ pub struct StoredBlock {
     pub point: Point,
     pub header: WrappedHeader,
     pub body: BlockBody,
+    pub block_no: u64,
 }
 
 /// The block to serve a ChainSync follower next, resolved against the current
@@ -70,7 +71,7 @@ const ORPHAN_CACHE_CAP: usize = 512;
 struct ChainStoreInner {
     blocks: VecDeque<StoredBlock>,
     capacity: usize,
-    /// Running block number (monotonically increasing, not reset on eviction).
+    /// Block number of the current live-chain tip.
     block_no: u64,
     /// Tip point after the most recent rollback truncation. Server handlers use
     /// this as the MsgRollBackward target (the true fork point).
@@ -210,7 +211,9 @@ impl ChainStore {
 
     /// Append a block to the chain. Evicts the oldest block if over capacity.
     /// `block_no` is the caller-provided chain height (not an internal counter).
-    /// Returns `false` if the point is already stored (no-op).
+    /// Returns `false` if the point is already stored, the block number does
+    /// not advance the live-chain tip, or a parsed header does not link to a
+    /// stored direct predecessor.
     pub fn append_block(
         &self,
         point: Point,
@@ -222,11 +225,42 @@ impl ChainStore {
         if inner.blocks.iter().any(|b| b.point == point) {
             return false;
         }
+
+        if inner
+            .blocks
+            .back()
+            .is_some_and(|tip| block_no <= tip.block_no)
+        {
+            return false;
+        }
+
+        // Gaps are allowed (an anchored store may not hold the whole chain),
+        // but when the direct predecessor is present a parsed Shelley+ header
+        // must link to its point hash. Opaque/Byron headers have no parsed
+        // prev_hash available, so they retain the existing best-effort path.
+        if let Some(previous_block_no) = block_no.checked_sub(1) {
+            if let Some(previous) = inner
+                .blocks
+                .iter()
+                .rev()
+                .find(|block| block.block_no == previous_block_no)
+            {
+                if let (Some(expected_hash), Some(header_info)) =
+                    (previous.point.get_hash(), header.parsed.as_ref())
+                {
+                    if header_info.prev_hash != Some(expected_hash) {
+                        return false;
+                    }
+                }
+            }
+        }
+
         inner.block_no = block_no;
         inner.blocks.push_back(StoredBlock {
             point,
             header,
             body,
+            block_no,
         });
         while inner.blocks.len() > inner.capacity {
             if let Some(evicted) = inner.blocks.pop_front() {
@@ -244,11 +278,18 @@ impl ChainStore {
     /// Returns the new tip point.
     pub fn rollback_to(&self, point: &Point) -> Point {
         let mut inner = self.inner.lock().unwrap();
-        if *point == Point::Origin {
+        let anchor_target = inner.servable_anchor().is_some_and(|a| a.point == *point);
+        let before_window = !anchor_target
+            && inner
+                .blocks
+                .front()
+                .is_some_and(|first| first.point.get_slot() > point.get_slot());
+        if *point == Point::Origin || before_window {
             inner.intersection_anchor = None;
             let removed: Vec<StoredBlock> = inner.blocks.drain(..).collect();
             inner.retain_orphans(removed);
-            inner.last_rollback_target = Some(Point::Origin);
+            inner.block_no = 0;
+            inner.last_rollback_target = Some(point.clone());
             drop(inner);
             let _ = self.notify.send(0);
             return Point::Origin;
@@ -267,6 +308,7 @@ impl ChainStore {
             let removed: Vec<StoredBlock> = inner.blocks.drain(pos + 1..).collect();
             inner.retain_orphans(removed);
         }
+        inner.block_no = inner.blocks.back().map(|block| block.block_no).unwrap_or(0);
         let tip_point = inner
             .blocks
             .back()
@@ -285,6 +327,7 @@ impl ChainStore {
         let new_len = inner.blocks.len().saturating_sub(depth);
         let removed: Vec<StoredBlock> = inner.blocks.drain(new_len..).collect();
         inner.retain_orphans(removed);
+        inner.block_no = inner.blocks.back().map(|block| block.block_no).unwrap_or(0);
         let tip_point = inner
             .blocks
             .back()
@@ -582,7 +625,7 @@ impl ChainStore {
         self.notify.receiver_count()
     }
 
-    /// Get the total number of blocks that have been appended (including evicted).
+    /// Get the current live-chain tip block number.
     pub fn block_count(&self) -> u64 {
         self.inner.lock().unwrap().block_no
     }
@@ -609,6 +652,23 @@ mod tests {
         let header = WrappedHeader::opaque(vec![0xA0]);
         let body = BlockBody::opaque(vec![0xBF, 0xFF]);
         (point, header, body)
+    }
+
+    fn parsed_header(block_number: u64, prev_hash: Option<[u8; 32]>) -> WrappedHeader {
+        WrappedHeader {
+            raw: vec![0xA0],
+            parsed: Some(crate::types::HeaderInfo {
+                era: 7,
+                block_number,
+                slot: block_number,
+                prev_hash,
+                issuer_vkey: [0; 32],
+                body_size: 0,
+                block_body_hash: [0; 32],
+                announced_eb: None,
+                certified_eb: None,
+            }),
+        }
     }
 
     #[test]
@@ -828,6 +888,75 @@ mod tests {
         let tip = store.tip();
         assert_eq!(tip.block_no, 1);
         assert_eq!(store.stored_count(), 1);
+    }
+
+    #[test]
+    fn append_rejects_non_monotonic_block_number() {
+        let (store, _rx) = ChainStore::new(100);
+        let (p10, h10, b10) = make_block(10);
+        assert!(store.append_block(p10, h10, b10, 10));
+
+        let (same_height, h11, b11) = make_block(11);
+        assert!(!store.append_block(same_height, h11, b11, 10));
+        let (lower, h12, b12) = make_block(12);
+        assert!(!store.append_block(lower, h12, b12, 9));
+
+        assert_eq!(store.tip().block_no, 10);
+        assert_eq!(store.stored_count(), 1);
+    }
+
+    #[test]
+    fn rollback_allows_replacement_at_removed_height() {
+        let (store, _rx) = ChainStore::new(100);
+        let (p10, h10, b10) = make_block(10);
+        let (p11, h11, b11) = make_block(11);
+        assert!(store.append_block(p10.clone(), h10, b10, 10));
+        assert!(store.append_block(p11, h11, b11, 11));
+
+        store.rollback_to(&p10);
+        assert_eq!(store.tip().block_no, 10);
+
+        let (replacement, header, body) = make_block(50);
+        assert!(store.append_block(replacement, header, body, 11));
+        assert_eq!(store.tip().block_no, 11);
+    }
+
+    #[test]
+    fn append_checks_hash_of_stored_predecessor() {
+        let (store, _rx) = ChainStore::new(100);
+        let (p10, h10, b10) = make_block(10);
+        assert!(store.append_block(p10, h10, b10, 10));
+
+        assert!(!store.append_block(
+            make_point(11),
+            parsed_header(11, Some([99; 32])),
+            BlockBody::opaque(Vec::new()),
+            11,
+        ));
+        assert_eq!(store.tip().block_no, 10);
+
+        assert!(store.append_block(
+            make_point(11),
+            parsed_header(11, Some([10; 32])),
+            BlockBody::opaque(Vec::new()),
+            11,
+        ));
+        assert_eq!(store.tip().block_no, 11);
+    }
+
+    #[test]
+    fn append_allows_gap_when_predecessor_is_not_stored() {
+        let (store, _rx) = ChainStore::new(100);
+        let (p10, h10, b10) = make_block(10);
+        assert!(store.append_block(p10, h10, b10, 10));
+
+        assert!(store.append_block(
+            make_point(12),
+            parsed_header(12, Some([99; 32])),
+            BlockBody::opaque(Vec::new()),
+            12,
+        ));
+        assert_eq!(store.tip().block_no, 12);
     }
 
     #[test]
