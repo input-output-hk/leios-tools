@@ -2025,15 +2025,21 @@ impl PraosState {
                 .into_iter()
                 .find(|h| !self.chain_tree.is_blacklisted(*h))
         });
-        // True when a newly-blacklisted ancestor forces us to abandon part
-        // (or all) of the adopted chain, even if no peer has a better one.
-        let adopted_tainted =
-            self.adopted_tip_hash.is_some() && effective_adopted != self.adopted_tip_hash;
 
         let (adopted_hash, adopted_bn, adopted_set) = match effective_adopted {
             Some(h) => (h, self.chain_tree.block_number(&h).unwrap_or(0), true),
             None => ([0u8; 32], 0, false),
         };
+
+        // True when a newly-blacklisted ancestor forces us to abandon part
+        // (or all) of the adopted chain, even if no peer has a better one.
+        if self.adopted_tip_hash.is_some() && effective_adopted != self.adopted_tip_hash {
+            return SelectionDecision::RollbackTainted {
+                ancestor: adopted_hash,
+                tip_block_no: adopted_bn,
+            };
+        }
+
         let best = self
             .peer_chains
             .iter()
@@ -2067,23 +2073,8 @@ impl PraosState {
                     .then_with(|| b.2.hash.cmp(&a.2.hash))
             });
 
-        let (peer_id, candidate, candidate_tip) = match best {
-            Some(b) => b,
-            None => {
-                // No peer offers a strictly-better chain. If the adopted tip
-                // was invalidated by a blacklisted ancestor we must still roll
-                // our own chain back to the effective (clean) adopted tip,
-                // abandoning only the tainted suffix — a minimal rollback.
-                // `adopted_hash` is the effective tip, or `[0u8; 32]` (Origin)
-                // when the whole adopted chain is tainted.
-                if adopted_tainted {
-                    return SelectionDecision::RollbackTainted {
-                        ancestor: adopted_hash,
-                        tip_block_no: adopted_bn,
-                    };
-                }
-                return SelectionDecision::NoBetterChain;
-            }
+        let Some((peer_id, candidate, candidate_tip)) = best else {
+            return SelectionDecision::NoBetterChain;
         };
 
         let adopted_ancestors: HashSet<[u8; 32]> = effective_adopted
