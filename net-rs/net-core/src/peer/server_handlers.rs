@@ -4,7 +4,7 @@
 //! reading from an `Arc<ChainStore>` for chain state and sending
 //! events to the coordinator via an `mpsc` channel.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -41,6 +41,7 @@ use crate::protocols::peersharing::{Message as PsMsg, PeerAddress, PeerSharing};
 use crate::protocols::txsubmission::{self, Message as TsMsg, TxSubmission};
 use crate::protocols::{Role, Runner};
 
+use super::leios_notify_state::NotifyState;
 use super::types::PeerEvent;
 use super::PeerId;
 use crate::store::chain_store::{ChainStore, NextForCursor};
@@ -910,29 +911,6 @@ pub async fn serve_peersharing(
     }
 }
 
-/// Translate a stored notification into the LeiosNotify wire message.
-/// `eb_size` is the byte length captured at `inject_block` time —
-/// CIP-0164 requires the real size; advertising `0` makes the dev relay
-/// drop the connection.
-fn notification_to_ln_msg(n: &crate::store::leios_store::LeiosNotification) -> LnMsg {
-    use crate::store::leios_store::LeiosNotification;
-    match n {
-        LeiosNotification::BlockOffer { point, eb_size } => LnMsg::MsgLeiosBlockOffer {
-            point: point.clone(),
-            eb_size: *eb_size,
-        },
-        LeiosNotification::BlockTxsOffer { point } => LnMsg::MsgLeiosBlockTxsOffer {
-            point: point.clone(),
-        },
-        LeiosNotification::BlockAnnouncement { header } => LnMsg::MsgLeiosBlockAnnouncement {
-            header: header.clone(),
-        },
-        LeiosNotification::Votes { votes, .. } => LnMsg::MsgLeiosVotes {
-            votes: votes.clone(),
-        },
-    }
-}
-
 /// A LeiosNotify responder failure requires connection teardown. A completed
 /// Quit/Done exchange instead returns `Ok(())` and leaves other protocols alive.
 #[derive(Debug, thiserror::Error)]
@@ -949,26 +927,10 @@ pub enum LeiosNotifyError {
     Mux(#[from] crate::mux::MuxError),
 }
 
-/// Serve LeiosNotify for one connection.
-///
-/// Sends notifications about available Leios data as the store is populated.
-/// Uses `LeiosStore::subscribe()` to wake when new items are injected.
-///
-/// `peer` is the connected peer.  When `behaviour` is `None`, the
-/// honest CIP-0164 policy applies: notifications tagged with `peer` as
-/// their source are skipped (no-echo), and `eb_size` goes on the wire
-/// unchanged.  With a behaviour handle attached, two hooks fire per
-/// entry:
-///
-/// - `control.leios.echo_to_source` gates the no-echo skip (the
-///   `echo-to-source` action opens it).
-/// - `control.leios.offer_eb_size` rewrites the advertised `eb_size` (the
-///   `lie-about-eb-size` action) via `EbSizePolicy::apply`.
-///
-/// Per-entry `Augment` is not supported on this path — the function
-/// returns one `LnMsg` per `MsgLeiosNotificationRequestNext`; a
-/// behaviour returning `Augment` falls back to the original message
-/// with a warning.
+/// Serve LeiosNotify for one connection, with one response per request.
+/// Announcements precede dependent body/transaction offers on this connection.
+/// Controls preserve no-echo overrides, offered-size rewrites and the explicit
+/// locally-produced `withhold_announce` exception.
 pub async fn serve_leios_notify(
     ln_send: CodecSend,
     ln_recv: CodecRecv,
@@ -1005,210 +967,140 @@ pub async fn serve_leios_notify(
     // accumulated while this connection was cold/warm.
     let mut read_index = store.notification_count();
     let mut subscription = store.subscribe();
-    let mut offered_blocks = BTreeSet::new();
+    let mut state = NotifyState::default();
     let mut pending_requests = 1;
+    let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(50));
     loop {
-        let notification = next_outbound_notification(
-            &store,
-            &mut read_index,
-            peer,
-            &mut subscription,
-            controls,
-            &mut offered_blocks,
-        );
-        tokio::pin!(notification);
-        loop {
-            tokio::select! {
-                // Drain queued requests/Quit before delivering a ready reply.
-                biased;
-                incoming = ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT) => {
-                    match incoming? {
-                        LnMsg::MsgLeiosNotificationRequestNext => {
-                            if pending_requests == MAX_PENDING_REQUESTS {
-                                return Err(LeiosNotifyError::TooManyPendingRequests);
+        let response = {
+            let notification = next_outbound_notification(
+                &store,
+                &mut read_index,
+                peer,
+                &mut subscription,
+                controls,
+                &mut state,
+            );
+            tokio::pin!(notification);
+            loop {
+                tokio::select! {
+                    // Drain queued requests/Quit before delivering a ready reply.
+                    biased;
+                    incoming = ln_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT) => {
+                        match incoming? {
+                            LnMsg::MsgLeiosNotificationRequestNext => {
+                                if pending_requests == MAX_PENDING_REQUESTS {
+                                    return Err(LeiosNotifyError::TooManyPendingRequests);
+                                }
+                                pending_requests += 1;
                             }
-                            pending_requests += 1;
-                        }
-                        LnMsg::MsgQuit => {
-                            for _ in 0..pending_requests {
-                                ln_send.send(&LnMsg::MsgCanceled).await?;
+                            LnMsg::MsgQuit => {
+                                for _ in 0..pending_requests {
+                                    ln_send.send(&LnMsg::MsgCanceled).await?;
+                                }
+                                ln_send.send(&LnMsg::MsgDone).await?;
+                                return Ok(());
                             }
-                            ln_send.send(&LnMsg::MsgDone).await?;
-                            return Ok(());
-                        }
-                        other => {
-                            tracing::warn!(peer = peer.0, ?other, "leios_notify: expected request or quit");
-                            return Err(LeiosNotifyError::UnexpectedMessage);
+                            other => {
+                                tracing::warn!(peer = peer.0, ?other, "leios_notify: expected request or quit");
+                                return Err(LeiosNotifyError::UnexpectedMessage);
+                            }
                         }
                     }
-                }
-                response = &mut notification, if pending_requests > 0 => {
-                    ln_send.send(&response?).await?;
-                    pending_requests -= 1;
-                    break;
+                    response = &mut notification, if pending_requests > 0 => {
+                        break Some(response?);
+                    }
+                    // Even an idle connection releases expired history when the
+                    // retention clock advances without any store notifications.
+                    _ = cleanup.tick(), if pending_requests == 0 => { break None; }
                 }
             }
+        };
+        let Some(response) = response else {
+            state.prune(store.retention_cutoff());
+            continue;
+        };
+        ln_send.send(&response).await?;
+        state.sent(&response);
+        match &response {
+            LnMsg::MsgLeiosBlockOffer { point, eb_size } => {
+                tracing::info!(peer = peer.0, %point, eb_size, "leios_notify: serving EB offer");
+            }
+            LnMsg::MsgLeiosBlockAnnouncement { header } => {
+                tracing::info!(peer = peer.0, slot = ?header.parsed.as_ref().map(|h| h.slot), "leios_notify: serving EB announcement");
+            }
+            LnMsg::MsgLeiosBlockTxsOffer { point } => {
+                tracing::info!(peer = peer.0, %point, "leios_notify: serving EB-txs offer");
+            }
+            LnMsg::MsgLeiosVotes { votes } => {
+                tracing::debug!(
+                    peer = peer.0,
+                    count = votes.len(),
+                    "leios_notify: serving votes"
+                );
+            }
+            _ => {}
         }
+        pending_requests -= 1;
     }
 }
 
-/// Lazily formats a peer-source list as bare ids (`[1, 2]`) without
-/// allocating — only materialised when the tracing level is enabled.
-struct SourceIds<'a>(&'a [PeerId]);
-impl std::fmt::Debug for SourceIds<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.iter().map(|p| p.0)).finish()
-    }
-}
-
-/// Find the next notification the wire actually sends to `peer`.
-///
-/// Honest policy skips entries where `peer` is in the entry's `sources`
-/// (no-echo); a configured Behaviour can override that gate
-/// (`allow_echo_to_source`) and/or mutate the outbound message
-/// (`transform_outbound`). Advances `read_index` past every consumed or
-/// skipped entry so the same notification isn't reconsidered next call,
-/// and awaits new injects when the queue is empty. Returns an error on history
-/// exhaustion or watch-channel close so the owner can tear down the connection.
+/// Advance the log independently of deferred offers. Availability is retried
+/// after store/control changes; the absolute keepalive deadline survives churn.
 async fn next_outbound_notification(
     store: &Arc<LeiosStore>,
     read_index: &mut usize,
     peer: PeerId,
     subscription: &mut tokio::sync::watch::Receiver<u64>,
     controls: Option<&OutboundControls>,
-    offered_blocks: &mut BTreeSet<(u64, [u8; 32])>,
+    state: &mut NotifyState,
 ) -> Result<LnMsg, LeiosNotifyError> {
-    use crate::store::leios_store::LeiosNotification;
-    // Answer the peer within this window even when nothing is deliverable.
-    // The deadline is absolute across the loop: `subscription.changed()`
-    // wakes on unrelated store activity (votes/offers for other peers) and
-    // must not reset it, or a busy store starves the keepalive entirely.
-    const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(50);
-    let keepalive_deadline = tokio::time::Instant::now() + KEEPALIVE_INTERVAL;
+    let keepalive_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50);
+    let mut control_changes = controls.map(|c| c.control.clone());
     loop {
-        let cutoff = store.retention_cutoff();
-        while offered_blocks
-            .first()
-            .is_some_and(|(slot, _)| *slot < cutoff)
+        state.prune(store.retention_cutoff());
+        let next = state.next_offer(store, controls);
+        match next {
+            Ok(Some(message)) => return Ok(message),
+            Err(()) => return Err(LeiosNotifyError::HistoryCapacityExceeded),
+            Ok(None) => {}
+        }
+        for (index, entry) in store
+            .notifications_after(read_index)
+            .into_iter()
+            .enumerate()
         {
-            offered_blocks.pop_first();
-        }
-        let pending = store.notifications_after(read_index);
-        for entry in &pending {
+            // Scanning a burst of deferred/skipped entries must leave the
+            // responder able to read pipelined Quit and other tasks to run.
+            if index % 64 == 63 {
+                tokio::task::yield_now().await;
+            }
             *read_index += 1;
-
-            // No-echo gate.  Honest policy drops echoes (peer among the
-            // entry's sources); `leios.echo_to_source` (the echo-to-source
-            // action) opens it.
-            if entry.sources.contains(&peer) {
-                let echo = controls
-                    .map(|c| c.control.borrow().leios.echo_to_source)
-                    .unwrap_or(false);
-                if !echo {
-                    tracing::debug!(
-                        peer = peer.0,
-                        "leios_notify: skipping no-echo offer back to source"
-                    );
-                    continue;
-                }
-                tracing::debug!(
-                    peer = peer.0,
-                    "leios_notify: behaviour opened echo-to-source gate"
-                );
+            let next = state
+                .observe(entry, peer, controls, store.retention_cutoff())
+                .and_then(|message| match message {
+                    Some(message) => Ok(Some(message)),
+                    None => state.next_offer(store, controls),
+                });
+            match next {
+                Ok(Some(message)) => return Ok(message),
+                Err(()) => return Err(LeiosNotifyError::HistoryCapacityExceeded),
+                Ok(None) => {}
             }
-
-            // Retries remain useful to newly connected peers, but an existing
-            // peer rejects a second body offer for the same slot/hash. Keep
-            // this history per connection, independently of the tx offer.
-            if let LeiosNotification::BlockOffer { point, .. } = &entry.notification {
-                let Point::Specific { slot, hash } = point else {
-                    continue;
-                };
-                if *slot < cutoff || offered_blocks.contains(&(*slot, *hash)) {
-                    continue;
-                }
-                // Bound memory even if the retention clock stalls or a slot
-                // contains arbitrarily many offers. Never evict a live key
-                // just to make room: that would let a duplicate through.
-                if offered_blocks.len() == crate::store::leios_store::MAX_NOTIFICATIONS {
-                    return Err(LeiosNotifyError::HistoryCapacityExceeded);
-                }
-                offered_blocks.insert((*slot, *hash));
-            }
-
-            // Build the wire message, applying the `leios.offer_eb_size` rewrite
-            // policy (lie-about-eb-size) to block offers.
-            let msg = match &entry.notification {
-                LeiosNotification::BlockOffer { point, eb_size } => {
-                    let size = controls
-                        .map(|c| c.control.borrow().leios.offer_eb_size.apply(*eb_size))
-                        .unwrap_or(*eb_size);
-                    LnMsg::MsgLeiosBlockOffer {
-                        point: point.clone(),
-                        eb_size: size,
-                    }
-                }
-                _ => notification_to_ln_msg(&entry.notification),
-            };
-
-            // Log the wire-level decision (post-policy).
-            let sources = SourceIds(&entry.sources);
-            match &msg {
-                LnMsg::MsgLeiosBlockOffer { point, eb_size } => {
-                    tracing::info!(
-                        peer = peer.0,
-                        %point,
-                        eb_size,
-                        ?sources,
-                        "leios_notify: serving EB offer"
-                    );
-                }
-                LnMsg::MsgLeiosBlockAnnouncement { header } => {
-                    // Log the cheap parsed slot, not header.point() — the latter
-                    // recomputes a Blake2b hash of the raw CBOR every send.
-                    tracing::info!(
-                        peer = peer.0,
-                        slot = ?header.parsed.as_ref().map(|h| h.slot),
-                        ?sources,
-                        "leios_notify: serving EB announcement"
-                    );
-                }
-                LnMsg::MsgLeiosBlockTxsOffer { point } => {
-                    tracing::info!(
-                        peer = peer.0,
-                        %point,
-                        ?sources,
-                        "leios_notify: serving EB-txs offer"
-                    );
-                }
-                LnMsg::MsgLeiosVotes { votes } => {
-                    tracing::debug!(
-                        peer = peer.0,
-                        count = votes.len(),
-                        ?sources,
-                        "leios_notify: serving votes"
-                    );
-                }
-                _ => {}
-            }
-            return Ok(msg);
         }
-        // Drained without a deliverable entry. Wait for new injects, but
-        // answer the peer's outstanding request with an empty MsgLeiosVotes
-        // once the keepalive deadline passes, so its LeiosNotify protocol
-        // timer can't expire while we have nothing to offer. (Replace with
-        // the dedicated "No offer" message once the protocol gains one.)
         tokio::select! {
             result = subscription.changed() => {
-                if result.is_err() {
-                    return Err(LeiosNotifyError::StoreClosed);
+                if result.is_err() { return Err(LeiosNotifyError::StoreClosed); }
+            }
+            result = async {
+                match &mut control_changes {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
                 }
+            } => {
+                if result.is_err() { control_changes = None; }
             }
             _ = tokio::time::sleep_until(keepalive_deadline) => {
-                tracing::info!(
-                    peer = peer.0,
-                    "leios_notify: sending empty-votes keepalive"
-                );
+                state.prune(store.retention_cutoff());
                 return Ok(LnMsg::MsgLeiosVotes { votes: Vec::new() });
             }
         }
@@ -1828,6 +1720,64 @@ mod tests {
         mux_b.abort();
     }
 
+    trait AnnouncedBlockFixture {
+        fn inject_announced_block(&self, point: Point, body: Vec<u8>, source: Option<PeerId>);
+    }
+
+    impl AnnouncedBlockFixture for LeiosStore {
+        fn inject_announced_block(&self, point: Point, body: Vec<u8>, source: Option<PeerId>) {
+            self.announce_block(
+                crate::test_utils::leios_header(&point, body.len() as u32),
+                source,
+            );
+            self.inject_block(point, body, source);
+        }
+    }
+
+    async fn next_announced_offer(
+        client: &mut Runner<LeiosNotify>,
+    ) -> Result<leios_notify::LeiosNotifyEvent, crate::protocols::ProtocolError> {
+        let announcement = leios_notify::request_next(client).await?;
+        let leios_notify::LeiosNotifyEvent::BlockAnnouncement { header } = announcement else {
+            panic!("expected announcement before body, got {announcement:?}");
+        };
+        let offer = leios_notify::request_next(client).await?;
+        let leios_notify::LeiosNotifyEvent::BlockOffer {
+            point: Point::Specific { slot, hash },
+            ..
+        } = &offer
+        else {
+            panic!("expected body after announcement, got {offer:?}");
+        };
+        let parsed = header.parsed.unwrap();
+        assert_eq!(parsed.slot, *slot);
+        assert_eq!(parsed.announced_eb.unwrap().0, *hash);
+        Ok(offer)
+    }
+
+    async fn recv_announced_offer(
+        send: &CodecSend,
+        recv: &mut CodecRecv,
+    ) -> Result<LnMsg, crate::mux::MuxError> {
+        let announcement = recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await?;
+        let LnMsg::MsgLeiosBlockAnnouncement { header } = announcement else {
+            panic!("expected announcement before body, got {announcement:?}");
+        };
+        send.send(&LnMsg::MsgLeiosNotificationRequestNext).await?;
+        let offer = recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await?;
+        let LnMsg::MsgLeiosBlockOffer {
+            point: Point::Specific { slot, hash },
+            ..
+        } = &offer
+        else {
+            panic!("expected body after announcement, got {offer:?}");
+        };
+        let parsed = header.parsed.unwrap();
+        assert_eq!(parsed.slot, *slot);
+        assert_eq!(parsed.announced_eb.unwrap().0, *hash);
+        Ok(offer)
+    }
+
     fn spawn_notify_server(
         store: Arc<LeiosStore>,
         peer: PeerId,
@@ -1894,9 +1844,9 @@ mod tests {
         send.send(&LnMsg::MsgLeiosNotificationRequestNext)
             .await
             .unwrap();
-        let (first, _) = tokio::join!(recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT), async {
+        let (first, _) = tokio::join!(recv_announced_offer(&send, &mut recv), async {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            store.inject_block(make_point(21), vec![0xa0], None);
+            store.inject_announced_block(make_point(21), vec![0xa0], None);
         });
         assert!(matches!(first.unwrap(), LnMsg::MsgLeiosBlockOffer { .. }));
 
@@ -1907,13 +1857,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.inject_block(make_point(22), vec![0xa0], None);
+        store.inject_announced_block(make_point(22), vec![0xa0], None);
         send.send(&LnMsg::MsgQuit).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             let mut offers = 0;
             for _ in 0..2 {
                 match recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT).await.unwrap() {
                     LnMsg::MsgCanceled => {}
+                    LnMsg::MsgLeiosBlockAnnouncement { header } => {
+                        assert_eq!(header.parsed.unwrap().announced_eb.unwrap().0, [22; 32]);
+                    }
                     LnMsg::MsgLeiosBlockOffer { point, .. } => {
                         assert_eq!(point, make_point(22));
                         offers += 1;
@@ -1944,9 +1897,9 @@ mod tests {
             .await
             .unwrap();
         let point = make_point(21);
-        let (first, _) = tokio::join!(old_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT), async {
+        let (first, _) = tokio::join!(recv_announced_offer(&old_send, &mut old_recv), async {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            store.inject_block(point.clone(), vec![0xa0], None);
+            store.inject_announced_block(point.clone(), vec![0xa0], None);
         });
         assert!(matches!(first.unwrap(), LnMsg::MsgLeiosBlockOffer { point: p, .. } if p == point));
 
@@ -1965,10 +1918,10 @@ mod tests {
         // Let the new connection snap past the original offer before retrying.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         store.reoffer_unfetched(24);
-        store.inject_block(make_point(22), vec![0xa0], Some(PeerId(8)));
+        store.inject_announced_block(make_point(22), vec![0xa0], Some(PeerId(8)));
         let (old, new) = tokio::join!(
-            old_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT),
-            new_recv.recv::<LnMsg>(leios_notify::SIZE_LIMIT)
+            recv_announced_offer(&old_send, &mut old_recv),
+            recv_announced_offer(&new_send, &mut new_recv)
         );
         assert!(
             matches!(old.unwrap(), LnMsg::MsgLeiosBlockOffer { point: p, .. } if p == make_point(22)),
@@ -2035,22 +1988,43 @@ mod tests {
         let (store, _rx) = LeiosStore::new_with_retention(100, None, 5, 0);
         let mut sub = store.subscribe();
         let mut cursor = 0;
-        let mut offered = BTreeSet::new();
-        store.inject_block(make_point(21), vec![0xa0], None);
-        assert!(matches!(
-            next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
-            Ok(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(21)
-        ));
-        assert_eq!(offered.len(), 1);
-
-        store.tick_slot(30);
-        store.reoffer_unfetched(30);
-        store.inject_block(make_point(30), vec![0xa0], None);
-        assert!(matches!(
-            next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut offered).await,
-            Ok(LnMsg::MsgLeiosBlockOffer { point, .. }) if point == make_point(30)
-        ));
-        assert_eq!(offered, BTreeSet::from([(30, [30; 32])]));
+        let mut state = NotifyState::default();
+        for slot in [21, 30] {
+            store.tick_slot(slot);
+            store.inject_announced_block(make_point(slot), vec![0xa0], None);
+            let header = next_outbound_notification(
+                &store,
+                &mut cursor,
+                PeerId(7),
+                &mut sub,
+                None,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(header, LnMsg::MsgLeiosBlockAnnouncement { .. }));
+            state.sent(&header);
+            let offer = next_outbound_notification(
+                &store,
+                &mut cursor,
+                PeerId(7),
+                &mut sub,
+                None,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(&offer, LnMsg::MsgLeiosBlockOffer { point, .. } if *point == make_point(slot))
+            );
+            state.sent(&offer);
+        }
+        // Old entries below the cutoff are dropped, including a late retry.
+        store.inject_announced_block(make_point(21), vec![0xa0], None);
+        assert!(
+            matches!(next_outbound_notification(&store, &mut cursor, PeerId(7), &mut sub, None, &mut state).await,
+            Ok(LnMsg::MsgLeiosVotes { votes }) if votes.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -2084,9 +2058,9 @@ mod tests {
         // so the response comes from a post-snap entry.
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
         let inject_store = store.clone();
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 42,
                     hash: [0xAB; 32],
@@ -2132,7 +2106,7 @@ mod tests {
         let churn = tokio::spawn(async move {
             for slot in 0..120u64 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                churn_store.inject_block(
+                churn_store.inject_announced_block(
                     Point::Specific {
                         slot,
                         hash: [slot as u8; 32],
@@ -2146,7 +2120,7 @@ mod tests {
         // Nothing is ever deliverable to peer 0, yet the keepalive must
         // arrive within ~50s despite the constant churn.
         let mut idx = 0usize;
-        let mut offered_blocks = BTreeSet::new();
+        let mut offered_blocks = NotifyState::default();
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(55),
             next_outbound_notification(
@@ -2204,9 +2178,9 @@ mod tests {
         // no-echo gate alone decides which one reaches the wire.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 10,
                     hash: [0xAA; 32],
@@ -2214,7 +2188,7 @@ mod tests {
                 vec![1, 2, 3],
                 Some(connected_peer),
             );
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 11,
                     hash: [0xBB; 32],
@@ -2278,7 +2252,7 @@ mod tests {
         // decide between two queued entries on its own.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             // Same EB advertised by other_peer then by connected_peer —
             // dedup collapses these into a single entry whose `sources`
@@ -2287,10 +2261,10 @@ mod tests {
                 slot: 10,
                 hash: [0xAA; 32],
             };
-            inject_store.inject_block(point.clone(), vec![1, 2, 3], Some(other_peer));
-            inject_store.inject_block(point.clone(), vec![1, 2, 3], Some(connected_peer));
+            inject_store.inject_announced_block(point.clone(), vec![1, 2, 3], Some(other_peer));
+            inject_store.inject_announced_block(point.clone(), vec![1, 2, 3], Some(connected_peer));
             // A separate EB advertised by third_peer — this one must be delivered.
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 11,
                     hash: [0xBB; 32],
@@ -2358,11 +2332,15 @@ mod tests {
         // point did not appear twice.
         let inject_store = store.clone();
         let point_for_inject = point.clone();
-        let (first, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (first, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(point_for_inject.clone(), vec![0xCD; 17], Some(PeerId(1)));
-            inject_store.inject_block(point_for_inject, vec![0xCD; 17], Some(PeerId(2)));
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
+                point_for_inject.clone(),
+                vec![0xCD; 17],
+                Some(PeerId(1)),
+            );
+            inject_store.inject_announced_block(point_for_inject, vec![0xCD; 17], Some(PeerId(2)));
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 22,
                     hash: [0x34; 32],
@@ -2380,7 +2358,7 @@ mod tests {
             other => panic!("expected first BlockOffer for duped point, got {other:?}"),
         }
 
-        let second = leios_notify::request_next(&mut client).await.unwrap();
+        let second = next_announced_offer(&mut client).await.unwrap();
         match second {
             leios_notify::LeiosNotifyEvent::BlockOffer { point: p, .. } => {
                 assert_eq!(
@@ -2426,7 +2404,7 @@ mod tests {
         for slot in 1u64..=3 {
             let mut hash = [0u8; 32];
             hash[0] = slot as u8;
-            store.inject_block(
+            store.inject_announced_block(
                 Point::Specific { slot, hash },
                 vec![0xAA; 10],
                 Some(PeerId(7)),
@@ -2447,9 +2425,9 @@ mod tests {
         // instead and the assertion below catches it.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 100,
                     hash: [0xEE; 32],
@@ -2522,9 +2500,9 @@ mod tests {
         // connected_peer — honest policy would drop this echo.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 10,
                     hash: [0xAA; 32],
@@ -2602,9 +2580,9 @@ mod tests {
         // no-echo gate doesn't drop it before the transform runs.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 42,
                     hash: [0xCC; 32],
@@ -2681,9 +2659,9 @@ mod tests {
         // Inject after the snap, sourced from a different peer.
         let inject_store = store.clone();
         let mut client = Runner::<LeiosNotify>::new(Role::Client, client_send, client_recv);
-        let (event, _) = tokio::join!(leios_notify::request_next(&mut client), async move {
+        let (event, _) = tokio::join!(next_announced_offer(&mut client), async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            inject_store.inject_block(
+            inject_store.inject_announced_block(
                 Point::Specific {
                     slot: 100,
                     hash: [0xDD; 32],

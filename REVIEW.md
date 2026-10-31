@@ -1,7 +1,7 @@
 # Review instructions
 
-Guide for the automated Codex PR review
-(`.github/workflows/codex-review.yaml`).
+Guide for the automated Claude PR review
+(`.github/workflows/claude-review.yaml`).
 
 ## Your role
 
@@ -26,7 +26,7 @@ and `net-rs` crates through path dependencies.
 
 ## Check the PR's claims
 
-`review-input/pr-claims.md` holds the PR title, description and commit
+`.claude-review/pr-claims.md` holds the PR title, description and commit
 messages. For each concrete claim ("fixes X", "adds a test for Y", "no
 behaviour change", "matches the Haskell node"), confirm the diff supports it,
 and flag one it contradicts or doesn't support, quoting it. You can't see
