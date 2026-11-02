@@ -29,7 +29,12 @@ pub fn inline_leios_transaction(era: u32, tx: &[u8]) -> Result<(Cow<'_, [u8]>, b
         if field == 2
             && !matches!(
                 d.datatype()?,
-                Type::Map | Type::MapIndef | Type::Null | Type::Tag
+                Type::Map
+                    | Type::MapIndef
+                    | Type::Array
+                    | Type::ArrayIndef
+                    | Type::Null
+                    | Type::Tag
             )
         {
             return Err(Error::message("unsupported auxiliary data"));
@@ -86,7 +91,7 @@ pub fn mempool_leios_transaction(tx: &[u8]) -> Result<Vec<u8>, Error> {
     let aux_start = d.position();
     if !matches!(
         d.datatype()?,
-        Type::Map | Type::MapIndef | Type::Null | Type::Tag
+        Type::Map | Type::MapIndef | Type::Array | Type::ArrayIndef | Type::Null | Type::Tag
     ) {
         return Err(Error::message("unsupported auxiliary data"));
     }
@@ -204,6 +209,49 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn array_auxiliary_data_preserves_transaction_bytes_and_validity() {
+        // Synthetic codec fixtures use indefinite maps and nested auxiliary
+        // data so converting the envelope must not re-encode signed fields.
+        let body = &[0xbf, 0x00, 0x80, 0x02, 0x18, 0x2a, 0xff][..];
+        let witnesses = &[0xbf, 0x00, 0x80, 0xff][..];
+        for auxiliary in [
+            &[0x82, 0xa1, 0x01, 0x61, b'x', 0x80][..],
+            &[0x9f, 0xbf, 0x01, 0x61, b'x', 0xff, 0x9f, 0xff, 0xff][..],
+        ] {
+            let mempool = [&[0x83][..], body, witnesses, auxiliary].concat();
+            let block = [&[0x84][..], body, witnesses, auxiliary, &[0xf5]].concat();
+            let legacy = [&[0x84][..], body, witnesses, &[0xf5], auxiliary].concat();
+
+            let (identity, valid) = inline_leios_transaction(8, &block).unwrap();
+            assert!(valid);
+            assert_eq!(identity.as_ref(), block);
+            assert_eq!(crate::blake2b_256(&identity), crate::blake2b_256(&block));
+            assert_eq!(mempool_leios_transaction(&mempool).unwrap(), block);
+            assert_eq!(mempool_leios_transaction(&legacy).unwrap(), block);
+            assert_eq!(leios_inline_transaction(&mempool).unwrap(), block);
+            assert_eq!(leios_inline_transaction(&legacy).unwrap(), block);
+            assert_eq!(leios_inline_transaction(&block).unwrap(), block);
+            assert_eq!(leios_mempool_transaction(&block).unwrap(), mempool);
+            assert_eq!(crate::wire_tx_id(&mempool), Some(crate::blake2b_256(body)));
+            assert_eq!(crate::wire_tx_id(&block), crate::wire_tx_id(&mempool));
+
+            let failed_block = [&[0x84][..], body, witnesses, auxiliary, &[0xf4]].concat();
+            let (failed_identity, valid) = inline_leios_transaction(8, &failed_block).unwrap();
+            assert!(!valid);
+            assert_eq!(failed_identity.as_ref(), failed_block);
+            assert_ne!(
+                crate::blake2b_256(&failed_identity),
+                crate::blake2b_256(&identity)
+            );
+            assert!(leios_mempool_transaction(&failed_block).is_err());
+            assert!(leios_inline_transaction(&failed_block).is_err());
+            let failed_legacy = [&[0x84][..], body, witnesses, &[0xf4], auxiliary].concat();
+            assert!(mempool_leios_transaction(&failed_legacy).is_err());
+            assert!(leios_inline_transaction(&failed_legacy).is_err());
+        }
+    }
+
     #[test]
     fn layouts_and_invalid_scripts() {
         for bytes in [

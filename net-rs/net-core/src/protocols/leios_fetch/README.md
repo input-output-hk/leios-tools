@@ -2,7 +2,7 @@
 
 Client-driven request/response for Leios data retrieval. Supports fetching individual endorser blocks (EBs) and selective transaction fetching via bitmap addressing. Complements [LeiosNotify](../leios_notify/) which provides the offers.
 
-The codec follows `encodeLeiosFetch` / `decodeLeiosFetch` in [ouroboros-consensus c54515e](https://github.com/IntersectMBO/ouroboros-consensus/blob/c54515e35498e921cbd651a2c19c3360a41d35b8/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestFetch.hs). Vote-fetch and block-range streaming messages are not implemented here.
+The codec follows `encodeLeiosFetch` / `decodeLeiosFetch` in [ouroboros-consensus a337d69](https://github.com/IntersectMBO/ouroboros-consensus/blob/a337d69f4946d5a1b20ecaaeae635dd47822e3d2/ouroboros-consensus/src/ouroboros-consensus/LeiosDemoOnlyTestFetch.hs). Vote-fetch and block-range streaming messages are not implemented here.
 
 ## Files
 
@@ -34,10 +34,10 @@ stateDiagram-v2
 | StIdle | **Client** | MsgLeiosBlockTxsRequest(point, bitmap) | StBlockTxs |
 | StIdle | **Client** | MsgDone | StDone |
 | StBlock | **Server** | MsgLeiosBlock(block) | StIdle |
-| StBlockTxs | **Server** | MsgLeiosBlockTxs(point, bitmap, transactions) | StIdle |
+| StBlockTxs | **Server** | MsgLeiosBlockTxs(transactions) | StIdle |
 | StDone | Nobody | — | — |
 
-**Legend:** Agency = the side allowed to send the next message; `St` and `Msg` are the state and message prefixes used in the Rust enums. `point` identifies an endorser block by slot and hash; `bitmap` selects transactions. The transaction response echoes the requested point and bitmap.
+**Legend:** Agency = the side allowed to send the next message; `St` and `Msg` are the state and message prefixes used in the Rust enums. `point` identifies an endorser block by slot and hash; `bitmap` selects transactions. The client retains the requested point and bitmap; neither is echoed in the transaction response.
 
 ## Wire Format
 
@@ -47,11 +47,11 @@ stateDiagram-v2
 | MsgLeiosBlockRequest | `[1, point]` |
 | MsgLeiosBlock | `[2, block]` |
 | MsgLeiosBlockTxsRequest | `[3, point, bitmaps]` |
-| MsgLeiosBlockTxs | `[4, point, bitmaps, transactions]` |
+| MsgLeiosBlockTxs | `[4, transactions]` |
 
-**Legend:** CBOR = Concise Binary Object Representation; `point` = `[slot, hash32]`, where `hash32` is a 32-byte hash; `block` = the endorser-block manifest map `{tx_hash => tx_size}` (transaction hash to transaction size); `bitmaps` = the transaction selection map described below; `transactions` = a list of transaction bodies. Block manifests and transaction bodies retain their raw CBOR bytes for the consumer to interpret.
+**Legend:** CBOR = Concise Binary Object Representation; `point` = `[slot, hash32]`, where `hash32` is a 32-byte hash; `block` = the endorser-block manifest map `{tx_hash => tx_size}` (transaction hash to transaction size); `bitmaps` = the transaction selection map described below; `transactions` = a list of tag-24-wrapped byte strings, `[tag24(bytes(block_transaction)), ...]`. Each `block_transaction` retains its exact four-field CBOR bytes, including the trailing validity boolean used in its manifest identity. Block manifests retain their raw CBOR bytes for the consumer to interpret.
 
-Exact message-tag tests use byte vectors derived from the Haskell encoder.
+The w42/w43 framing is checked against captured Haskell request/response vectors with byte-exact re-encoding; see the [capture notes](../../../test_data/README.md).
 
 ## Limits
 
