@@ -79,13 +79,9 @@ pub enum Message {
         point: Point,
         bitmap: BTreeMap<u16, u64>,
     },
-    /// Server delivers transactions. `[4, point, bitmaps, tx_list]` —
-    /// the server echoes the request's point and bitmap.
-    MsgLeiosBlockTxs {
-        point: Point,
-        bitmap: BTreeMap<u16, u64>,
-        transactions: Vec<TxBody>,
-    },
+    /// Server delivers transactions. `[4, tx_list]` in w42/w43.
+    /// Request identity remains with the client; each tx is tag-24 wrapped bytes.
+    MsgLeiosBlockTxs { transactions: Vec<TxBody> },
     /// Client terminates. [0]
     MsgDone,
 }
@@ -169,14 +165,19 @@ pub async fn fetch_block_txs(
     point: Point,
     bitmap: BTreeMap<u16, u64>,
 ) -> Result<Vec<TxBody>, ProtocolError> {
+    let expected: usize = bitmap.values().map(|bits| bits.count_ones() as usize).sum();
     runner
         .send(&Message::MsgLeiosBlockTxsRequest { point, bitmap })
         .await?;
     let msg = runner.recv().await?;
     match msg {
-        // The server echoes point + bitmap; the client already knows
-        // them, so only the tx list is returned.
-        Message::MsgLeiosBlockTxs { transactions, .. } => Ok(transactions),
+        Message::MsgLeiosBlockTxs { transactions } if transactions.len() == expected => {
+            Ok(transactions)
+        }
+        Message::MsgLeiosBlockTxs { transactions } => Err(ProtocolError::InvalidMessage(format!(
+            "LeiosFetch returned {} transactions for {expected} requested positions",
+            transactions.len()
+        ))),
         other => Err(ProtocolError::InvalidMessage(format!(
             "expected MsgLeiosBlockTxs, got {other:?}"
         ))),
@@ -257,11 +258,6 @@ mod tests {
             LeiosFetch::transition(
                 &State::StBlockTxs,
                 &Message::MsgLeiosBlockTxs {
-                    point: Point::Specific {
-                        slot: 1,
-                        hash: [0; 32]
-                    },
-                    bitmap: BTreeMap::new(),
                     transactions: vec![],
                 }
             )
@@ -298,11 +294,6 @@ mod tests {
         assert!(LeiosFetch::transition(
             &State::StBlock,
             &Message::MsgLeiosBlockTxs {
-                point: Point::Specific {
-                    slot: 1,
-                    hash: [0; 32]
-                },
-                bitmap: BTreeMap::new(),
                 transactions: vec![],
             }
         )
@@ -419,21 +410,18 @@ mod tests {
             let mut runner = Runner::<LeiosFetch>::new(Role::Server, ss, sr);
 
             let msg = runner.recv().await.unwrap();
-            let (req_point, req_bitmap) = match msg {
+            match msg {
                 Message::MsgLeiosBlockTxsRequest { point, bitmap } => {
                     assert_eq!(point, Point::Specific { slot: 100, hash });
                     assert_eq!(bitmap.len(), 2);
-                    assert_eq!(bitmap[&0], 0xFF); // first 8 txs
-                    assert_eq!(bitmap[&1], 0x01); // tx 64
-                    (point, bitmap)
+                    assert_eq!(bitmap[&0], 0xC000_0000_0000_0000); // txs 0 and 1
+                    assert_eq!(bitmap[&1], 0x8000_0000_0000_0000); // tx 64
                 }
                 other => panic!("expected MsgLeiosBlockTxsRequest, got {other:?}"),
             };
 
             runner
                 .send(&Message::MsgLeiosBlockTxs {
-                    point: req_point,
-                    bitmap: req_bitmap,
                     transactions: vec![
                         TxBody::new_with_vec(vec![0x01]),
                         TxBody::new_with_vec(vec![0x02]),
@@ -451,8 +439,8 @@ mod tests {
             let mut runner = Runner::<LeiosFetch>::new(Role::Client, cs, cr);
 
             let mut bitmap = BTreeMap::new();
-            bitmap.insert(0u16, 0xFFu64);
-            bitmap.insert(1u16, 0x01u64);
+            bitmap.insert(0u16, 0xC000_0000_0000_0000u64);
+            bitmap.insert(1u16, 0x8000_0000_0000_0000u64);
 
             let txs = fetch_block_txs(&mut runner, Point::Specific { slot: 100, hash }, bitmap)
                 .await
@@ -463,6 +451,39 @@ mod tests {
         });
 
         client.await.unwrap();
+        server.await.unwrap();
+        ra.abort();
+        rb.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_response_count_different_from_requested_bitmap() {
+        let ((cs, cr), (ss, sr), ra, rb) = make_leios_fetch_mux_pair();
+        let server = tokio::spawn(async move {
+            let mut runner = Runner::<LeiosFetch>::new(Role::Server, ss, sr);
+            assert!(matches!(
+                runner.recv().await.unwrap(),
+                Message::MsgLeiosBlockTxsRequest { .. }
+            ));
+            runner
+                .send(&Message::MsgLeiosBlockTxs {
+                    transactions: vec![],
+                })
+                .await
+                .unwrap();
+        });
+        let mut runner = Runner::<LeiosFetch>::new(Role::Client, cs, cr);
+        let error = fetch_block_txs(
+            &mut runner,
+            Point::Specific {
+                slot: 100,
+                hash: test_hash(),
+            },
+            BTreeMap::from([(0, 1_u64 << 63)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("0 transactions for 1 requested"));
         server.await.unwrap();
         ra.abort();
         rb.abort();
