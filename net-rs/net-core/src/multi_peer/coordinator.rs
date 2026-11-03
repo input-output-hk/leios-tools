@@ -10,6 +10,8 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use shared_consensus::types::short_hash;
+
 /// Dedup state for Leios offer forwarding.
 ///
 /// Each peer typically re-announces still-relevant EBs / TXs / votes
@@ -672,7 +674,7 @@ impl Coordinator {
                         peer = peer_id.0,
                         tip_block_no = tip.block_no,
                         tip_slot,
-                        tip_hash = ?tip_hash.map(|h| format!("{:02x}{:02x}", h[30], h[31])),
+                        tip_hash = ?tip_hash.as_ref().map(short_hash),
                         "best peer tip advanced"
                     );
                     self.best_tip = Some(tip.clone());

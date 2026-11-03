@@ -614,7 +614,12 @@ impl NodeImpl for SharedConsensus {
             self.bt_tree
                 .tick(&TickCtx::new(&self.bt_env, &sensors, &chain_state, bt_seed));
         self.leios.apply_control(&control);
-        self.praos.apply_control(&control);
+        let previous_tip = self.praos.tip_hash();
+        let praos_fx = self.praos.apply_control(&control, self.instant_now());
+        self.dispatch_praos_effects(&mut out, praos_fx);
+        if self.praos.tip_hash() != previous_tip {
+            self.update_chain_tip_ctx();
+        }
         self.mempool.apply_control(&control);
 
         // Drive Leios election lifecycle.  `tx_known` mirrors

@@ -163,6 +163,9 @@ pub fn build_action(
             count: *count,
             n_txs: *n_txs,
         }),
+        ActionSpec::BlacklistBlocks { offset } => {
+            Box::new(catalogue::BlacklistBlocks::new(*offset))
+        }
     }
 }
 
@@ -176,7 +179,8 @@ mod tests {
     fn tick_once(
         action: &mut dyn LeafAction<ConsensusCtx, ControlSignal>,
     ) -> (Status, ControlSignal) {
-        let env = DynamicEnv::new();
+        let mut env = DynamicEnv::new();
+        env.insert("tip", crate::behaviour::tree::EnvValue::Str("03".repeat(32)));
         let state = NativeChainState::default();
         let ctx = TickCtx {
             env: &env,
@@ -208,5 +212,23 @@ mod tests {
         let (s, out) = tick_once(a.as_mut());
         assert_eq!(s, Status::Running);
         assert_eq!(out.leios.vote, VotePolicy::Abstain(NoVoteReason::Declined));
+    }
+
+    #[test]
+    fn build_action_blacklist_blocks_uses_offset_and_environment_tip() {
+        let mut a = build_action(&ActionSpec::BlacklistBlocks { offset: 4 }, 0);
+        let (s, out) = tick_once(a.as_mut());
+        assert_eq!(s, Status::Running);
+        assert_eq!(out.praos.rb_blacklist_tip, [3u8; 32]);
+        assert_eq!(out.praos.rb_blacklist_offset, 4);
+    }
+
+    #[test]
+    fn build_action_blacklist_blocks_defaults_offset_to_zero() {
+        let spec: ActionSpec = toml::from_str("kind = \"blacklist-blocks\"").unwrap();
+        let mut a = build_action(&spec, 0);
+        let (status, out) = tick_once(a.as_mut());
+        assert_eq!(status, Status::Running);
+        assert_eq!(out.praos.rb_blacklist_offset, 0);
     }
 }
