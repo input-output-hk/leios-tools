@@ -595,6 +595,9 @@ impl PraosState {
             // transition. Callers dispatch the rollback before performing any
             // subsequent per-slot action (notably block production).
             self.evaluate_and_fetch_internal(now, &mut fx);
+            if let Some(best) = self.chain_tree.best_tip_hash() {
+                self.try_switch_and_execute_internal(best, &mut fx);
+            }
         }
         fx
     }
