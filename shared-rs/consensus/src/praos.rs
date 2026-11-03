@@ -1054,7 +1054,10 @@ impl PraosState {
                     .insert_chain_start(hash, point, slot, block_no.unwrap_or(0));
                 // Sync-at-tip cold start: adopt the tip anchor as a trusted
                 // root so we forge on the real tip from boot.
-                if block_no.is_some() && self.adopted_tip_hash.is_none() {
+                if block_no.is_some()
+                    && self.adopted_tip_hash.is_none()
+                    && !self.chain_tree.is_blacklisted(hash)
+                {
                     self.adopted_tip_hash = Some(hash);
                 }
             }
@@ -3091,6 +3094,22 @@ mod tests {
         s.record_peer_intersection(pid, pt(2000, 9), true, None);
         assert_eq!(s.adopted_tip_hash, None, "no adoption without a height");
         assert!(s.chain_tree.is_chain_origin(&h(9)), "anchor still inserted");
+    }
+
+    #[test]
+    fn initial_intersection_at_tip_does_not_adopt_blacklisted_anchor() {
+        let mut s = fresh();
+        let pid = PeerId(7);
+        s.chain_tree.update_blacklist(&[h(9)]);
+
+        s.record_peer_intersection(pid, pt(2000, 9), true, Some(84_000));
+
+        assert_eq!(s.adopted_tip_hash, None, "blacklisted anchor must not be adopted");
+        assert_eq!(
+            s.tip_hash(),
+            None,
+            "tip stays at Origin when the sync-at-tip anchor is tainted"
+        );
     }
 
     #[test]
