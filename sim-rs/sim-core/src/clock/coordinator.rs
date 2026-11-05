@@ -117,6 +117,23 @@ impl ClockCoordinator {
 
                     // Advance time through queued events while no tasks are pending
                     while running == 0 && self.tasks.load(Ordering::Acquire) == 0 {
+                        // finish_task releases the atomic task guard after the actor
+                        // has queued CancelWait, but we may not have consumed that
+                        // cancellation yet. Observe the guard first, then reconcile
+                        // actor state before advancing to any timestamp (including
+                        // a peer-shard ceiling).
+                        while let Ok(event) = self.rx.try_recv() {
+                            Self::handle_event(
+                                event,
+                                &mut waiters,
+                                &mut running,
+                                &mut queue,
+                                &self.time,
+                            );
+                        }
+                        if running != 0 || self.tasks.load(Ordering::Acquire) != 0 {
+                            break;
+                        }
                         let Some((timestamp, _)) = queue.first_key_value() else {
                             break;
                         };
@@ -324,11 +341,13 @@ mod tests {
         assert_eq!(clock.now(), t0); // no time has passed
         assert_eq!(poll!(&mut wait1), Poll::Pending);
 
-        let wait2 = actor2.wait_until(t2);
-        assert_eq!(poll!(wait2), Poll::Pending);
-        while poll!(&mut wait1).is_pending() {
-            assert_eq!(poll!(&mut run_future), Poll::Pending);
-        }
+        // Keep the second wait alive: polling it by value would drop and
+        // cancel it, so the coordinator must then refuse to advance time.
+        let mut wait2 = actor2.wait_until(t2);
+        assert_eq!(poll!(&mut wait2), Poll::Pending);
+        assert_eq!(poll!(&mut run_future), Poll::Pending);
+        assert_eq!(poll!(&mut wait1), Poll::Ready(()));
+        assert_eq!(poll!(&mut wait2), Poll::Ready(()));
         // We expect a long time to have passed, because the "short" wait was cancelled
         assert_eq!(clock.now(), t2);
     }
@@ -391,5 +410,60 @@ mod tests {
         assert_eq!(clock.now(), t1); // 5ms have passed
         assert_eq!(poll!(&mut wait2), Poll::Pending); // the eternal wait is still pending
         assert_eq!(poll!(wait1), Poll::Ready(())); // the 5ms wait is done
+    }
+
+    #[tokio::test]
+    async fn should_process_queued_cancellation_before_advancing_time() {
+        let mut coordinator = ClockCoordinator::new(TIMESTAMP_RESOLUTION);
+        let clock = coordinator.clock();
+        let t0 = clock.now();
+        let delivery_at = t0 + Duration::from_millis(100);
+        let slot_at = t0 + Duration::from_secs(1);
+        let mut network = clock.barrier();
+        let mut slot = clock.barrier();
+        let run_future = coordinator.run();
+        pin!(run_future);
+
+        network.start_task();
+        let idle = network.wait_forever();
+        let mut slot_tick = slot.wait_until(slot_at);
+        // Receiving a message cancels the network actor's old wait. The
+        // coordinator has not consumed either wait or the cancellation yet.
+        drop(idle);
+        network.finish_task();
+        let mut delivery = network.wait_until(delivery_at);
+
+        assert_eq!(poll!(&mut run_future), Poll::Pending);
+        assert_eq!(clock.now(), delivery_at);
+        assert_eq!(poll!(&mut delivery), Poll::Ready(()));
+        assert_eq!(poll!(&mut slot_tick), Poll::Pending);
+    }
+
+    #[tokio::test]
+    async fn should_wait_for_cancelled_actor_to_register_its_next_event() {
+        let mut coordinator = ClockCoordinator::new(TIMESTAMP_RESOLUTION);
+        let clock = coordinator.clock();
+        let t0 = clock.now();
+        let delivery_at = t0 + Duration::from_millis(100);
+        let mut network = clock.barrier();
+        let mut slot = clock.barrier();
+        let run_future = coordinator.run();
+        pin!(run_future);
+
+        network.start_task();
+        let idle = network.wait_forever();
+        let mut slot_tick = slot.wait_until(t0 + Duration::from_secs(1));
+        drop(idle);
+        network.finish_task();
+        // The network actor has released the guard but has not registered
+        // its next wait. It must count as running until it does so.
+        assert_eq!(poll!(&mut run_future), Poll::Pending);
+        assert_eq!(clock.now(), t0);
+        assert_eq!(poll!(&mut slot_tick), Poll::Pending);
+
+        let mut delivery = network.wait_until(delivery_at);
+        assert_eq!(poll!(&mut run_future), Poll::Pending);
+        assert_eq!(clock.now(), delivery_at);
+        assert_eq!(poll!(&mut delivery), Poll::Ready(()));
     }
 }
