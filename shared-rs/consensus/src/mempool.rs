@@ -35,8 +35,21 @@ use crate::types::hex_prefix;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Display;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::info;
+
+static FLAG_ALLOW_DUPLICATE_TXS: AtomicBool = AtomicBool::new(false);
+
+/// Set the process-wide mempool test flag at startup.
+pub fn set_flag_allow_duplicate_txs(enabled: bool) {
+    FLAG_ALLOW_DUPLICATE_TXS.store(enabled, Ordering::Relaxed);
+}
+
+/// Read the process-wide mempool test flag, which defaults to `false`.
+pub fn flag_allow_duplicate_txs() -> bool {
+    FLAG_ALLOW_DUPLICATE_TXS.load(Ordering::Relaxed)
+}
 
 /// Slot-window retention for EB-pinned bodies.  Holds wide enough that
 /// every active voting / certification window stays serveable; pruned
@@ -385,7 +398,7 @@ impl MempoolState {
         slot: u64,
         ours: bool,
     ) -> Vec<MempoolEffect> {
-        if self.contains(&tx_id) {
+        if !flag_allow_duplicate_txs() && self.contains(&tx_id) {
             return vec![MempoolEffect::TxRejected {
                 tx_id,
                 reason: TxRejectReason::AlreadyKnown,
@@ -1037,6 +1050,16 @@ impl MempoolState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_allow_duplicate_txs_defaults_to_false_and_can_be_enabled() {
+        assert!(!flag_allow_duplicate_txs());
+        set_flag_allow_duplicate_txs(true);
+        let enabled = flag_allow_duplicate_txs();
+        set_flag_allow_duplicate_txs(false);
+        assert!(enabled);
+        assert!(!flag_allow_duplicate_txs());
+    }
 
     /// A tx body arrived from the network.  If the mempool already
     /// holds it (or it's pending validation), emits `TxRejected` with
