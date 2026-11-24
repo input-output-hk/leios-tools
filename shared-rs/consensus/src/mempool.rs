@@ -390,6 +390,12 @@ impl MempoolState {
     /// `true` for a tx this node generated, `false` for a peer-sent tx
     /// the wrapper validated inline.
     /// `slot` is the moment (=slot) of tx receiving/generating.
+    ///
+    /// If the tx is already held, it is rejected as `AlreadyKnown` —
+    /// unless the process-wide duplicate-tx test flag is on, in which
+    /// case the stored copy is kept, the id is re-owed to every peer
+    /// (re-announcement), and no rejection is emitted so the caller's
+    /// admit fan-out still announces it.
     pub fn admit_validated(
         &mut self,
         tx_id: TxId,
@@ -398,11 +404,24 @@ impl MempoolState {
         slot: u64,
         ours: bool,
     ) -> Vec<MempoolEffect> {
-        if !flag_allow_duplicate_txs() && self.contains(&tx_id) {
-            return vec![MempoolEffect::TxRejected {
-                tx_id,
-                reason: TxRejectReason::AlreadyKnown,
-            }];
+        if self.contains(&tx_id) {
+            if !flag_allow_duplicate_txs() {
+                return vec![MempoolEffect::TxRejected {
+                    tx_id,
+                    reason: TxRejectReason::AlreadyKnown,
+                }];
+            }
+            // Duplicate re-admission (duplicate-tx test flag on): keep
+            // the stored copy — queueing a second body would desync `txs`
+            // from `tx_index` (the first drain or eviction drops the id
+            // while a copy is still queued, and the duplicate can satisfy
+            // `peek_unannounced_for_peer`'s early return, starving another
+            // owed tx).  Re-announcement only needs the id re-owed to every
+            // peer.
+            for set in self.peer_unannounced.values_mut() {
+                set.insert(tx_id.clone());
+            }
+            return Vec::new();
         }
         // If a validation was in flight for this id, drop it — the
         // local admission supersedes.
@@ -1051,14 +1070,101 @@ impl MempoolState {
 mod tests {
     use super::*;
 
+    /// Serialises every test that reads or flips the process-wide
+    /// duplicate-tx flag.  `cargo test` runs this module's tests on
+    /// several threads in one process, so an unguarded flip would leak
+    /// into concurrently running flag-sensitive tests (e.g.
+    /// `admit_validated_dedup_returns_already_known`).
+    static FLAG_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the flag-test lock.  Tests that touch the flag hold this
+    /// guard for their whole body.
+    fn lock_flag() -> std::sync::MutexGuard<'static, ()> {
+        FLAG_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Enables the duplicate-tx flag for the rest of the scope and
+    /// restores the default (off) on exit — also on panic, so a failed
+    /// flag test cannot poison the other flag-sensitive tests.
+    struct DuplicateTxFlagOn;
+
+    impl DuplicateTxFlagOn {
+        fn new() -> Self {
+            set_flag_allow_duplicate_txs(true);
+            DuplicateTxFlagOn
+        }
+    }
+
+    impl Drop for DuplicateTxFlagOn {
+        fn drop(&mut self) {
+            set_flag_allow_duplicate_txs(false);
+        }
+    }
+
     #[test]
     fn flag_allow_duplicate_txs_defaults_to_false_and_can_be_enabled() {
+        let _guard = lock_flag();
         assert!(!flag_allow_duplicate_txs());
         set_flag_allow_duplicate_txs(true);
         let enabled = flag_allow_duplicate_txs();
         set_flag_allow_duplicate_txs(false);
         assert!(enabled);
         assert!(!flag_allow_duplicate_txs());
+    }
+
+    /// Duplicate-tx flag on: re-admitting a held tx re-announces it — the
+    /// id is re-owed to a peer that already saw it — while the pool keeps
+    /// exactly one stored copy (no second `txs` entry, no double-counted
+    /// bytes, no eviction of an unrelated oldest tx).
+    #[test]
+    fn admit_validated_duplicate_with_flag_reannounces_single_copy() {
+        let _guard = lock_flag();
+        let _flag = DuplicateTxFlagOn::new();
+        let mut s = MempoolState::new(2);
+        admit(&mut s, 1, 100);
+        admit(&mut s, 2, 50);
+        let peer = pid(0);
+        // The pool is now at capacity; the peer has seen both txs.
+        assert_eq!(s.peek_unannounced_for_peer(peer, 10, 0).len(), 2);
+        assert!(s.peek_unannounced_for_peer(peer, 10, 0).is_empty());
+        let (dup_id, dup_body, dup_sz) = tx(1, 100);
+        // Admitted, not rejected: the caller's fan-out still announces.
+        assert!(s
+            .admit_validated(dup_id.clone(), dup_body, dup_sz, 0, false)
+            .is_empty());
+        // Single stored copy each; nothing evicted at capacity.
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.total_bytes(), 150);
+        assert_eq!(s.current_tx_ids().len(), 2);
+        // The already-advertised peer is offered the tx again.
+        let again = s.peek_unannounced_for_peer(peer, 10, 0);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id(), &dup_id);
+    }
+
+    /// Duplicate-tx flag on: a duplicate re-admission must not satisfy a
+    /// later `peek_unannounced_for_peer` with a second copy of the same
+    /// tx — every owed id resolves to its own body.
+    #[test]
+    fn admit_validated_duplicate_with_flag_does_not_starve_owed_txs() {
+        let _guard = lock_flag();
+        let _flag = DuplicateTxFlagOn::new();
+        let mut s = MempoolState::new(10);
+        admit(&mut s, 1, 100);
+        // Re-admit the front tx, then queue a second tx behind it.
+        let (dup_id, dup_body, dup_sz) = tx(1, 100);
+        assert!(s
+            .admit_validated(dup_id, dup_body, dup_sz, 0, false)
+            .is_empty());
+        admit(&mut s, 2, 50);
+        // Both owed ids resolve to distinct txs in one peek.
+        let got = s.peek_unannounced_for_peer(pid(0), 10, 0);
+        let ids: BTreeSet<&TxId> = got.iter().map(|t| t.id()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&TxId::new_with_slice(&[1u8; 32])));
+        assert!(ids.contains(&TxId::new_with_slice(&[2u8; 32])));
     }
 
     /// A tx body arrived from the network.  If the mempool already
@@ -1644,6 +1750,7 @@ mod tests {
 
     #[test]
     fn admit_validated_dedup_returns_already_known() {
+        let _guard = lock_flag();
         let mut s = MempoolState::new(10);
         admit(&mut s, 1, 100);
         let (tx_id, body, sz) = tx(1, 100);
