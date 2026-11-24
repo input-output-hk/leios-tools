@@ -1,0 +1,42 @@
+\documentclass[10pt, a4paper]{article}
+\usepackage{graphicx}
+
+\title{T22 experiments report, \textit{Preliminary}}
+\author{Leios Red team}
+\date{28.09.2026, ver. 1.0}
+
+\begin{document}
+\maketitle
+
+\subsection*{Experiment set-up}
+
+In order to test possibilities in T20 attack, a local Piranha cluster was 
+established, and tested under various (adversarial) test scenarios.
+
+Some nodes are ``honest'' and do not participate in adversarial activity,
+others are ``adversarial''. Typical scenario is a combination of normal work 
+(all nodes behave honestly) and an attack (adversarial part performs an attack).
+Typical layout is 10+10+10 mins run (10 min. normal, 10 min. 
+adversarial, 10 min. normal).
+
+The default parameters for the network are the following:
+
+\begin{itemize}
+\item Piranha (net-rs) network, 30 Piranha nodes.
+\item Basic topology: random, 30 nodes, network diameter 4.
+\item Basic txs tempo: transactions generated uniformly by all nodes,
+1 tx per node per second.
+\end{itemize}
+
+The attacks are presented roughly in the power growth proportion. 
+Ultimate target of the attack: stop EB certification, and it's partially 
+achieved.
+
+%The variation in protocol implementation gives us some space to research 
+%general protocol performance. The second implementation was introduced after 
+%the first one demonstrated unreliable behaviour.
+
+\section*{Raw results}
+
+
+\end{document}

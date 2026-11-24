@@ -1,0 +1,91 @@
+T11 duplicate-manifest variant, run 1 (2026-11-23 UTC; recorded at the time as T24 run 1) - retained evidence excerpt
+Produced by the superseded dup-eb-test / dup_eb_report.py; re-read with t11_report.py in t11/report.md.
+Full evidence (97 MB, kept outside the repo, on the operator's machine):
+  ~/leios-magazines/dup-eb-20261122-165254.mag.{report.txt,report.json,report.initial.txt,utxo.json,txids,pairs.txids}
+  ~/leios-magazines/dup-eb-20261122-165254.mag.evidence/{netrs-node-0.log,node1.log,node2.log,node3.log,run-console.log,netrs.toml}
+Lines below are verbatim unless marked. 'N:' prefixes are line numbers in the named file.
+
+== 1. Corrected report: dup-eb-20261122-165254.mag.report.txt (verbatim) ==
+========================================================================
+ T24 duplicate-transaction EB test — report
+========================================================================
+  date                   2026-11-23T01:34:29Z
+  duration               2495s
+  cardano-node           cardano-node 11.2.0.164 - darwin-aarch64 - ghc-9.6
+  adversarial-tools      a52a96db (uncommitted changes)
+  leios-tools            b6fcb51 cet/t24_duplicate_txs
+  magazine               ~/leios-magazines/dup-eb-20261122-165254.mag
+  magazine sha256        9f0ed1c84d63f980
+  pairs / tx rate        600 / 1.0/s
+  window                 2100s
+  regenerated            from preserved evidence after the EB-id join fix (initial: .report.initial.txt)
+
+--- injection (net-rs) ---
+  duplicate-tx flag     ENABLED (confirmed in net-rs log)
+  EBs produced          10
+  EBs repeating tx ids  10
+  pairs inside one EB   599 / 600   (both copies in the same EB; the rest were split by an EB boundary)
+
+--- Haskell verdicts on EBs that repeated a tx id ---
+    slot  EB hash           entries   rep  status            per-node decision
+     640  7949d21f411ddebb      264   132  body-rejected     node1:body-invalid(9507/9507B) node2:body-invalid(9507/9507B) node3:body-invalid(9507/9507B)
+     652  d389d6c86f139840       12     6  body-rejected     node1:body-invalid(433/433B) node2:body-invalid(433/433B) node3:body-invalid(433/433B)
+     753  8a6c8433188eeaff       86    43  body-rejected     node1:body-invalid(3098/3098B) node2:body-invalid(3098/3098B) node3:body-invalid(3098/3098B)
+     861  484ac0248dd91e34       92    46  body-rejected     node1:body-invalid(3314/3314B) node2:body-invalid(3314/3314B) node3:body-invalid(3314/3314B)
+     962  36421bd64fe9cac1      112    56  body-rejected     node1:body-invalid(4034/4034B) node2:body-invalid(4034/4034B) node3:body-invalid(4034/4034B)
+    1248  86c0419d24296bda      284   142  body-rejected     node1:body-invalid(10227/10227B) node2:body-invalid(10227/10227B) node3:body-invalid(10227/10227B)
+    1288  10b9dc2a1a7d61a9       37    18  body-rejected     node1:body-invalid(1334/1334B) node2:body-invalid(1334/1334B) node3:body-invalid(1334/1334B)
+    1361  1965f8f1daca7cda       71    35  body-rejected     node1:body-invalid(2558/2558B) node2:body-invalid(2558/2558B) node3:body-invalid(2558/2558B)
+    1548  7e69968b9b7efca5      216   108  body-rejected     node1:body-invalid(7778/7778B) node2:body-invalid(7778/7778B) node3:body-invalid(7778/7778B)
+    1636  5de1e0824c461630       26    13  body-rejected     node1:body-invalid(938/938B) node2:body-invalid(938/938B) node3:body-invalid(938/938B)
+  Legend: slot = EB slot; EB hash = 16-hex prefix from net-rs; entries = manifest
+  entries (copies included); rep = tx ids appearing more than once; status:
+  accepted = a node logged EbValidated (passed ledger validation); rejected = a
+  node logged NotVoted blaming the transactions (ledger stage); body-rejected = a
+  node fetched the EB and logged FetchBodyArrival with every byte invalid and none
+  good, so it never reached ledger validation (structural stage); not-attributable
+  = NotVoted for another reason (e.g. chainTipDoesNotAnnounce); undecided = none
+  of these logged. Per-node: body-invalid(invalid/size B) = bytes classified invalid
+  out of the EB body size.
+  totals: accepted 0, rejected 0, body-rejected 10, not-attributable 0, undecided 0
+
+--- Haskell warning-or-worse Leios traces (decode failures appear here) ---
+  node1: 2  Consensus.LeiosKernel.BlockPointMissing x2
+  node2: 2  Consensus.LeiosKernel.BlockPointMissing x2
+  node3: 3  Consensus.LeiosKernel.BlockPointMissing x3
+
+--- ledger ---
+  pair tx ids landed    0 / 600
+    repeated in an EB   0   (any here is a FAIL)
+    copies split by EB  0   (EB held one copy; landing once is correct)
+
+--- chain ---
+  tip block at inject   7
+  tip block at end      116
+  growth                109  (need >= 30)
+
+✅ T24 PASS: 10 EB(s) repeating tx ids were rejected by the Haskell nodes (10 on body arrival, 0 at ledger validation), none validated, and no repeated tx id landed.
+
+== 2. net-rs: netrs-node-0.log (ANSI colour codes stripped) ==
+1:2026-11-23T00:59:09.277430Z  WARN net_node: mempool duplicate-tx test flag ENABLED: repeated tx ids are admitted and can share one EB
+1747:2026-11-23T01:03:50.026977Z  INFO net_node: produced endorser block node_id=node-0 eb.point=640/7949d21f411ddebb fabricated=false
+1748:2026-11-23T01:03:50.027161Z  WARN net_node: endorser block manifest repeats tx ids node_id=node-0 eb.point=640/7949d21f411ddebb total=264 repeated_ids=132 repeated=0dd0806b5a90e39480017325f6f43c37e27da2ea6b8989baaaebb53686555be0*2,632bc68c57779593ea4608810498bdb00a293090b8c5e097c23d3036f295a3a5*2,... [130 more ids truncated for size; all 132 have *2]
+
+== 3. node1.log: slot-640 EB 7949d21f411ddebb, announcement -> fetch -> body arrival ==
+37823:{"at":"2026-11-23T01:03:50.028553Z","ns":"Consensus.LeiosKernel.AnnouncementAccepted","data":{"announcementAgeSeconds":2.7813e-2,"ebBodySize":9507,"ebHash":"7949d21f411ddebb7f7187f48de1b1d2b982c6294a53aa4a900af43084e3a8ac","electionPool":"eaffce36a363947c36a687dc356383696d1d78b60dfbd39be60d626d","electionSlot":640,"equivocation":false,"kind":"LeiosAnnouncementAccepted","source":"receivedViaLeiosNotify"},"sev":"Info","thread":"2655","host":"Mac"}
+37841:{"at":"2026-11-23T01:03:50.03019Z","ns":"LeiosFetch.Remote.Send.BlockRequest","data":{"kind":"Send","msg":{"ebHash":"7949d21f411ddebb7f7187f48de1b1d2b982c6294a53aa4a900af43084e3a8ac","ebSlot":640,"kind":"MsgLeiosBlockRequest"},"peer":{"connectionId":"127.0.0.1:4001 127.0.0.1:4010"}},"sev":"Debug","thread":"2663","host":"Mac"}
+37842:{"at":"2026-11-23T01:03:50.030974Z","ns":"LeiosFetch.Remote.Receive.Block","data":{"kind":"Recv","msg":{"ebBytesSize":9507,"ebHash":"7949d21f411ddebb7f7187f48de1b1d2b982c6294a53aa4a900af43084e3a8ac","kind":"MsgLeiosBlock"},"peer":{"connectionId":"127.0.0.1:4001 127.0.0.1:4010"}},"sev":"Debug","thread":"2662","host":"Mac"}
+37844:{"at":"2026-11-23T01:03:50.031178Z","ns":"Consensus.LeiosKernel.FetchBodyArrival","data":{"evictedBytes":0,"extraBytes":0,"goodBytes":0,"invalidBytes":9507,"kind":"LeiosFetchBodyArrival"},"sev":"Debug","thread":"2662","host":"Mac"}
+
+== 4. node1.log: certification check while forging the RB at slot 702 (slot-652 EB) ==
+42765:{"at":"2026-11-23T01:04:52.003879Z","ns":"Consensus.LeiosKernel.Msg","data":{"kind":"LeiosKernelMsg","msg":"EB not yet downloaded: (652, d389d6c86f139840e1e71ff1fe16016e9ddc6b320f48c78974938514e5ab981f)"},"sev":"Info","thread":"70","host":"Mac"}
+
+== 5. node2.log: in-run reference, honest node1 EB (slot 62) served over the net-rs link (not a control) ==
+6208:{"at":"2026-11-23T00:54:12.513379Z","ns":"LeiosFetch.Remote.Receive.Block","data":{"kind":"Recv","msg":{"ebBytesSize":2703,"ebHash":"b3355c4feb2b9cbadfda40a4815887061b5b6930ded57956506ce2f6034d81e6","kind":"MsgLeiosBlock"},"peer":{"connectionId":"127.0.0.1:4002 127.0.0.1:4010"}},"sev":"Debug","thread":"208","host":"Mac"}
+6211:{"at":"2026-11-23T00:54:12.513692Z","ns":"Consensus.LeiosKernel.FetchBodyArrival","data":{"evictedBytes":0,"extraBytes":0,"goodBytes":2703,"invalidBytes":0,"kind":"LeiosFetchBodyArrival"},"sev":"Debug","thread":"208","host":"Mac"}
+6455:{"at":"2026-11-23T00:54:15.028193Z","ns":"Consensus.LeiosKernel.EbValidated","data":{"applied":73,"ebHash":"b3355c4feb2b9cbadfda40a4815887061b5b6930ded57956506ce2f6034d81e6","ebSlot":62,"kind":"LeiosEbValidated","reapplied":0},"sev":"Info","thread":"62","host":"Mac"}
+
+== 6. Final chain tip per node (newtip field of the last AddedToCurrentChain line; extracted) ==
+node1 "at":"2026-11-23T01:34:12.012394Z" "blockNo":116 "newtip":"94c7e7a59884c7af160a7d4e75067439ab77344b310cb192f13e41f5a7aa3645@2462" 
+node2 "at":"2026-11-23T01:34:12.013421Z" "blockNo":116 "newtip":"94c7e7a59884c7af160a7d4e75067439ab77344b310cb192f13e41f5a7aa3645@2462" 
+node3 "at":"2026-11-23T01:34:12.006168Z" "blockNo":116 "newtip":"94c7e7a59884c7af160a7d4e75067439ab77344b310cb192f13e41f5a7aa3645@2462" 
