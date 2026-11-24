@@ -9,6 +9,7 @@ pub mod codec;
 use shared_consensus::mempool::{TxBody, TxId, TxInfo};
 use shared_consensus::PeerId;
 use std::collections::VecDeque;
+use std::fmt::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -361,16 +362,115 @@ fn announce_txs(
     reply
 }
 
+/// Tracing target for the client's per-message wire record: one debug event
+/// for each request received and each reply sent. Off unless enabled, for
+/// example with `RUST_LOG=net_core::txsubmission::client=debug`.
+pub const CLIENT_TRACE_TARGET: &str = "net_core::txsubmission::client";
+
+/// Tx ids as lower-case hex, comma-separated, in order.
+fn hex_tx_ids<'a>(tx_ids: impl IntoIterator<Item = &'a TxId>) -> String {
+    let mut out = String::new();
+    for (index, tx_id) in tx_ids.into_iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        for byte in tx_id.get_bytes() {
+            // Writing into a String cannot fail.
+            let _ = write!(out, "{byte:02x}");
+        }
+    }
+    out
+}
+
+/// Sizes as decimal numbers, comma-separated, in order.
+fn join_sizes(sizes: impl IntoIterator<Item = usize>) -> String {
+    let parts: Vec<String> = sizes.into_iter().map(|size| size.to_string()).collect();
+    parts.join(",")
+}
+
+fn client_trace_enabled() -> bool {
+    tracing::enabled!(target: CLIENT_TRACE_TARGET, tracing::Level::DEBUG)
+}
+
+/// Bytes `msg` occupies on the wire before mux framing (0 if it cannot be
+/// encoded, which the real send would then report).
+fn encoded_len(msg: &Message) -> usize {
+    minicbor::to_vec(msg).map(|bytes| bytes.len()).unwrap_or(0)
+}
+
+fn trace_ids_requested(peer_id: PeerId, blocking: bool, ack: u16, req: u16) {
+    tracing::debug!(
+        target: CLIENT_TRACE_TARGET,
+        peer = %peer_id,
+        kind = "ids-requested",
+        blocking,
+        ack,
+        req,
+        "txsubmission client"
+    );
+}
+
+fn trace_ids_announced(peer_id: PeerId, blocking: bool, msg: &Message) {
+    if !client_trace_enabled() {
+        return;
+    }
+    if let Message::MsgReplyTxIds { tx_ids } = msg {
+        tracing::debug!(
+            target: CLIENT_TRACE_TARGET,
+            peer = %peer_id,
+            kind = "ids-announced",
+            blocking,
+            tx_ids = %hex_tx_ids(tx_ids.iter().map(|announced| &announced.tx_id)),
+            sizes = %join_sizes(tx_ids.iter().map(|announced| announced.size as usize)),
+            encoded_len = encoded_len(msg),
+            "txsubmission client"
+        );
+    }
+}
+
+fn trace_bodies_requested(peer_id: PeerId, tx_ids: &[EraTxId]) {
+    if !client_trace_enabled() {
+        return;
+    }
+    tracing::debug!(
+        target: CLIENT_TRACE_TARGET,
+        peer = %peer_id,
+        kind = "bodies-requested",
+        tx_ids = %hex_tx_ids(tx_ids.iter().map(|requested| &requested.tx_id)),
+        "txsubmission client"
+    );
+}
+
+fn trace_bodies_sent(peer_id: PeerId, sent_ids: &[TxId], msg: &Message) {
+    if !client_trace_enabled() {
+        return;
+    }
+    if let Message::MsgReplyTxs { txs } = msg {
+        tracing::debug!(
+            target: CLIENT_TRACE_TARGET,
+            peer = %peer_id,
+            kind = "bodies-sent",
+            tx_ids = %hex_tx_ids(sent_ids),
+            sizes = %join_sizes(txs.iter().map(|tx| tx.body.len())),
+            encoded_len = encoded_len(msg),
+            "txsubmission client"
+        );
+    }
+}
+
 /// Run the client (tx provider) side of the TxSubmission protocol.
 ///
 /// Sends MsgInit, then responds to server requests by pulling transactions
 /// from `tx_receiver`. When the channel closes and all pending txs have been
 /// sent and acknowledged, sends MsgDone and returns.
+///
+/// Every request received and reply sent is traced at debug level on
+/// [`CLIENT_TRACE_TARGET`].
 pub async fn run_client(
     runner: &mut Runner<TxSubmission>,
     tx_receiver: &mut mpsc::Receiver<PendingTx>,
     request_sender: Option<mpsc::Sender<u16>>,
-    _peer_id: PeerId,
+    peer_id: PeerId,
 ) -> Result<(), ProtocolError> {
     // Send MsgInit to transition StInit -> StIdle.
     runner.send(&Message::MsgInit).await?;
@@ -386,6 +486,7 @@ pub async fn run_client(
 
         match msg {
             Message::MsgRequestTxIdsBlocking { ack, req } => {
+                trace_ids_requested(peer_id, true, ack, req);
                 // Acknowledge the first `ack` announced tx ids (and drop any
                 // acked-but-unrequested bodies — see `ack_and_prune`).
                 ack_and_prune(&mut announced, &mut pending_bodies, ack);
@@ -442,12 +543,13 @@ pub async fn run_client(
                     // block for more rather than send an empty blocking reply.
                 };
 
-                runner
-                    .send(&Message::MsgReplyTxIds { tx_ids: reply })
-                    .await?;
+                let reply = Message::MsgReplyTxIds { tx_ids: reply };
+                trace_ids_announced(peer_id, true, &reply);
+                runner.send(&reply).await?;
             }
 
             Message::MsgRequestTxIdsNonBlocking { ack, req } => {
+                trace_ids_requested(peer_id, false, ack, req);
                 // Acknowledge the first `ack` announced tx ids (and drop any
                 // acked-but-unrequested bodies — see `ack_and_prune`).
                 ack_and_prune(&mut announced, &mut pending_bodies, ack);
@@ -465,31 +567,35 @@ pub async fn run_client(
 
                 drop(new_txs);
 
-                runner
-                    .send(&Message::MsgReplyTxIds { tx_ids: reply })
-                    .await?;
+                let reply = Message::MsgReplyTxIds { tx_ids: reply };
+                trace_ids_announced(peer_id, false, &reply);
+                runner.send(&reply).await?;
             }
 
             Message::MsgRequestTxs { tx_ids } => {
+                trace_bodies_requested(peer_id, &tx_ids);
                 // Look up requested tx bodies from the pending set.
                 let mut txs = Vec::new();
+                let mut sent_ids = Vec::new();
                 for requested_id in &tx_ids {
                     // The peer requests by the canonical Praos TxId we announced
                     // (`praos_tx_id`), which differs from our internal TxHash key.
-                    if let Some(pos) = pending_bodies
+                    let position = pending_bodies
                         .iter()
-                        .position(|p| praos_tx_id(p).as_ref() == Some(&requested_id.tx_id))
-                    {
-                        let pending = pending_bodies.remove(pos).expect("position valid");
+                        .position(|p| praos_tx_id(p).as_ref() == Some(&requested_id.tx_id));
+                    if let Some(pending) = position.and_then(|pos| pending_bodies.remove(pos)) {
                         txs.push(EraTxBody {
                             era: wire_era(pending.era),
                             body: pending.tx.body.clone(),
                         });
+                        sent_ids.push(requested_id.tx_id.clone());
                     }
                     // Per spec: omitted txs are treated as never announced.
                 }
 
-                runner.send(&Message::MsgReplyTxs { txs }).await?;
+                let reply = Message::MsgReplyTxs { txs };
+                trace_bodies_sent(peer_id, &sent_ids, &reply);
+                runner.send(&reply).await?;
             }
 
             other => {
@@ -1008,5 +1114,218 @@ mod tests {
         server.await.unwrap();
         ra.abort();
         rb.abort();
+    }
+
+    /// One recorded event's fields, rendered as strings.
+    type RecordedEvent = std::collections::BTreeMap<String, String>;
+
+    /// Minimal recording subscriber built on the `tracing` crate alone (no
+    /// `tracing-subscriber`): it keeps the fields of every event on
+    /// [`CLIENT_TRACE_TARGET`] and ignores everything else.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        events: Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
+    }
+
+    /// The process-wide recorder, installed once as the global default.
+    ///
+    /// A scoped (`set_default`) subscriber is not enough here: while it is the
+    /// only registered dispatcher, `tracing` computes a callsite's interest from
+    /// the thread-local default of whichever thread reaches the callsite first.
+    /// Other tests in this module run `run_client` on their own threads with no
+    /// subscriber, so they would cache "never" for these callsites. As the
+    /// global default the recorder is consulted on every thread; callers keep
+    /// only their own events (by `peer`).
+    fn global_recorder() -> Recorder {
+        static RECORDER: std::sync::OnceLock<Recorder> = std::sync::OnceLock::new();
+        RECORDER
+            .get_or_init(|| {
+                let recorder = Recorder::default();
+                // Fails only if another global default exists; none is set in
+                // this test binary.
+                let _ = tracing::subscriber::set_global_default(recorder.clone());
+                tracing::callsite::rebuild_interest_cache();
+                recorder
+            })
+            .clone()
+    }
+
+    struct FieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for Recorder {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == CLIENT_TRACE_TARGET
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = std::collections::BTreeMap::new();
+            event.record(&mut FieldVisitor(&mut fields));
+            if let Ok(mut events) = self.events.lock() {
+                events.push(fields);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn hex(tx_id: &TxId) -> String {
+        tx_id
+            .get_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// T24 (research R7): `run_client` records every message it receives or
+    /// sends on the dedicated client target, so a harness can reconstruct what
+    /// was announced and what the peer asked for.
+    #[tokio::test]
+    async fn run_client_traces_each_message() {
+        // The T24 harness enables this target by name in RUST_LOG.
+        assert_eq!(CLIENT_TRACE_TARGET, "net_core::txsubmission::client");
+        let recorder = global_recorder();
+        let ((cs, cr), (ss, sr), ra, rb) = make_txsubmission_mux_pair();
+
+        let tx1 = make_test_tx(0x01, 1500);
+        let tx2 = make_test_tx(0x02, 900);
+        let id1 = hex(&praos_tx_id(&tx1).expect("test tx has a wire id"));
+        let id2 = hex(&praos_tx_id(&tx2).expect("test tx has a wire id"));
+
+        let server = tokio::spawn(async move {
+            let mut runner = Runner::<TxSubmission>::new(Role::Server, ss, sr);
+            assert!(matches!(runner.recv().await.unwrap(), Message::MsgInit));
+            let mut announced = Vec::new();
+            let mut reply_lens = Vec::new();
+            for request in [
+                Message::MsgRequestTxIdsBlocking { ack: 0, req: 1 },
+                Message::MsgRequestTxIdsNonBlocking { ack: 0, req: 1 },
+            ] {
+                runner.send(&request).await.unwrap();
+                let reply = runner.recv().await.unwrap();
+                reply_lens.push(minicbor::to_vec(&reply).unwrap().len());
+                match reply {
+                    Message::MsgReplyTxIds { tx_ids } => {
+                        announced.extend(tx_ids.into_iter().map(|t| EraTxId {
+                            era: t.era,
+                            tx_id: t.tx_id,
+                        }))
+                    }
+                    other => panic!("expected MsgReplyTxIds, got {other:?}"),
+                }
+            }
+            runner
+                .send(&Message::MsgRequestTxs { tx_ids: announced })
+                .await
+                .unwrap();
+            let bodies = runner.recv().await.unwrap();
+            reply_lens.push(minicbor::to_vec(&bodies).unwrap().len());
+            assert!(matches!(bodies, Message::MsgReplyTxs { .. }));
+            runner
+                .send(&Message::MsgRequestTxIdsBlocking { ack: 2, req: 10 })
+                .await
+                .unwrap();
+            assert!(matches!(runner.recv().await.unwrap(), Message::MsgDone));
+            reply_lens
+        });
+
+        let client = tokio::spawn(async move {
+            let mut runner = Runner::<TxSubmission>::new(Role::Client, cs, cr);
+            let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(16);
+            tx_sender.send(tx1).await.unwrap();
+            tx_sender.send(tx2).await.unwrap();
+            drop(tx_sender);
+            run_client(&mut runner, &mut tx_receiver, None, PeerId(7))
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap();
+        let reply_lens = server.await.unwrap();
+        ra.abort();
+        rb.abort();
+
+        // Other tests' clients run as peer-0; this one is peer-7.
+        let events: Vec<_> = recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|fields| fields.get("peer").map(String::as_str) == Some("peer-7"))
+            .cloned()
+            .collect();
+        let field = |i: usize, name: &str| -> String {
+            events[i]
+                .get(name)
+                .unwrap_or_else(|| panic!("event {i} has no field {name}: {:?}", events[i]))
+                .clone()
+        };
+        let kinds: Vec<_> = (0..events.len()).map(|i| field(i, "kind")).collect();
+        assert_eq!(
+            kinds,
+            [
+                "ids-requested",
+                "ids-announced",
+                "ids-requested",
+                "ids-announced",
+                "bodies-requested",
+                "bodies-sent",
+                "ids-requested",
+            ]
+        );
+        for i in 0..events.len() {
+            assert_eq!(field(i, "peer"), "peer-7");
+        }
+        // Requests: blocking flag, ack and req as received.
+        let requests = [
+            (0, "true", "0", "1"),
+            (2, "false", "0", "1"),
+            (6, "true", "2", "10"),
+        ];
+        for (i, blocking, ack, req) in requests {
+            assert_eq!(
+                (field(i, "blocking"), field(i, "ack"), field(i, "req")),
+                (blocking.to_string(), ack.to_string(), req.to_string())
+            );
+        }
+        // Announcements: the wire ids, declared sizes and the encoded reply.
+        assert_eq!(
+            (field(1, "blocking"), field(1, "tx_ids"), field(1, "sizes")),
+            ("true".to_string(), id1.clone(), "1500".to_string())
+        );
+        assert_eq!(field(1, "encoded_len"), reply_lens[0].to_string());
+        assert_eq!(
+            (field(3, "blocking"), field(3, "tx_ids"), field(3, "sizes")),
+            ("false".to_string(), id2.clone(), "900".to_string())
+        );
+        assert_eq!(field(3, "encoded_len"), reply_lens[1].to_string());
+        // Body request and reply: the ids, body sizes and the encoded reply.
+        let both = format!("{id1},{id2}");
+        assert_eq!(field(4, "tx_ids"), both);
+        assert_eq!(
+            (field(5, "tx_ids"), field(5, "sizes")),
+            (both, "1500,900".to_string())
+        );
+        assert_eq!(field(5, "encoded_len"), reply_lens[2].to_string());
     }
 }

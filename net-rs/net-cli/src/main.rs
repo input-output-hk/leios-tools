@@ -17,6 +17,10 @@ use scheduler_args::SchedulerArgs;
 #[derive(Parser)]
 #[command(name = "net-cli", about = "Cardano network protocol test tool")]
 struct Cli {
+    /// Set the shared mempool flag to allow duplicate transactions (for testing Haskell Node duplicate handling).  Defaults to false.
+    #[arg(long = "flag_allow_duplicate_txs", global = true)]
+    flag_allow_duplicate_txs: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -258,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+    shared_consensus::mempool::set_flag_allow_duplicate_txs(cli.flag_allow_duplicate_txs);
 
     match cli.command {
         Command::Handshake {
@@ -392,5 +397,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_allow_duplicate_txs_is_global_and_defaults_to_false() -> Result<(), clap::Error> {
+        assert!(!Cli::try_parse_from(["net-cli", "serve"])?.flag_allow_duplicate_txs);
+        assert!(
+            Cli::try_parse_from(["net-cli", "--flag_allow_duplicate_txs", "serve"])?
+                .flag_allow_duplicate_txs
+        );
+        assert!(
+            Cli::try_parse_from(["net-cli", "serve", "--flag_allow_duplicate_txs"])?
+                .flag_allow_duplicate_txs
+        );
+        Ok(())
     }
 }
