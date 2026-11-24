@@ -75,6 +75,44 @@ resource cost under a sustained flood is unmeasured (bead
 `leios_adversarial_tools-bi9.6`). All runs ran under host load 28–76 from
 unrelated processes, so the chain-growth measurement is noisy (§5.4, §8).
 
+### August 27 Trojan Horse result on Musashi
+
+On August 27, 2026, the Red Team demonstrated a transaction-validation gap in
+the Leios prototype on the Musashi testnet. The ledger recorded the transfer in
+block **80,676**. The team deliberately limited the transfer to **1,000 test
+ADA** to minimize the test’s impact.
+
+From Christopher Tilt’s August 27 Red Team update at 1:48 p.m. (excerpt):
+
+> Red1 (PRI0) was able to “steal” 1000 Ada from IOG1 today via the EB Trojan
+> Horse attack. I chose 1000 Ada so as not to do any real damage and not have to
+> scramble to give it back. We could have taken it all :elmofire: but there was
+> no point in being really Red and nasty. This is not a serious exploit - it
+> just demonstrates the current state of Leios that it doesn’t yet validate
+> TXs when they arrive via an EB. @sebastian already has a PR under development
+> (or maybe even review now) that will address this current gap. Once that PR
+> lands in a release, we can re-run this attack to verify it’s closed. It’s
+> more like a test-driven development than any real exploit. Nick and Sebastian
+> already saw this coming.
+>
+> [Operational details omitted.]
+>
+> So, this is a big milestone for us - being a real forging BP that votes, etc.
+> It’s default mode is honest now - it votes and certifies. [Operational details
+> omitted.] For the curious, it was block #80676 that contains a single
+> transaction.
+
+Here, EB means endorser block, TX means transaction, BP means block producer,
+and PR means pull request. The comment about a larger transfer reflects the
+operator’s assessment.
+
+In the September 17 local retest, the committee fetched the transactions,
+checked their spending authorization, and withheld its votes because the
+required signatures were missing. **Zero of 129 unauthorized transactions
+settled.** The September 17 run record also describes a Musashi attempt in
+which a relay failure prevented the transactions from reaching the committee.
+That attempt was inconclusive for validation.
+
 ## 2. Threat and scope
 
 T11 is the threat-model entry "Create invalid EB": a block producer, which needs
@@ -99,7 +137,7 @@ transactions). Because duplicates inside an EB need EB-producer stake and make
 the EB itself invalid, it belongs here, not under the client-side T24 threat;
 see [`t24/README.md`](../t24/README.md).
 
-Out of scope:
+Out of scope for the November w43 campaign:
 - Client-side submission of duplicate, invalid or conflicting transactions over
   TxSubmission (T24/T25/T26).
 - Cryptographic-stage invalidity (bad VRF or body signature): net-rs's EBs are
