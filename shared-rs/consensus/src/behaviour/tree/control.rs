@@ -28,7 +28,14 @@ pub struct ControlSignal {
 
 impl ControlSignal {
     pub fn requires_tx_production(&self) -> bool {
-        self != &Self::default()
+        // EB transaction insertion edits only a normally selected candidate.
+        // Arming it must not enable transaction production on an empty-mode node.
+        if self.leios.eb_tx_insertion.is_none() {
+            return self != &Self::default();
+        }
+        let mut without_insertion = self.clone();
+        without_insertion.leios.eb_tx_insertion = None;
+        without_insertion != Self::default()
     }
 }
 
@@ -250,9 +257,21 @@ impl std::fmt::Display for NetFloodKind {
     }
 }
 
+/// Inputs for inserting one private transaction before a selected EB transaction.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EbTxInsertionControl {
+    pub insert_mag: String,
+    pub target_mag: String,
+    pub evidence_dir: String,
+}
+
 /// Leios-domain actuator inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeiosControl {
+    /// Insert a private transaction only if the ordinary EB candidate
+    /// contains the target. The caller reads the magazines and records
+    /// the production evidence; the behaviour engine performs no file I/O.
+    pub eb_tx_insertion: Option<EbTxInsertionControl>,
     /// CIP-0164 voting policy (`Honest` | `Abstain(reason)`).
     pub vote: VotePolicy,
     /// Rewrite `eb_size` on outbound `MsgLeiosBlockOffer`.

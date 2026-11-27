@@ -103,6 +103,15 @@ pub fn build_action(
         )),
         ActionSpec::EchoToSource => Box::new(catalogue::EchoToSource),
         ActionSpec::CertSuppressor => Box::new(catalogue::CertSuppressor),
+        ActionSpec::InsertEbTransactionBefore {
+            insert_mag,
+            target_mag,
+            evidence_dir,
+        } => Box::new(catalogue::InsertEbTransactionBefore::new(
+            insert_mag.clone(),
+            target_mag.clone(),
+            evidence_dir.clone(),
+        )),
         ActionSpec::SingleBlsCert => Box::new(catalogue::single_bls_cert::SingleBlsCert),
         ActionSpec::WrongLenCert => Box::new(catalogue::wrong_len_cert::WrongLenCert),
         ActionSpec::WrongContextCert => Box::new(catalogue::wrong_context_cert::WrongContextCert),

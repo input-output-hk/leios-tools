@@ -64,6 +64,14 @@ pub enum ActionSpec {
     EchoToSource,
     #[serde(rename = "cert-suppressor")]
     CertSuppressor,
+    /// Insert one selected transaction before another in an
+    /// otherwise ordinary EB candidate. File paths are consumed by the caller.
+    #[serde(rename = "insert-eb-transaction-before")]
+    InsertEbTransactionBefore {
+        insert_mag: String,
+        target_mag: String,
+        evidence_dir: String,
+    },
     /// AUDIT — forge a `leios_certificate` whose signers bitfield names the
     /// whole committee but whose aggregate is only this node's own BLS vote
     /// signature. Probes whether `verifyLeiosCert` binds the aggregate to the
@@ -343,6 +351,31 @@ pub fn seed_from_node_id(node_id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eb_tx_insertion_requires_all_fixture_paths() {
+        let spec: ActionSpec = toml::from_str(
+            r#"kind = "insert-eb-transaction-before"
+insert_mag = "insert.mag"
+target_mag = "target.mag"
+evidence_dir = "evidence""#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec,
+            ActionSpec::InsertEbTransactionBefore {
+                insert_mag: "insert.mag".into(),
+                target_mag: "target.mag".into(),
+                evidence_dir: "evidence".into(),
+            }
+        );
+        assert!(toml::from_str::<ActionSpec>(
+            r#"kind = "insert-eb-transaction-before"
+insert_mag = "insert.mag"
+target_mag = "target.mag""#,
+        )
+        .is_err());
+    }
 
     #[test]
     fn fetch_flood_parses_from_generated_spec() {
